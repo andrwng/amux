@@ -5,6 +5,7 @@
 mod app;
 mod client;
 mod input;
+mod pane;
 
 use anyhow::Result;
 
