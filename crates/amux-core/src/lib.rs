@@ -4,5 +4,6 @@
 //!
 //! Populated across Phases 0–1.
 
+pub mod agent;
 pub mod clock;
 pub mod paths;
