@@ -428,6 +428,15 @@ impl App {
                 self.reconcile(sink).await?;
             }
             KeyCode::Char('r') if !self.tree.is_empty() => self.resize_mode = true,
+            // Direct resize (tmux muscle memory): `Ctrl+B` then capital H/J/K/L resizes the
+            // focused pane one step and stays in resize mode so you can keep nudging (like `-r`).
+            KeyCode::Char('H' | 'J' | 'K' | 'L') if !self.tree.is_empty() => {
+                if let Some(dir) = resize_dir(key.code) {
+                    self.tree.resize(dir, RESIZE_STEP);
+                    self.resize_mode = true;
+                    self.reconcile(sink).await?;
+                }
+            }
             // Jump to the next unread agent (inbox navigation).
             KeyCode::Tab => self.jump_next_unread(sink).await?,
             KeyCode::Char(c) if key.modifiers.contains(KeyModifiers::CONTROL) => {
@@ -466,18 +475,12 @@ impl App {
     }
 
     async fn key_resize(&mut self, key: KeyEvent, sink: &mut Sink) -> Result<Flow> {
-        let dir = match key.code {
-            KeyCode::Char('h') | KeyCode::Left => Some(Dir::Left),
-            KeyCode::Char('l') | KeyCode::Right => Some(Dir::Right),
-            KeyCode::Char('j') | KeyCode::Down => Some(Dir::Down),
-            KeyCode::Char('k') | KeyCode::Up => Some(Dir::Up),
-            KeyCode::Esc | KeyCode::Enter => {
-                self.resize_mode = false;
-                None
-            }
-            _ => None,
-        };
-        if let Some(dir) = dir {
+        if matches!(key.code, KeyCode::Esc | KeyCode::Enter) {
+            self.resize_mode = false;
+            return Ok(Flow::Continue);
+        }
+        // Accept both hjkl and HJKL (and arrows) so it doesn't matter if Shift is still held.
+        if let Some(dir) = resize_dir(key.code) {
             self.tree.resize(dir, RESIZE_STEP);
             self.reconcile(sink).await?;
         }
@@ -785,6 +788,17 @@ fn ctrl_dir(key: KeyEvent) -> Option<Dir> {
     }
 }
 
+/// Map a resize key to a direction — accepts hjkl, HJKL, and the arrow keys.
+fn resize_dir(code: KeyCode) -> Option<Dir> {
+    match code {
+        KeyCode::Char('h' | 'H') | KeyCode::Left => Some(Dir::Left),
+        KeyCode::Char('l' | 'L') | KeyCode::Right => Some(Dir::Right),
+        KeyCode::Char('j' | 'J') | KeyCode::Down => Some(Dir::Down),
+        KeyCode::Char('k' | 'K') | KeyCode::Up => Some(Dir::Up),
+        _ => None,
+    }
+}
+
 fn ctrl_byte(c: char) -> Option<u8> {
     let up = c.to_ascii_uppercase();
     match up {
@@ -1027,7 +1041,7 @@ fn render_status(frame: &mut Frame, area: Rect, app: &App) {
         )
     } else if app.prefix {
         (
-            " Ctrl+B — % split \u{b7} \" split \u{b7} x close \u{b7} r resize \u{b7} tab next unread"
+            " Ctrl+B — % split \u{b7} \" split \u{b7} x close \u{b7} HJKL/r resize \u{b7} tab unread"
                 .to_string(),
             Style::default().fg(Color::Black).bg(Color::Cyan),
         )
