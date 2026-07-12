@@ -33,17 +33,40 @@ Replace `attached: Option<AgentId>` + the single parser with a binary space-part
 - **DoD:** pure unit tests for split / close / navigate on the tree; `TestBackend` snapshot of a
   2- and 3-pane layout.
 
-## S.3 — tmux keymap (the `Ctrl-B` prefix)
+## S.3 — Navigation, resize, and the keymap
 
-Rework `Ctrl-B` from a Nav/Terminal toggle into a real **tmux-style prefix**. In Terminal mode,
-`Ctrl-B` enters "prefix pending"; the next key is a command:
-- `%` split focused pane vertically · `"` split horizontally
-- `h`/`j`/`k`/`l` or arrows — move focus between panes
-- `x` close the focused pane (agent keeps running; `Detach`)
-- `o` / Enter (from the sidebar) open the selected agent into the focused pane
-- `Ctrl-B` again → send a literal `Ctrl-B` to the agent (tmux behavior)
-- anything unmapped → back to Terminal input
-- **DoD:** prefix state machine unit-tested; keys route to the right pane; interactive check.
+**Focus is spatial.** The whole screen — the sidebar plus every tiled pane — is one grid, and
+focus is exactly one cell. There is no separate Nav/Terminal *mode*: what a keystroke does is
+determined by *where focus is* (sidebar = commands; pane = agent input) plus a few global keys.
+
+### Movement — direct `Ctrl+hjkl` (no prefix), sidebar included
+- `Ctrl+h/j/k/l` move focus **directionally** to the neighboring cell. The sidebar sits to the
+  left of all panes, so `Ctrl+h` from a left-edge pane lands in the sidebar, and `Ctrl+l` from
+  the sidebar enters the nearest pane. Geometry-based (pick the adjacent cell whose rect is
+  closest in that direction and overlaps on the perpendicular axis) — like vim-tmux-navigator.
+- **Collision (accepted):** intercepting `Ctrl+hjkl` means the focused agent doesn't receive
+  those control codes (`Ctrl+L` clear, `Ctrl+K` kill-line, `Ctrl+J` LF, `Ctrl+H` backspace-ish).
+  Right default for a multi-agent tool; escape hatch below. Nav keys are keymap-configurable.
+
+### Structure — the `Ctrl+B` prefix (less-frequent commands)
+- `Ctrl+B %` split focused pane left/right · `Ctrl+B "` split top/bottom
+- `Ctrl+B x` close focused pane (agent keeps running; `Detach`)
+- `Ctrl+B r` enter **resize mode** (below)
+- `Ctrl+B <any Ctrl-key>` → send that literal control key to the agent (the escape hatch, e.g.
+  `Ctrl+B Ctrl+L` clears the agent's screen; `Ctrl+B Ctrl+B` sends a literal `Ctrl+B`)
+
+### Resize — a small `hjkl` submode
+`Ctrl+B r` enters resize mode (status bar: `RESIZE — hjkl grow/shrink · esc done`). Then, on the
+focused pane, `l`/`h` widen/narrow and `j`/`k` grow/shrink height, each press one step (~5%),
+by adjusting the ratio of the nearest ancestor split of the matching axis (clamped 0.1–0.9).
+`Esc`/`Enter` exits. Repeatable in-mode so you can nudge quickly — the `hjkl` you like.
+
+### Sidebar cell (when focused)
+`j`/`k` select · `n` new · `d` delete · `r` resume · `Enter`/`l` open the selected agent into the
+most-recently-focused pane (or the first pane if the layout is empty). `Ctrl+l` moves into panes.
+
+**DoD:** pure unit tests for directional nav, split, close, and resize on the pane tree; the
+prefix + resize state machines tested; keys route to the right pane; interactive check.
 
 ## S.4 — Persistence hook (small)
 

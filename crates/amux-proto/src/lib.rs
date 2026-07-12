@@ -9,5 +9,5 @@ pub use codec::{check_version, ClientCodec, ProtoError, ServerCodec, WireCodec, 
 pub use message::{AgentInfo, ClientMsg, DaemonMsg, Size};
 
 /// Protocol version. The client and daemon refuse to talk across a mismatch (the client
-/// auto-recovers). v1 = multi-agent; v2 = dirty-delete confirmation.
-pub const PROTO_VERSION: u32 = 2;
+/// auto-recovers). v1 = multi-agent; v2 = dirty-delete confirmation; v3 = multi-attach.
+pub const PROTO_VERSION: u32 = 3;

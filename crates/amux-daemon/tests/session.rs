@@ -163,6 +163,88 @@ async fn create_attach_echo_delete() {
 }
 
 #[tokio::test]
+async fn two_agents_stream_simultaneously() {
+    let tmp = tempfile::tempdir().unwrap();
+    let repo = tmp.path().join("repo");
+    std::fs::create_dir(&repo).unwrap();
+    init_repo(&repo);
+
+    let worktrees = WorktreeService::with_base(&repo, tmp.path().join("wt")).unwrap();
+    let adapter = Box::new(ClaudeAdapter::with_command(vec!["cat".into()]));
+    let registry = Registry::new(worktrees, adapter);
+
+    let socket = tmp.path().join("amuxd.sock");
+    let listener = UnixListener::bind(&socket).unwrap();
+    let server = tokio::spawn(serve(listener, registry));
+
+    let mut client = handshake(&socket).await;
+    let size = Size { cols: 80, rows: 24 };
+
+    client
+        .send(ClientMsg::CreateAgent { branch: "a".into() })
+        .await
+        .unwrap();
+    let a = wait_for_added(&mut client).await;
+    client
+        .send(ClientMsg::CreateAgent { branch: "b".into() })
+        .await
+        .unwrap();
+    let b = wait_for_added(&mut client).await;
+
+    // Attach both, then feed each — both should stream back, tagged by id.
+    client
+        .send(ClientMsg::Attach { id: a, size })
+        .await
+        .unwrap();
+    client
+        .send(ClientMsg::Attach { id: b, size })
+        .await
+        .unwrap();
+    client
+        .send(ClientMsg::Input {
+            id: a,
+            bytes: b"AAAA\n".to_vec(),
+        })
+        .await
+        .unwrap();
+    client
+        .send(ClientMsg::Input {
+            id: b,
+            bytes: b"BBBB\n".to_vec(),
+        })
+        .await
+        .unwrap();
+
+    let both = tokio::time::timeout(Duration::from_secs(5), async {
+        let (mut sa, mut sb) = (Vec::new(), Vec::new());
+        loop {
+            match client.next().await {
+                Some(Ok(DaemonMsg::Output { id, bytes }))
+                | Some(Ok(DaemonMsg::OutputSnapshot { id, bytes })) => {
+                    if id == a {
+                        sa.extend_from_slice(&bytes);
+                    } else if id == b {
+                        sb.extend_from_slice(&bytes);
+                    }
+                    if String::from_utf8_lossy(&sa).contains("AAAA")
+                        && String::from_utf8_lossy(&sb).contains("BBBB")
+                    {
+                        return true;
+                    }
+                }
+                Some(Ok(_)) => {}
+                _ => return false,
+            }
+        }
+    })
+    .await
+    .unwrap_or(false);
+    assert!(both, "both attached agents should stream, tagged by id");
+
+    server.abort();
+}
+
+#[tokio::test]
 async fn dirty_worktree_requires_delete_confirmation() {
     let tmp = tempfile::tempdir().unwrap();
     let repo = tmp.path().join("repo");

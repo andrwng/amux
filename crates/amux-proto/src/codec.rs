@@ -154,6 +154,7 @@ mod tests {
                 rows: 40,
             },
         });
+        roundtrip(ClientMsg::Detach { id });
         roundtrip(ClientMsg::Input {
             id,
             bytes: vec![0x1b, b'[', b'A'],

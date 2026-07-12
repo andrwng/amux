@@ -260,6 +260,13 @@ impl App {
     }
 
     async fn attach(&mut self, id: AgentId, sink: &mut Sink) -> Result<()> {
+        // Single-pane for now: stop streaming the previously-open agent. (The pane UI in the
+        // next step keeps several attached at once.)
+        if let Some(prev) = self.attached {
+            if prev != id {
+                sink.send(ClientMsg::Detach { id: prev }).await?;
+            }
+        }
         self.attached = Some(id);
         self.parser = vt100::Parser::new(self.main_size.rows, self.main_size.cols, 2000);
         sink.send(ClientMsg::Attach {

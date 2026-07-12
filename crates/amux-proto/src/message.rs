@@ -38,9 +38,11 @@ pub enum ClientMsg {
     DeleteAgent { id: AgentId, force: bool },
     /// Resume a suspended (exited) agent's session in its existing worktree.
     ResumeAgent { id: AgentId },
-    /// Stream this agent into the main window (re-targets the single live stream). Sends a
-    /// snapshot then live output; implicitly detaches whatever was streaming before.
+    /// Start streaming this agent (snapshot then live output). Multiple agents can be attached
+    /// at once — one per visible pane. Re-attaching an already-attached agent just resizes it.
     Attach { id: AgentId, size: Size },
+    /// Stop streaming this agent (its pane was closed). The agent keeps running.
+    Detach { id: AgentId },
     /// Keystroke bytes for a specific agent's PTY.
     Input { id: AgentId, bytes: Vec<u8> },
     /// Resize a specific agent's PTY.
