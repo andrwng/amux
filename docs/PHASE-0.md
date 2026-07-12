@@ -17,7 +17,7 @@ manual checklists — except where a step genuinely needs an interactive TTY (no
 
 ---
 
-## 0.1 — Bootstrap + de-risking spike &nbsp; · &nbsp; **← IN PROGRESS**
+## 0.1 — Bootstrap + de-risking spike &nbsp; · &nbsp; **✓ code-complete** (builds/tests green; interactive spike run + Ubuntu CI pending)
 
 Prove the four scary integrations (portable-pty, vt100, tui-term, crossterm input/resize) in one
 throwaway file *before* committing to the real architecture.
@@ -42,7 +42,7 @@ the workspace builds clean; CI is green.
 
 ---
 
-## 0.2 — `amux-proto`: framing + handshake
+## 0.2 — `amux-proto`: framing + handshake &nbsp; · &nbsp; **✓ code-complete** (9 tests green)
 
 **Deliverables**
 - Phase-0 message subset: `Hello`, `Input`, `Resize`, `Output`, `OutputSnapshot`, `Shutdown`.
