@@ -11,3 +11,7 @@ serde = { workspace = true }
 uuid = { workspace = true }
 chrono = { workspace = true }
 directories = { workspace = true }
+git2 = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }

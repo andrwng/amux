@@ -7,3 +7,4 @@
 pub mod agent;
 pub mod clock;
 pub mod paths;
+pub mod worktree;

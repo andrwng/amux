@@ -21,7 +21,7 @@ will actually produce it (Phase 1 emits the coarse `Started/SawActivity/WentIdle
 
 **DoD:** `next_state` is total and covered by a transition table; distinct sidebar glyphs.
 
-## 1.2 — Worktree service (`amux-core`)
+## 1.2 — Worktree service (`amux-core`) &nbsp; · &nbsp; **✓ code-complete** (create/list/remove round-trip on a temp repo; global-base stability tested)
 
 Port grove's `src/git/worktree.rs` (git2 + `vendored-libgit2`): create/remove/list worktrees,
 symlink shared files. Config: branch prefix, main branch, worktree location. Tests against a
