@@ -16,7 +16,7 @@ The defining ergonomics, and how they differ from grove (the tool this grows out
 |---|---|---|
 | Interacting with an agent | `tmux attach` = **full-screen takeover**; sidebar disappears | Agent renders in a pane **beside a persistent sidebar** |
 | Knowing an agent needs you | ~2,600 lines of regex screen-scraping (fragile) | **Structured signals** from Claude Code hooks (exact) |
-| Handling several agents at once | one at a time | a **main window** + several **floating live mini-terminals** (Gmail-style) |
+| Handling several agents at once | one at a time | a **tmux-splittable main area** (tiled panes) + **floating minis** (Gmail-style popups) |
 | Session lifetime | tmux server | **`amuxd` daemon** — agents survive the UI closing |
 
 Three interaction pillars:
@@ -408,6 +408,29 @@ When an agent enters a slot (main, or a mini expands on focus), the client sends
 reflows; the momentary reflow is accepted. **Displaced-main = (a)**: opening an agent in main
 while one is already there returns the displaced agent to sidebar-only (still running), not
 into a mini.
+
+### 7.5 Tiled splits — the main area is tmux-splittable (first-class)
+
+The **main area is not a single pane** — it is a tmux-style split space. You can split it into
+tiled panes, each streaming an agent's terminal, and navigate with tmux muscle memory (the
+leader is already `Ctrl-B`):
+
+- `Ctrl-B %` split the focused pane vertically · `Ctrl-B "` split horizontally
+- `Ctrl-B` + `h`/`j`/`k`/`l` (or arrows) move focus between panes
+- `Ctrl-B x` close the focused pane (the agent keeps running; it just leaves the layout)
+- open a sidebar-selected agent into the focused pane
+
+This is **distinct from the floating minis** (§7.2): splits are a *tiled workspace* for actively
+working several agents side by side; minis are a *transient overlay* for quickly answering a
+waiting agent without disturbing that layout. All three coexist — sidebar (inbox) + tiled main
+(workspace) + floating minis (attention popups).
+
+**Daemon requirement:** several panes stream at once, so the daemon must support **multiple
+simultaneous attachments** — the client subscribes to output for every agent that has a pane,
+each tagged by `AgentId`. Phase 1 shipped a single re-targetable stream; multi-attach is the
+small change that unlocks splits, and the protocol was always ready for it (`Output`/`Input`/
+`Resize` are all per-`AgentId`). The client's `Layout` becomes a **pane tree** rather than
+`main: Option<AgentId>`. Plan: `docs/SPLITS.md`.
 
 ---
 
