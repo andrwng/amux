@@ -1,8 +1,8 @@
-//! The agent registry — durable **Agents** over generic **Sessions**. An `Agent` is the
-//! workspace (worktree + branch + adapter + `ai_session_id`); it holds zero-or-one live
-//! `Session`. A session exiting **suspends** the agent (state → Exited, session → None) but
-//! never removes it; only [`Registry::delete`] destroys a worktree. Resume is always manual.
-//! See `docs/DESIGN.md` §5 and `docs/PHASE-1.md` §1.5.
+//! The agent registry. An **Agent** is a durable workspace (worktree + branch); it owns a
+//! **primary terminal** (its CLI) plus any **shell terminals** split off in the same worktree.
+//! Terminals are the streaming unit; agents are what the sidebar lists. A session exiting
+//! suspends the agent (primary) or removes the terminal (shell); only delete destroys a
+//! worktree. See `docs/DESIGN.md` §5, `docs/SPLITS.md`.
 
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -13,16 +13,20 @@ use chrono::{DateTime, Utc};
 use tokio::sync::broadcast;
 
 use amux_core::adapter::{AgentAdapter, LaunchContext};
-use amux_core::agent::{AgentId, AgentState};
+use amux_core::agent::{AgentId, AgentState, TerminalId};
 use amux_core::worktree::WorktreeService;
 use amux_proto::{AgentInfo, DaemonMsg, Size};
 
 use crate::pty::Session;
 
-/// Backlog of lifecycle events buffered per subscribed client before it must resync.
 const EVENT_BACKLOG: usize = 256;
-/// PTY size a session starts at, before a client attaches and resizes it.
 const DEFAULT_SIZE: Size = Size { cols: 80, rows: 24 };
+
+/// Outcome of a delete request.
+pub enum DeleteOutcome {
+    Deleted,
+    NeedsConfirm(String),
+}
 
 struct Agent {
     id: AgentId,
@@ -30,11 +34,11 @@ struct Agent {
     branch: String,
     worktree: PathBuf,
     ai_session_id: Option<String>,
-    #[allow(dead_code)] // durable metadata; used by state.json persistence (deferred to later 1.5)
+    #[allow(dead_code)] // durable metadata; used by state.json persistence (deferred)
     created_at: DateTime<Utc>,
     last_activity: DateTime<Utc>,
     state: AgentState,
-    session: Option<Arc<Session>>,
+    primary: TerminalId,
 }
 
 impl Agent {
@@ -45,19 +49,26 @@ impl Agent {
             branch: self.branch.clone(),
             state: self.state.clone(),
             last_activity: self.last_activity,
+            primary_terminal: self.primary,
         }
     }
 }
 
-/// Outcome of a delete request.
-pub enum DeleteOutcome {
-    Deleted,
-    /// The worktree is dirty and `force` was not set; carries a human-readable reason.
-    NeedsConfirm(String),
+struct Terminal {
+    agent: AgentId,
+    worktree: PathBuf,
+    primary: bool,
+    session: Option<Arc<Session>>,
+}
+
+#[derive(Default)]
+struct State {
+    agents: HashMap<AgentId, Agent>,
+    terminals: HashMap<TerminalId, Terminal>,
 }
 
 pub struct Registry {
-    agents: Mutex<HashMap<AgentId, Agent>>,
+    state: Mutex<State>,
     worktrees: WorktreeService,
     adapter: Box<dyn AgentAdapter>,
     events: broadcast::Sender<DaemonMsg>,
@@ -67,38 +78,38 @@ impl Registry {
     pub fn new(worktrees: WorktreeService, adapter: Box<dyn AgentAdapter>) -> Arc<Self> {
         let (events, _) = broadcast::channel(EVENT_BACKLOG);
         Arc::new(Self {
-            agents: Mutex::new(HashMap::new()),
+            state: Mutex::new(State::default()),
             worktrees,
             adapter,
             events,
         })
     }
 
-    /// Subscribe to lifecycle events (AgentAdded / AgentRemoved / StateChanged).
     pub fn subscribe_events(&self) -> broadcast::Receiver<DaemonMsg> {
         self.events.subscribe()
     }
 
-    /// Current roster.
     pub fn infos(&self) -> Vec<AgentInfo> {
-        self.agents
+        self.state
             .lock()
             .unwrap()
+            .agents
             .values()
             .map(Agent::info)
             .collect()
     }
 
-    /// The live session for an agent, if it has one.
-    pub fn session(&self, id: AgentId) -> Option<Arc<Session>> {
-        self.agents
+    /// The live session for a terminal, if it has one.
+    pub fn session(&self, terminal: TerminalId) -> Option<Arc<Session>> {
+        self.state
             .lock()
             .unwrap()
-            .get(&id)
-            .and_then(|a| a.session.clone())
+            .terminals
+            .get(&terminal)
+            .and_then(|t| t.session.clone())
     }
 
-    /// Create an agent: worktree + a fresh session. Broadcasts `AgentAdded`.
+    /// Create an agent: worktree + a primary terminal running the agent CLI.
     pub fn create(self: &Arc<Self>, branch: &str) -> Result<AgentInfo> {
         let worktree = self.worktrees.create(branch).context("create worktree")?;
         let ctx = LaunchContext {
@@ -110,40 +121,95 @@ impl Registry {
         let spec = self.adapter.spawn_spec(&ctx);
         let session = Session::spawn(&spec.command, &spec.cwd, &spec.env, DEFAULT_SIZE)?;
 
-        let id = AgentId::new();
+        let agent_id = AgentId::new();
+        let terminal_id = TerminalId::new();
         let now = Utc::now();
-        let agent = Agent {
-            id,
-            name: agent_name(branch),
-            branch: branch.to_string(),
-            worktree,
-            ai_session_id: None,
-            created_at: now,
-            last_activity: now,
-            state: AgentState::Working,
-            session: Some(Arc::clone(&session)),
+        let info = {
+            let mut state = self.state.lock().unwrap();
+            state.terminals.insert(
+                terminal_id,
+                Terminal {
+                    agent: agent_id,
+                    worktree: worktree.clone(),
+                    primary: true,
+                    session: Some(Arc::clone(&session)),
+                },
+            );
+            let agent = Agent {
+                id: agent_id,
+                name: agent_name(branch),
+                branch: branch.to_string(),
+                worktree,
+                ai_session_id: None,
+                created_at: now,
+                last_activity: now,
+                state: AgentState::Working,
+                primary: terminal_id,
+            };
+            let info = agent.info();
+            state.agents.insert(agent_id, agent);
+            info
         };
-        let info = agent.info();
-        self.agents.lock().unwrap().insert(id, agent);
-        self.spawn_exit_monitor(id, session);
+        self.spawn_primary_monitor(agent_id, terminal_id, session);
         let _ = self.events.send(DaemonMsg::AgentAdded(info.clone()));
         Ok(info)
     }
 
-    /// Resume a suspended agent — a new session in the existing worktree. `StateChanged`.
-    pub fn resume(self: &Arc<Self>, id: AgentId) -> Result<()> {
-        let (branch, worktree, resume_id) = {
-            let agents = self.agents.lock().unwrap();
-            let agent = agents.get(&id).context("no such agent")?;
-            if agent.session.is_some() {
-                return Ok(()); // already live
+    /// Split: spawn a `$SHELL` terminal (id `new`) in the same worktree as `like`.
+    pub fn spawn_shell(self: &Arc<Self>, new: TerminalId, like: TerminalId) -> Result<()> {
+        let (agent, worktree) = {
+            let state = self.state.lock().unwrap();
+            let term = state.terminals.get(&like).context("no such terminal")?;
+            (term.agent, term.worktree.clone())
+        };
+        let shell = std::env::var("SHELL").unwrap_or_else(|_| "/bin/sh".to_string());
+        let session = Session::spawn(&[shell], &worktree, &[], DEFAULT_SIZE)?;
+        {
+            let mut state = self.state.lock().unwrap();
+            state.terminals.insert(
+                new,
+                Terminal {
+                    agent,
+                    worktree,
+                    primary: false,
+                    session: Some(Arc::clone(&session)),
+                },
+            );
+        }
+        self.spawn_shell_monitor(new, session);
+        Ok(())
+    }
+
+    /// Kill a shell terminal (its pane closed). No-op on a primary terminal.
+    pub fn close_terminal(&self, terminal: TerminalId) {
+        let mut state = self.state.lock().unwrap();
+        if state.terminals.get(&terminal).is_some_and(|t| !t.primary) {
+            if let Some(session) = state.terminals.remove(&terminal).and_then(|t| t.session) {
+                session.kill();
             }
+        }
+    }
+
+    /// Resume a suspended agent — respawn its primary terminal in the existing worktree.
+    pub fn resume(self: &Arc<Self>, id: AgentId) -> Result<()> {
+        let (worktree, branch, resume_id, primary, already_live) = {
+            let state = self.state.lock().unwrap();
+            let agent = state.agents.get(&id).context("no such agent")?;
+            let live = state
+                .terminals
+                .get(&agent.primary)
+                .is_some_and(|t| t.session.is_some());
             (
-                agent.branch.clone(),
                 agent.worktree.clone(),
+                agent.branch.clone(),
                 agent.ai_session_id.clone(),
+                agent.primary,
+                live,
             )
         };
+        if already_live {
+            return Ok(());
+        }
         let ctx = LaunchContext {
             worktree: &worktree,
             branch: &branch,
@@ -151,27 +217,34 @@ impl Registry {
         };
         let spec = self.adapter.spawn_spec(&ctx);
         let session = Session::spawn(&spec.command, &spec.cwd, &spec.env, DEFAULT_SIZE)?;
-
-        let state = {
-            let mut agents = self.agents.lock().unwrap();
-            let agent = agents.get_mut(&id).context("agent vanished")?;
-            agent.session = Some(Arc::clone(&session));
-            agent.state = AgentState::Working;
-            agent.last_activity = Utc::now();
-            agent.state.clone()
+        let state_change = {
+            let mut state = self.state.lock().unwrap();
+            if let Some(term) = state.terminals.get_mut(&primary) {
+                term.session = Some(Arc::clone(&session));
+            }
+            match state.agents.get_mut(&id) {
+                Some(agent) => {
+                    agent.state = AgentState::Working;
+                    agent.last_activity = Utc::now();
+                    agent.state.clone()
+                }
+                None => return Ok(()),
+            }
         };
-        self.spawn_exit_monitor(id, session);
-        let _ = self.events.send(DaemonMsg::StateChanged { id, state });
+        self.spawn_primary_monitor(id, primary, session);
+        let _ = self.events.send(DaemonMsg::StateChanged {
+            id,
+            state: state_change,
+        });
         Ok(())
     }
 
-    /// Delete an agent — the only destructive op: kill its session and remove its worktree
-    /// (the git branch and its commits are kept). If `force` is false and the worktree has
-    /// uncommitted changes, returns `NeedsConfirm` without deleting anything.
+    /// Delete an agent — the only destructive op: kill all its terminals and remove its worktree
+    /// (branch and commits are kept). Refuses a dirty worktree unless `force`.
     pub fn delete(&self, id: AgentId, force: bool) -> Result<DeleteOutcome> {
-        let branch = match self.agents.lock().unwrap().get(&id) {
+        let branch = match self.state.lock().unwrap().agents.get(&id) {
             Some(agent) => agent.branch.clone(),
-            None => return Ok(DeleteOutcome::Deleted), // already gone — idempotent
+            None => return Ok(DeleteOutcome::Deleted),
         };
         if !force {
             let dirty = self.worktrees.dirty_count(&branch).unwrap_or(0);
@@ -182,54 +255,87 @@ impl Registry {
                 )));
             }
         }
-        if let Some(agent) = self.agents.lock().unwrap().remove(&id) {
-            if let Some(session) = &agent.session {
-                session.kill();
-            }
-            self.worktrees.remove(&agent.branch).ok();
-            let _ = self.events.send(DaemonMsg::AgentRemoved { id });
+        let sessions: Vec<Arc<Session>> = {
+            let mut state = self.state.lock().unwrap();
+            state.agents.remove(&id);
+            let terminal_ids: Vec<TerminalId> = state
+                .terminals
+                .iter()
+                .filter(|(_, t)| t.agent == id)
+                .map(|(&tid, _)| tid)
+                .collect();
+            terminal_ids
+                .into_iter()
+                .filter_map(|tid| state.terminals.remove(&tid))
+                .filter_map(|t| t.session)
+                .collect()
+        };
+        for session in sessions {
+            session.kill();
         }
+        self.worktrees.remove(&branch).ok();
+        let _ = self.events.send(DaemonMsg::AgentRemoved { id });
         Ok(DeleteOutcome::Deleted)
     }
 
-    /// Kill every live session (daemon shutdown). Worktrees are left on disk.
     pub fn shutdown_all(&self) {
-        for agent in self.agents.lock().unwrap().values() {
-            if let Some(session) = &agent.session {
+        let state = self.state.lock().unwrap();
+        for terminal in state.terminals.values() {
+            if let Some(session) = &terminal.session {
                 session.kill();
             }
         }
     }
 
-    /// Watch a session; when it exits, suspend the agent (Exited + no session) and broadcast.
-    fn spawn_exit_monitor(self: &Arc<Self>, id: AgentId, session: Arc<Session>) {
+    fn spawn_primary_monitor(
+        self: &Arc<Self>,
+        agent: AgentId,
+        terminal: TerminalId,
+        session: Arc<Session>,
+    ) {
         let registry = Arc::clone(self);
         let mut exit_rx = session.exit_rx();
         tokio::spawn(async move {
-            let _ = exit_rx.changed().await; // resolves when the session exits (or drops)
-            let code = session.exit_code();
-            registry.mark_exited(id, code);
+            let _ = exit_rx.changed().await;
+            registry.on_primary_exit(agent, terminal, session.exit_code());
         });
     }
 
-    fn mark_exited(&self, id: AgentId, code: Option<i32>) {
-        let state = {
-            let mut agents = self.agents.lock().unwrap();
-            match agents.get_mut(&id) {
-                Some(agent) => {
-                    agent.session = None;
-                    agent.state = AgentState::Exited { code };
-                    agent.last_activity = Utc::now();
-                    agent.state.clone()
+    fn on_primary_exit(&self, agent: AgentId, terminal: TerminalId, code: Option<i32>) {
+        let state_change = {
+            let mut state = self.state.lock().unwrap();
+            if let Some(term) = state.terminals.get_mut(&terminal) {
+                term.session = None;
+            }
+            match state.agents.get_mut(&agent) {
+                Some(a) => {
+                    a.state = AgentState::Exited { code };
+                    a.last_activity = Utc::now();
+                    a.state.clone()
                 }
-                None => return, // already deleted
+                None => return,
             }
         };
-        let _ = self.events.send(DaemonMsg::StateChanged { id, state });
+        let _ = self.events.send(DaemonMsg::StateChanged {
+            id: agent,
+            state: state_change,
+        });
+    }
+
+    fn spawn_shell_monitor(self: &Arc<Self>, terminal: TerminalId, session: Arc<Session>) {
+        let registry = Arc::clone(self);
+        let mut exit_rx = session.exit_rx();
+        tokio::spawn(async move {
+            let _ = exit_rx.changed().await;
+            let code = session.exit_code();
+            registry.state.lock().unwrap().terminals.remove(&terminal);
+            let _ = registry
+                .events
+                .send(DaemonMsg::TerminalExited { terminal, code });
+        });
     }
 }
 
-/// Human-friendly name from a branch: its last path segment.
 fn agent_name(branch: &str) -> String {
     branch.rsplit('/').next().unwrap_or(branch).to_string()
 }

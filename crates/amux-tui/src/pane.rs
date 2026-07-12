@@ -1,8 +1,7 @@
 //! A pure binary-space-partition pane tree for the tiled main area: split, close, directional
-//! navigate, and resize. No I/O, no rendering — it only computes rectangles. Heavily
-//! unit-tested. See `docs/SPLITS.md`.
+//! navigate, and resize. Generic over the pane payload (the app stores a `TerminalId`). No I/O,
+//! no rendering — it only computes rectangles. Heavily unit-tested. See `docs/SPLITS.md`.
 
-use amux_core::agent::AgentId;
 use ratatui::layout::Rect;
 
 pub type PaneId = u64;
@@ -25,24 +24,24 @@ pub enum Dir {
     Down,
 }
 
-enum Node {
+enum Node<P> {
     Leaf {
         id: PaneId,
-        agent: Option<AgentId>,
+        payload: Option<P>,
     },
     Split {
         axis: Axis,
         ratio: f32,
-        first: Box<Node>,
-        second: Box<Node>,
+        first: Box<Node<P>>,
+        second: Box<Node<P>>,
     },
 }
 
 /// A pane's placement, for rendering and geometry.
 #[derive(Clone, Copy, Debug, PartialEq)]
-pub struct Placement {
+pub struct Placement<P> {
     pub id: PaneId,
-    pub agent: Option<AgentId>,
+    pub payload: Option<P>,
     pub rect: Rect,
     pub focused: bool,
 }
@@ -57,19 +56,19 @@ pub enum Nav {
 }
 
 /// The tiled pane layout: a tree of splits with a focused leaf.
-pub struct PaneTree {
-    root: Option<Node>,
+pub struct PaneTree<P> {
+    root: Option<Node<P>>,
     focus: PaneId,
     next_id: PaneId,
 }
 
-impl Default for PaneTree {
+impl<P: Copy + PartialEq> Default for PaneTree<P> {
     fn default() -> Self {
         Self::new()
     }
 }
 
-impl PaneTree {
+impl<P: Copy + PartialEq> PaneTree<P> {
     pub fn new() -> Self {
         Self {
             root: None,
@@ -88,34 +87,35 @@ impl PaneTree {
         self.root.is_none()
     }
 
-    pub fn focused_agent(&self) -> Option<AgentId> {
+    pub fn focused_payload(&self) -> Option<P> {
         self.root
             .as_ref()
-            .and_then(|n| find_agent(n, self.focus))
+            .and_then(|n| find_payload(n, self.focus))
             .flatten()
     }
 
-    /// Every agent currently shown in a pane.
-    pub fn agents(&self) -> Vec<AgentId> {
+    /// Every payload currently shown in a pane. (Test helper — the app reconciles via `layout`.)
+    #[cfg(test)]
+    pub fn payloads(&self) -> Vec<P> {
         let mut out = Vec::new();
         if let Some(n) = &self.root {
-            collect_agents(n, &mut out);
+            collect_payloads(n, &mut out);
         }
         out
     }
 
-    /// Open `agent` into the focused pane (creating the first pane if the tree is empty).
-    pub fn open(&mut self, agent: AgentId) {
+    /// Put `payload` into the focused pane (creating the first pane if the tree is empty).
+    pub fn open(&mut self, payload: P) {
         match &mut self.root {
             None => {
                 let id = self.alloc();
                 self.root = Some(Node::Leaf {
                     id,
-                    agent: Some(agent),
+                    payload: Some(payload),
                 });
                 self.focus = id;
             }
-            Some(node) => set_agent(node, self.focus, Some(agent)),
+            Some(node) => set_payload(node, self.focus, Some(payload)),
         }
     }
 
@@ -134,22 +134,29 @@ impl PaneTree {
 
     /// Close the focused pane; focus moves to its sibling. Empties the tree if it was the last.
     pub fn close(&mut self) {
-        let focus = self.focus;
-        if let Some(root) = self.root.take() {
-            let (new_root, sibling_focus) = close_leaf(root, focus);
-            self.root = new_root;
-            if let Some(id) = sibling_focus {
-                self.focus = id;
-            } else if let Some(node) = &self.root {
-                self.focus = first_leaf(node);
+        self.close_id(self.focus);
+    }
+
+    /// Close the pane showing `payload`, if any. Returns whether one was found.
+    pub fn close_payload(&mut self, payload: P) -> bool {
+        match self.root.as_ref().and_then(|n| leaf_with(n, payload)) {
+            Some(id) => {
+                self.close_id(id);
+                true
             }
+            None => false,
         }
     }
 
-    /// Clear any pane showing `agent` (e.g. it was deleted), leaving those panes empty.
-    pub fn remove_agent(&mut self, agent: AgentId) {
-        if let Some(node) = &mut self.root {
-            clear_agent(node, agent);
+    fn close_id(&mut self, id: PaneId) {
+        if let Some(root) = self.root.take() {
+            let (new_root, sibling) = close_leaf(root, id);
+            self.root = new_root;
+            if self.focus == id {
+                self.focus = sibling
+                    .or_else(|| self.root.as_ref().map(first_leaf))
+                    .unwrap_or(0);
+            }
         }
     }
 
@@ -179,8 +186,8 @@ impl PaneTree {
         }
     }
 
-    /// Grow/shrink the focused pane in `dir` by `step` (0.0–1.0), adjusting the nearest ancestor
-    /// split of the matching axis.
+    /// Grow/shrink the focused pane in `dir` by `step`, adjusting the nearest ancestor split of
+    /// the matching axis.
     pub fn resize(&mut self, dir: Dir, step: f32) {
         let (axis, grow) = match dir {
             Dir::Right => (Axis::LeftRight, true),
@@ -195,7 +202,7 @@ impl PaneTree {
     }
 
     /// Placements for every pane within `area`.
-    pub fn layout(&self, area: Rect) -> Vec<Placement> {
+    pub fn layout(&self, area: Rect) -> Vec<Placement<P>> {
         let mut out = Vec::new();
         if let Some(node) = &self.root {
             layout_node(node, area, self.focus, &mut out);
@@ -206,64 +213,78 @@ impl PaneTree {
 
 // --- tree helpers ---
 
-fn find_agent(node: &Node, id: PaneId) -> Option<Option<AgentId>> {
+fn find_payload<P: Copy>(node: &Node<P>, id: PaneId) -> Option<Option<P>> {
     match node {
-        Node::Leaf { id: lid, agent } if *lid == id => Some(*agent),
+        Node::Leaf { id: lid, payload } if *lid == id => Some(*payload),
         Node::Leaf { .. } => None,
         Node::Split { first, second, .. } => {
-            find_agent(first, id).or_else(|| find_agent(second, id))
+            find_payload(first, id).or_else(|| find_payload(second, id))
         }
     }
 }
 
-fn collect_agents(node: &Node, out: &mut Vec<AgentId>) {
+#[cfg(test)]
+fn collect_payloads<P: Copy>(node: &Node<P>, out: &mut Vec<P>) {
     match node {
-        Node::Leaf { agent, .. } => {
-            if let Some(a) = agent {
-                out.push(*a);
+        Node::Leaf { payload, .. } => {
+            if let Some(p) = payload {
+                out.push(*p);
             }
         }
         Node::Split { first, second, .. } => {
-            collect_agents(first, out);
-            collect_agents(second, out);
+            collect_payloads(first, out);
+            collect_payloads(second, out);
         }
     }
 }
 
-fn set_agent(node: &mut Node, id: PaneId, agent: Option<AgentId>) {
+fn leaf_with<P: Copy + PartialEq>(node: &Node<P>, payload: P) -> Option<PaneId> {
     match node {
-        Node::Leaf { id: lid, agent: a } if *lid == id => *a = agent,
+        Node::Leaf {
+            id,
+            payload: Some(p),
+        } if *p == payload => Some(*id),
+        Node::Leaf { .. } => None,
+        Node::Split { first, second, .. } => {
+            leaf_with(first, payload).or_else(|| leaf_with(second, payload))
+        }
+    }
+}
+
+fn set_payload<P>(node: &mut Node<P>, id: PaneId, payload: Option<P>) {
+    match node {
+        Node::Leaf {
+            id: lid,
+            payload: p,
+        } if *lid == id => *p = payload,
         Node::Leaf { .. } => {}
         Node::Split { first, second, .. } => {
-            set_agent(first, id, agent);
-            set_agent(second, id, agent);
-        }
-    }
-}
-
-fn clear_agent(node: &mut Node, agent: AgentId) {
-    match node {
-        Node::Leaf { agent: a, .. } => {
-            if *a == Some(agent) {
-                *a = None;
+            // Only one branch will match; the payload isn't Clone so hand it down carefully.
+            if contains(first, id) {
+                set_payload(first, id, payload);
+            } else {
+                set_payload(second, id, payload);
             }
         }
-        Node::Split { first, second, .. } => {
-            clear_agent(first, agent);
-            clear_agent(second, agent);
-        }
     }
 }
 
-fn split_leaf(node: Node, target: PaneId, axis: Axis, new_id: PaneId) -> Node {
+fn contains<P>(node: &Node<P>, id: PaneId) -> bool {
     match node {
-        Node::Leaf { id, agent } if id == target => Node::Split {
+        Node::Leaf { id: lid, .. } => *lid == id,
+        Node::Split { first, second, .. } => contains(first, id) || contains(second, id),
+    }
+}
+
+fn split_leaf<P>(node: Node<P>, target: PaneId, axis: Axis, new_id: PaneId) -> Node<P> {
+    match node {
+        Node::Leaf { id, payload } if id == target => Node::Split {
             axis,
             ratio: 0.5,
-            first: Box::new(Node::Leaf { id, agent }),
+            first: Box::new(Node::Leaf { id, payload }),
             second: Box::new(Node::Leaf {
                 id: new_id,
-                agent: None,
+                payload: None,
             }),
         },
         Node::Leaf { .. } => node,
@@ -281,8 +302,7 @@ fn split_leaf(node: Node, target: PaneId, axis: Axis, new_id: PaneId) -> Node {
     }
 }
 
-/// Returns the (possibly-collapsed) subtree and, if a leaf was removed here, the sibling's focus.
-fn close_leaf(node: Node, target: PaneId) -> (Option<Node>, Option<PaneId>) {
+fn close_leaf<P>(node: Node<P>, target: PaneId) -> (Option<Node<P>>, Option<PaneId>) {
     match node {
         Node::Leaf { id, .. } if id == target => (None, None),
         Node::Leaf { .. } => (Some(node), None),
@@ -292,7 +312,6 @@ fn close_leaf(node: Node, target: PaneId) -> (Option<Node>, Option<PaneId>) {
             first,
             second,
         } => {
-            // Direct child is the target → collapse to the sibling.
             if matches!(&*first, Node::Leaf { id, .. } if *id == target) {
                 let focus = first_leaf(&second);
                 return (Some(*second), Some(focus));
@@ -301,7 +320,6 @@ fn close_leaf(node: Node, target: PaneId) -> (Option<Node>, Option<PaneId>) {
                 let focus = first_leaf(&first);
                 return (Some(*first), Some(focus));
             }
-            // Recurse.
             let (nf, ff) = close_leaf(*first, target);
             let (ns, fs) = close_leaf(*second, target);
             match (nf, ns) {
@@ -321,17 +339,15 @@ fn close_leaf(node: Node, target: PaneId) -> (Option<Node>, Option<PaneId>) {
     }
 }
 
-fn first_leaf(node: &Node) -> PaneId {
+fn first_leaf<P>(node: &Node<P>) -> PaneId {
     match node {
         Node::Leaf { id, .. } => *id,
         Node::Split { first, .. } => first_leaf(first),
     }
 }
 
-/// Adjust the nearest matching-axis ancestor of the focused leaf. Returns
-/// `(focus_in_subtree, already_handled)`.
-fn resize_toward(
-    node: &mut Node,
+fn resize_toward<P>(
+    node: &mut Node<P>,
     focus: PaneId,
     axis: Axis,
     grow: bool,
@@ -354,7 +370,6 @@ fn resize_toward(
             let in_sub = in_first || in_second;
             let handled = handled_first || handled_second;
             if in_sub && !handled && *node_axis == axis {
-                // Grow the focused child: +step if it's `first`, -step if `second`.
                 let delta = if grow == in_first { step } else { -step };
                 *ratio = (*ratio + delta).clamp(0.1, 0.9);
                 return (true, true);
@@ -364,11 +379,11 @@ fn resize_toward(
     }
 }
 
-fn layout_node(node: &Node, rect: Rect, focus: PaneId, out: &mut Vec<Placement>) {
+fn layout_node<P: Copy>(node: &Node<P>, rect: Rect, focus: PaneId, out: &mut Vec<Placement<P>>) {
     match node {
-        Node::Leaf { id, agent } => out.push(Placement {
+        Node::Leaf { id, payload } => out.push(Placement {
             id: *id,
-            agent: *agent,
+            payload: *payload,
             rect,
             focused: *id == focus,
         }),
@@ -388,21 +403,29 @@ fn layout_node(node: &Node, rect: Rect, focus: PaneId, out: &mut Vec<Placement>)
 fn split_rect(rect: Rect, axis: Axis, ratio: f32) -> (Rect, Rect) {
     match axis {
         Axis::LeftRight => {
-            let w1 = ((rect.width as f32 * ratio).round() as u16).clamp(1, rect.width.max(1));
-            let w1 = w1.min(rect.width.saturating_sub(1)).max(1.min(rect.width));
+            let w1 = ((rect.width as f32 * ratio).round() as u16)
+                .clamp(1, rect.width.saturating_sub(1).max(1));
             (
                 Rect::new(rect.x, rect.y, w1, rect.height),
-                Rect::new(rect.x + w1, rect.y, rect.width - w1, rect.height),
+                Rect::new(
+                    rect.x + w1,
+                    rect.y,
+                    rect.width.saturating_sub(w1),
+                    rect.height,
+                ),
             )
         }
         Axis::TopBottom => {
-            let h1 = ((rect.height as f32 * ratio).round() as u16).clamp(1, rect.height.max(1));
-            let h1 = h1
-                .min(rect.height.saturating_sub(1))
-                .max(1.min(rect.height));
+            let h1 = ((rect.height as f32 * ratio).round() as u16)
+                .clamp(1, rect.height.saturating_sub(1).max(1));
             (
                 Rect::new(rect.x, rect.y, rect.width, h1),
-                Rect::new(rect.x, rect.y + h1, rect.width, rect.height - h1),
+                Rect::new(
+                    rect.x,
+                    rect.y + h1,
+                    rect.width,
+                    rect.height.saturating_sub(h1),
+                ),
             )
         }
     }
@@ -444,6 +467,7 @@ fn dist(dir: Dir, cur: Rect, other: Rect) -> (u32, u32) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use amux_core::agent::TerminalId;
 
     fn area() -> Rect {
         Rect::new(0, 0, 100, 40)
@@ -453,75 +477,81 @@ mod tests {
     fn open_into_empty_creates_one_focused_pane() {
         let mut t = PaneTree::new();
         assert!(t.is_empty());
-        let a = AgentId::new();
+        let a = TerminalId::new();
         t.open(a);
-        assert!(!t.is_empty());
-        assert_eq!(t.focused_agent(), Some(a));
-        assert_eq!(t.agents(), vec![a]);
+        assert_eq!(t.focused_payload(), Some(a));
+        assert_eq!(t.payloads(), vec![a]);
         assert_eq!(t.layout(area()).len(), 1);
     }
 
     #[test]
     fn split_makes_two_panes_new_one_empty_and_focused() {
         let mut t = PaneTree::new();
-        let a = AgentId::new();
+        let a = TerminalId::new();
         t.open(a);
         t.split(Axis::LeftRight);
-        let places = t.layout(area());
-        assert_eq!(places.len(), 2);
-        assert_eq!(t.focused_agent(), None); // new pane is empty
-        assert_eq!(t.agents(), vec![a]); // only the original has an agent
-        let b = AgentId::new();
-        t.open(b); // fill the focused (new) pane
-        assert_eq!(t.focused_agent(), Some(b));
-        assert_eq!(t.agents().len(), 2);
+        assert_eq!(t.layout(area()).len(), 2);
+        assert_eq!(t.focused_payload(), None);
+        assert_eq!(t.payloads(), vec![a]);
+        let b = TerminalId::new();
+        t.open(b);
+        assert_eq!(t.focused_payload(), Some(b));
+        assert_eq!(t.payloads().len(), 2);
     }
 
     #[test]
     fn close_collapses_back_to_sibling() {
         let mut t = PaneTree::new();
-        let a = AgentId::new();
+        let a = TerminalId::new();
         t.open(a);
-        t.split(Axis::LeftRight); // focus on new empty pane
-        t.close(); // close the empty one → back to `a`
+        t.split(Axis::LeftRight);
+        t.close();
         assert_eq!(t.layout(area()).len(), 1);
-        assert_eq!(t.focused_agent(), Some(a));
-        t.close(); // close the last one → empty
+        assert_eq!(t.focused_payload(), Some(a));
+        t.close();
         assert!(t.is_empty());
+    }
+
+    #[test]
+    fn close_payload_removes_the_right_pane() {
+        let mut t = PaneTree::new();
+        let a = TerminalId::new();
+        t.open(a);
+        t.split(Axis::LeftRight);
+        let b = TerminalId::new();
+        t.open(b);
+        assert!(t.close_payload(a)); // close the non-focused pane by payload
+        assert_eq!(t.payloads(), vec![b]);
+        assert!(!t.close_payload(TerminalId::new())); // unknown payload
     }
 
     #[test]
     fn navigate_moves_across_panes_and_exits_left() {
         let mut t = PaneTree::new();
-        t.open(AgentId::new()); // pane 1 (left)
-        t.split(Axis::LeftRight); // pane 2 (right), focused
+        t.open(TerminalId::new());
+        t.split(Axis::LeftRight);
         let a = area();
-        // Focused is the right pane; moving left lands on the left pane.
         assert_eq!(t.navigate(Dir::Left, a), Nav::Moved);
-        // Moving left again — no pane further left → exit to the sidebar.
         assert_eq!(t.navigate(Dir::Left, a), Nav::ExitLeft);
-        // Back right onto the second pane.
         assert_eq!(t.navigate(Dir::Right, a), Nav::Moved);
-        // Nothing above.
         assert_eq!(t.navigate(Dir::Up, a), Nav::Stay);
     }
 
     #[test]
     fn resize_changes_pane_widths() {
         let mut t = PaneTree::new();
-        t.open(AgentId::new());
-        t.split(Axis::LeftRight); // focus = right pane, ratio 0.5
+        t.open(TerminalId::new());
+        t.split(Axis::LeftRight);
         let a = area();
-        let right_before = t
+        let before = t
             .layout(a)
             .into_iter()
             .find(|p| p.focused)
             .unwrap()
             .rect
             .width;
-        // Grow the focused (right) pane's width.
         t.resize(Dir::Right, 0.1);
-        let right_after = t
+        let after = t
             .layout(a)
             .into_iter()
             .find(|p| p.focused)
@@ -529,8 +559,8 @@ mod tests {
             .rect
             .width;
         assert!(
-            right_after > right_before,
-            "focused pane should widen ({right_before} → {right_after})"
+            after > before,
+            "focused pane should widen ({before} → {after})"
         );
     }
 }

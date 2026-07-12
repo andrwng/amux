@@ -88,7 +88,6 @@ impl<S, R: DeserializeOwned> Decoder for WireCodec<S, R> {
             return Err(ProtoError::FrameTooLarge(len));
         }
         if src.len() < 4 + len {
-            // Reserve the rest of the frame so the next read can complete it.
             src.reserve(4 + len - src.len());
             return Ok(None);
         }
@@ -107,12 +106,10 @@ pub type ServerCodec = WireCodec<DaemonMsg, ClientMsg>;
 mod tests {
     use super::*;
     use crate::{AgentInfo, Size};
-    use amux_core::agent::{AgentId, AgentState};
+    use amux_core::agent::{AgentId, AgentState, TerminalId};
     use chrono::Utc;
     use proptest::prelude::*;
 
-    /// Encode then decode with a symmetric codec; assert we get the same value back and the
-    /// buffer is fully consumed.
     fn roundtrip<T>(msg: T)
     where
         T: Serialize + DeserializeOwned + Clone + PartialEq + std::fmt::Debug,
@@ -132,12 +129,14 @@ mod tests {
             branch: "feat/auth".into(),
             state: AgentState::Working,
             last_activity: Utc::now(),
+            primary_terminal: TerminalId::new(),
         }
     }
 
     #[test]
     fn client_messages_roundtrip() {
         let id = AgentId::new();
+        let t = TerminalId::new();
         roundtrip(ClientMsg::Hello {
             proto_version: PROTO_VERSION,
         });
@@ -147,20 +146,25 @@ mod tests {
         });
         roundtrip(ClientMsg::DeleteAgent { id, force: true });
         roundtrip(ClientMsg::ResumeAgent { id });
+        roundtrip(ClientMsg::SpawnShell {
+            terminal: t,
+            like: TerminalId::new(),
+        });
+        roundtrip(ClientMsg::CloseTerminal { terminal: t });
         roundtrip(ClientMsg::Attach {
-            id,
+            terminal: t,
             size: Size {
                 cols: 120,
                 rows: 40,
             },
         });
-        roundtrip(ClientMsg::Detach { id });
+        roundtrip(ClientMsg::Detach { terminal: t });
         roundtrip(ClientMsg::Input {
-            id,
+            terminal: t,
             bytes: vec![0x1b, b'[', b'A'],
         });
         roundtrip(ClientMsg::Resize {
-            id,
+            terminal: t,
             size: Size { cols: 80, rows: 24 },
         });
     }
@@ -168,27 +172,32 @@ mod tests {
     #[test]
     fn daemon_messages_roundtrip() {
         let id = AgentId::new();
+        let t = TerminalId::new();
         roundtrip(DaemonMsg::Hello {
             proto_version: PROTO_VERSION,
         });
         roundtrip(DaemonMsg::Agents(vec![sample_info(), sample_info()]));
         roundtrip(DaemonMsg::AgentAdded(sample_info()));
         roundtrip(DaemonMsg::AgentRemoved { id });
-        roundtrip(DaemonMsg::DeleteNeedsConfirm {
-            id,
-            message: "2 uncommitted changes".into(),
-        });
         roundtrip(DaemonMsg::StateChanged {
             id,
             state: AgentState::Exited { code: Some(0) },
         });
-        roundtrip(DaemonMsg::OutputSnapshot {
+        roundtrip(DaemonMsg::DeleteNeedsConfirm {
             id,
+            message: "2 uncommitted changes".into(),
+        });
+        roundtrip(DaemonMsg::OutputSnapshot {
+            terminal: t,
             bytes: vec![1, 2, 3],
         });
         roundtrip(DaemonMsg::Output {
-            id,
-            bytes: b"hello\r\n".to_vec(),
+            terminal: t,
+            bytes: b"hi\r\n".to_vec(),
+        });
+        roundtrip(DaemonMsg::TerminalExited {
+            terminal: t,
+            code: Some(0),
         });
         roundtrip(DaemonMsg::Error {
             message: "boom".into(),
@@ -200,7 +209,7 @@ mod tests {
         let mut codec = WireCodec::<ClientMsg, ClientMsg>::new();
         let mut full = BytesMut::new();
         let msg = ClientMsg::Input {
-            id: AgentId::new(),
+            terminal: TerminalId::new(),
             bytes: vec![1, 2, 3, 4, 5],
         };
         codec.encode(msg.clone(), &mut full).unwrap();
@@ -258,12 +267,12 @@ mod tests {
     proptest! {
         #[test]
         fn input_bytes_roundtrip(bytes in prop::collection::vec(any::<u8>(), 0..4096)) {
-            roundtrip(ClientMsg::Input { id: AgentId::new(), bytes });
+            roundtrip(ClientMsg::Input { terminal: TerminalId::new(), bytes });
         }
 
         #[test]
         fn output_bytes_roundtrip(bytes in prop::collection::vec(any::<u8>(), 0..4096)) {
-            roundtrip(DaemonMsg::Output { id: AgentId::new(), bytes });
+            roundtrip(DaemonMsg::Output { terminal: TerminalId::new(), bytes });
         }
     }
 }

@@ -1,15 +1,15 @@
-//! Integration test for the multi-agent daemon: a headless client creates an agent (a worktree
-//! plus a `cat` session), attaches, echoes input, then deletes it — over the v1 protocol against
-//! a temp git repo built via libgit2 (no `git` binary needed). See `docs/PHASE-1.md` §1.5.
+//! Integration tests for the multi-agent daemon (v4): a headless client creates an agent (a
+//! worktree + a primary `cat` terminal), attaches, echoes input, splits a shell in the same
+//! worktree, and deletes — over a temp git repo built via libgit2 (no `git` binary needed).
 
 use std::path::Path;
 use std::time::Duration;
 
 use amux_core::adapter::ClaudeAdapter;
-use amux_core::agent::AgentId;
+use amux_core::agent::TerminalId;
 use amux_core::worktree::WorktreeService;
 use amux_daemon::{serve, Registry};
-use amux_proto::{ClientCodec, ClientMsg, DaemonMsg, Size, PROTO_VERSION};
+use amux_proto::{AgentInfo, ClientCodec, ClientMsg, DaemonMsg, Size, PROTO_VERSION};
 use futures::{SinkExt, StreamExt};
 use git2::Repository;
 use tokio::net::{UnixListener, UnixStream};
@@ -34,6 +34,25 @@ fn init_repo(dir: &Path) {
         .unwrap();
 }
 
+/// Spin up a daemon over a fresh temp repo with a `cat` primary; return (client, socket, tmp).
+async fn setup() -> (Client, tempfile::TempDir) {
+    let tmp = tempfile::tempdir().unwrap();
+    let repo = tmp.path().join("repo");
+    std::fs::create_dir(&repo).unwrap();
+    init_repo(&repo);
+
+    let worktrees = WorktreeService::with_base(&repo, tmp.path().join("wt")).unwrap();
+    let adapter = Box::new(ClaudeAdapter::with_command(vec!["cat".into()]));
+    let registry = Registry::new(worktrees, adapter);
+
+    let socket = tmp.path().join("amuxd.sock");
+    let listener = UnixListener::bind(&socket).unwrap();
+    tokio::spawn(serve(listener, registry));
+
+    let client = handshake(&socket).await;
+    (client, tmp)
+}
+
 async fn handshake(socket: &Path) -> Client {
     let stream = UnixStream::connect(socket).await.expect("connect");
     let mut client = Framed::new(stream, ClientCodec::new());
@@ -54,12 +73,17 @@ async fn handshake(socket: &Path) -> Client {
     client
 }
 
-/// Drain until an `AgentAdded` arrives; return its id.
-async fn wait_for_added(client: &mut Client) -> AgentId {
+async fn create_agent(client: &mut Client, branch: &str) -> AgentInfo {
+    client
+        .send(ClientMsg::CreateAgent {
+            branch: branch.into(),
+        })
+        .await
+        .unwrap();
     tokio::time::timeout(Duration::from_secs(5), async {
         loop {
             match client.next().await {
-                Some(Ok(DaemonMsg::AgentAdded(info))) => return info.id,
+                Some(Ok(DaemonMsg::AgentAdded(info))) => return info,
                 Some(Ok(_)) => {}
                 other => panic!("stream ended before AgentAdded: {other:?}"),
             }
@@ -90,66 +114,44 @@ async fn wait_for_output(client: &mut Client, needle: &str) -> bool {
     .unwrap_or(false)
 }
 
+const SIZE: Size = Size { cols: 80, rows: 24 };
+
 #[tokio::test]
 async fn create_attach_echo_delete() {
-    let tmp = tempfile::tempdir().unwrap();
-    let repo = tmp.path().join("repo");
-    std::fs::create_dir(&repo).unwrap();
-    init_repo(&repo);
+    let (mut client, _tmp) = setup().await;
+    let agent = create_agent(&mut client, "feat/x").await;
+    let term = agent.primary_terminal;
 
-    let worktrees = WorktreeService::with_base(&repo, tmp.path().join("wt")).unwrap();
-    let adapter = Box::new(ClaudeAdapter::with_command(vec!["cat".into()]));
-    let registry = Registry::new(worktrees, adapter);
-
-    let socket = tmp.path().join("amuxd.sock");
-    let listener = UnixListener::bind(&socket).unwrap();
-    let server = tokio::spawn(serve(listener, registry));
-
-    let mut client = handshake(&socket).await;
-
-    // Create an agent (worktree + cat session) and learn its id from the broadcast event.
-    client
-        .send(ClientMsg::CreateAgent {
-            branch: "feat/x".into(),
-        })
-        .await
-        .unwrap();
-    let id = wait_for_added(&mut client).await;
-
-    // Attach and confirm the cat session echoes input.
     client
         .send(ClientMsg::Attach {
-            id,
-            size: Size { cols: 80, rows: 24 },
+            terminal: term,
+            size: SIZE,
         })
         .await
         .unwrap();
     client
         .send(ClientMsg::Input {
-            id,
+            terminal: term,
             bytes: b"echo-marker\n".to_vec(),
         })
         .await
         .unwrap();
     assert!(
         wait_for_output(&mut client, "echo-marker").await,
-        "attached session did not echo input"
+        "primary terminal did not echo input"
     );
 
-    // Delete removes the agent (and its worktree); expect the broadcast.
-    let worktree_path = tmp.path().join("wt").join("feat-x");
-    assert!(
-        worktree_path.exists(),
-        "worktree should exist before delete"
-    );
     client
-        .send(ClientMsg::DeleteAgent { id, force: true })
+        .send(ClientMsg::DeleteAgent {
+            id: agent.id,
+            force: true,
+        })
         .await
         .unwrap();
     let removed = tokio::time::timeout(Duration::from_secs(5), async {
         loop {
             match client.next().await {
-                Some(Ok(DaemonMsg::AgentRemoved { id: gone })) => return gone == id,
+                Some(Ok(DaemonMsg::AgentRemoved { id })) => return id == agent.id,
                 Some(Ok(_)) => {}
                 _ => return false,
             }
@@ -158,58 +160,76 @@ async fn create_attach_echo_delete() {
     .await
     .unwrap_or(false);
     assert!(removed, "expected AgentRemoved after delete");
-
-    server.abort();
 }
 
 #[tokio::test]
-async fn two_agents_stream_simultaneously() {
-    let tmp = tempfile::tempdir().unwrap();
-    let repo = tmp.path().join("repo");
-    std::fs::create_dir(&repo).unwrap();
-    init_repo(&repo);
+async fn split_spawns_an_attachable_shell_in_the_same_worktree() {
+    let (mut client, _tmp) = setup().await;
+    let agent = create_agent(&mut client, "feat/split").await;
 
-    let worktrees = WorktreeService::with_base(&repo, tmp.path().join("wt")).unwrap();
-    let adapter = Box::new(ClaudeAdapter::with_command(vec!["cat".into()]));
-    let registry = Registry::new(worktrees, adapter);
-
-    let socket = tmp.path().join("amuxd.sock");
-    let listener = UnixListener::bind(&socket).unwrap();
-    let server = tokio::spawn(serve(listener, registry));
-
-    let mut client = handshake(&socket).await;
-    let size = Size { cols: 80, rows: 24 };
-
+    // Split: spawn a shell terminal (client-generated id) beside the primary.
+    let shell = TerminalId::new();
     client
-        .send(ClientMsg::CreateAgent { branch: "a".into() })
-        .await
-        .unwrap();
-    let a = wait_for_added(&mut client).await;
-    client
-        .send(ClientMsg::CreateAgent { branch: "b".into() })
-        .await
-        .unwrap();
-    let b = wait_for_added(&mut client).await;
-
-    // Attach both, then feed each — both should stream back, tagged by id.
-    client
-        .send(ClientMsg::Attach { id: a, size })
+        .send(ClientMsg::SpawnShell {
+            terminal: shell,
+            like: agent.primary_terminal,
+        })
         .await
         .unwrap();
     client
-        .send(ClientMsg::Attach { id: b, size })
+        .send(ClientMsg::Attach {
+            terminal: shell,
+            size: SIZE,
+        })
+        .await
+        .unwrap();
+
+    // Attaching the new shell yields a snapshot tagged with its terminal id.
+    let attached = tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            match client.next().await {
+                Some(Ok(DaemonMsg::OutputSnapshot { terminal, .. })) => return terminal == shell,
+                Some(Ok(_)) => {}
+                _ => return false,
+            }
+        }
+    })
+    .await
+    .unwrap_or(false);
+    assert!(attached, "the split shell terminal should be attachable");
+}
+
+#[tokio::test]
+async fn two_terminals_stream_simultaneously() {
+    let (mut client, _tmp) = setup().await;
+    let a = create_agent(&mut client, "a").await;
+    let b = create_agent(&mut client, "b").await;
+    let (ta, tb) = (a.primary_terminal, b.primary_terminal);
+
+    client
+        .send(ClientMsg::Attach {
+            terminal: ta,
+            size: SIZE,
+        })
+        .await
+        .unwrap();
+    client
+        .send(ClientMsg::Attach {
+            terminal: tb,
+            size: SIZE,
+        })
         .await
         .unwrap();
     client
         .send(ClientMsg::Input {
-            id: a,
+            terminal: ta,
             bytes: b"AAAA\n".to_vec(),
         })
         .await
         .unwrap();
     client
         .send(ClientMsg::Input {
-            id: b,
+            terminal: tb,
             bytes: b"BBBB\n".to_vec(),
         })
         .await
@@ -219,11 +239,11 @@ async fn two_agents_stream_simultaneously() {
         let (mut sa, mut sb) = (Vec::new(), Vec::new());
         loop {
             match client.next().await {
-                Some(Ok(DaemonMsg::Output { id, bytes }))
-                | Some(Ok(DaemonMsg::OutputSnapshot { id, bytes })) => {
-                    if id == a {
+                Some(Ok(DaemonMsg::Output { terminal, bytes }))
+                | Some(Ok(DaemonMsg::OutputSnapshot { terminal, bytes })) => {
+                    if terminal == ta {
                         sa.extend_from_slice(&bytes);
-                    } else if id == b {
+                    } else if terminal == tb {
                         sb.extend_from_slice(&bytes);
                     }
                     if String::from_utf8_lossy(&sa).contains("AAAA")
@@ -239,48 +259,28 @@ async fn two_agents_stream_simultaneously() {
     })
     .await
     .unwrap_or(false);
-    assert!(both, "both attached agents should stream, tagged by id");
-
-    server.abort();
+    assert!(both, "both terminals should stream, tagged by id");
 }
 
 #[tokio::test]
 async fn dirty_worktree_requires_delete_confirmation() {
-    let tmp = tempfile::tempdir().unwrap();
-    let repo = tmp.path().join("repo");
-    std::fs::create_dir(&repo).unwrap();
-    init_repo(&repo);
+    let (mut client, tmp) = setup().await;
+    let agent = create_agent(&mut client, "feat/dirty").await;
 
-    let worktrees = WorktreeService::with_base(&repo, tmp.path().join("wt")).unwrap();
-    let adapter = Box::new(ClaudeAdapter::with_command(vec!["cat".into()]));
-    let registry = Registry::new(worktrees, adapter);
-
-    let socket = tmp.path().join("amuxd.sock");
-    let listener = UnixListener::bind(&socket).unwrap();
-    let server = tokio::spawn(serve(listener, registry));
-
-    let mut client = handshake(&socket).await;
-    client
-        .send(ClientMsg::CreateAgent {
-            branch: "feat/dirty".into(),
-        })
-        .await
-        .unwrap();
-    let id = wait_for_added(&mut client).await;
-
-    // Dirty the worktree with an untracked file.
     let worktree = tmp.path().join("wt").join("feat-dirty");
     std::fs::write(worktree.join("scratch.txt"), "uncommitted").unwrap();
 
-    // Delete without force → the daemon refuses and asks to confirm.
     client
-        .send(ClientMsg::DeleteAgent { id, force: false })
+        .send(ClientMsg::DeleteAgent {
+            id: agent.id,
+            force: false,
+        })
         .await
         .unwrap();
     let needs_confirm = tokio::time::timeout(Duration::from_secs(5), async {
         loop {
             match client.next().await {
-                Some(Ok(DaemonMsg::DeleteNeedsConfirm { id: got, .. })) => return got == id,
+                Some(Ok(DaemonMsg::DeleteNeedsConfirm { id, .. })) => return id == agent.id,
                 Some(Ok(_)) => {}
                 _ => return false,
             }
@@ -294,15 +294,17 @@ async fn dirty_worktree_requires_delete_confirmation() {
         "worktree must survive an unconfirmed delete"
     );
 
-    // Force delete → gone.
     client
-        .send(ClientMsg::DeleteAgent { id, force: true })
+        .send(ClientMsg::DeleteAgent {
+            id: agent.id,
+            force: true,
+        })
         .await
         .unwrap();
     let removed = tokio::time::timeout(Duration::from_secs(5), async {
         loop {
             match client.next().await {
-                Some(Ok(DaemonMsg::AgentRemoved { id: got })) => return got == id,
+                Some(Ok(DaemonMsg::AgentRemoved { id })) => return id == agent.id,
                 Some(Ok(_)) => {}
                 _ => return false,
             }
@@ -315,6 +317,4 @@ async fn dirty_worktree_requires_delete_confirmation() {
         !worktree.exists(),
         "worktree should be gone after force delete"
     );
-
-    server.abort();
 }

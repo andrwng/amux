@@ -1,37 +1,46 @@
 # Tiled Splits — Plan
 
-**Goal:** make the main area a tmux-style split space — tiled panes, each streaming an agent,
-navigated with tmux muscle memory. First-class, coexisting with the floating minis (§7.5 of
-`docs/DESIGN.md`). Independent of Phase 2 (hooks); can land before or after it.
+**Goal:** make the main area a tmux-style split space — tiled panes, each streaming a
+**terminal**, navigated with tmux muscle memory. First-class, coexisting with the floating minis
+(§7.5 of `docs/DESIGN.md`). Independent of Phase 2 (hooks); can land before or after it.
 
-The protocol was built for this: `Output` / `Input` / `Resize` are already per-`AgentId`. The
-two real changes are the daemon streaming *several* agents at once, and the client holding a
-*pane tree* instead of a single `main`.
+**The terminal model (proto v4).** The sidebar lists **agents** (durable workspaces: worktree +
+branch). Panes stream **terminals** (PTYs). An agent owns a *primary terminal* (its CLI) plus any
+*shell terminals* split off in the same worktree. A split is not "an empty slot for another
+agent" — it opens the default `$SHELL` in the same worktree, a sibling terminal, and it lives
+only as long as its pane. `Output` / `Input` / `Resize` / `Attach` / `Detach` are all keyed by
+`TerminalId`.
 
 ---
 
-## S.1 — Daemon: multiple simultaneous attachments
+## S.1 — Daemon: multiple simultaneous attachments  ✅
 
 Replace the single re-targetable stream with a set of attachments. Client subscribes to N
-agents; the daemon runs one output forwarder per attached agent, tagging `Output { id, .. }`.
+terminals; the daemon runs one output forwarder per attached terminal, tagging
+`Output { terminal, .. }`.
 
-- Proto v3: add `ClientMsg::Detach { id }` (Attach already adds a stream; Detach removes it).
-- `handle_client`: `attached: HashMap<AgentId, JoinHandle>` instead of `Option<(id, handle)>`.
-  `Attach{id}` spawns a forwarder + snapshot if not already attached; `Detach{id}` aborts it.
-- **DoD:** integration test — attach two `cat` agents on one connection, feed each, assert both
-  streams echo independently, tagged by id.
+- Proto v4: Attach/Detach/Input/Resize keyed by `TerminalId`; `SpawnShell { terminal, like }`
+  opens a `$SHELL` in `like`'s worktree; `CloseTerminal { terminal }` kills a shell (no-op on a
+  primary). `AgentInfo` carries `primary_terminal`.
+- `handle_command`: `attached: HashMap<TerminalId, JoinHandle>`. `Attach` spawns a forwarder +
+  snapshot if not already attached; `Detach` aborts it.
+- **DoD (done):** integration tests — attach two primary terminals on one connection and assert
+  both echo independently, tagged by id; `SpawnShell` yields an attachable shell in the same
+  worktree; force-delete kills every terminal + removes the worktree.
 
-## S.2 — Client: pane tree
+## S.2 — Client: pane tree  ✅
 
-Replace `attached: Option<AgentId>` + the single parser with a binary space-partition tree:
-- Leaf = a pane: `{ agent: AgentId, parser: vt100::Parser }`.
-- Internal node = `{ dir: H|V, ratio, left, right }`.
-- `focus`: a path/id to the focused leaf.
-- A pure `layout(tree, area) -> Vec<(leaf, Rect)>` (recursive) drives rendering; each leaf's
-  parser is fed by that agent's `Output`. On any layout change, each visible pane sends
-  `Resize { id, pane_size }` (resize-to-slot, per pane).
-- **DoD:** pure unit tests for split / close / navigate on the tree; `TestBackend` snapshot of a
-  2- and 3-pane layout.
+A binary space-partition tree generic over its payload, instantiated as `PaneTree<TerminalId>`:
+- Leaf = a pane holding a `TerminalId`; the client keeps `parsers: HashMap<TerminalId, Parser>`
+  and `terminals: HashMap<TerminalId, AgentId>` alongside it.
+- Internal node = `Split { axis: H|V, ratio, first, second }`; focus is a path to the focused
+  leaf.
+- A pure `layout(area) -> Vec<Placement<TerminalId>>` drives rendering; each leaf's parser is fed
+  by that terminal's `Output`. `reconcile` diffs the layout against what's attached and sends
+  `Attach`/`Resize` for newly-visible terminals; a terminal that leaves the layout is `Detach`ed
+  (primary — the agent keeps running) or `CloseTerminal`d (shell — killed).
+- **DoD (done):** pure unit tests for split / close / navigate on the tree; render tests of the
+  2- and 3-pane layouts.
 
 ## S.3 — Navigation, resize, and the keymap
 
@@ -49,11 +58,13 @@ determined by *where focus is* (sidebar = commands; pane = agent input) plus a f
   Right default for a multi-agent tool; escape hatch below. Nav keys are keymap-configurable.
 
 ### Structure — the `Ctrl+B` prefix (less-frequent commands)
-- `Ctrl+B %` split focused pane left/right · `Ctrl+B "` split top/bottom
-- `Ctrl+B x` close focused pane (agent keeps running; `Detach`)
+- `Ctrl+B %` split focused pane left/right · `Ctrl+B "` split top/bottom. **A split opens a new
+  `$SHELL` terminal in the same worktree** (`SpawnShell`), not a slot for a different agent.
+- `Ctrl+B x` close focused pane. Primary terminal → `Detach` (the agent keeps running);
+  shell terminal → `CloseTerminal` (the shell process is killed, ending with its pane).
 - `Ctrl+B r` enter **resize mode** (below)
-- `Ctrl+B <any Ctrl-key>` → send that literal control key to the agent (the escape hatch, e.g.
-  `Ctrl+B Ctrl+L` clears the agent's screen; `Ctrl+B Ctrl+B` sends a literal `Ctrl+B`)
+- `Ctrl+B <any Ctrl-key>` → send that literal control key to the focused terminal (the escape
+  hatch, e.g. `Ctrl+B Ctrl+L` clears its screen; `Ctrl+B Ctrl+B` sends a literal `Ctrl+B`)
 
 ### Resize — a small `hjkl` submode
 `Ctrl+B r` enters resize mode (status bar: `RESIZE — hjkl grow/shrink · esc done`). Then, on the
@@ -63,7 +74,8 @@ by adjusting the ratio of the nearest ancestor split of the matching axis (clamp
 
 ### Sidebar cell (when focused)
 `j`/`k` select · `n` new · `d` delete · `r` resume · `Enter`/`l` open the selected agent into the
-most-recently-focused pane (or the first pane if the layout is empty). `Ctrl+l` moves into panes.
+most-recently-focused pane (or the first pane if the layout is empty). Opening an agent attaches
+its **primary terminal**. `Ctrl+l` moves into panes.
 
 **DoD:** pure unit tests for directional nav, split, close, and resize on the pane tree; the
 prefix + resize state machines tested; keys route to the right pane; interactive check.
@@ -76,5 +88,5 @@ a first splits release.
 
 ---
 
-**Order:** S.1 (daemon) → S.2 (tree) → S.3 (keymap) as one coordinated change (like the
-multi-agent transition), green when the workspace builds. Minis (Phase 3) layer on top later.
+**Order:** S.1 (daemon) → S.2 (tree) → S.3 (keymap) landed as one coordinated change on the
+terminal model (proto v4), green across the workspace. Minis (Phase 3) layer on top later.

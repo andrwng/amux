@@ -1,8 +1,8 @@
-//! Wire message types, v1 — multi-agent. Every terminal-directed message carries an `AgentId`;
-//! the client attaches to (streams) one agent at a time (minis are Phase 3), but manages and
-//! sees the status of all of them. See `docs/DESIGN.md` §6.
+//! Wire message types, v4 — agents own terminals. The sidebar lists **agents** (workspaces);
+//! panes stream **terminals** (PTYs). An agent has a primary terminal (its CLI) plus any shell
+//! terminals split off in the same worktree. See `docs/DESIGN.md` §6 and `docs/SPLITS.md`.
 
-use amux_core::agent::{AgentId, AgentState};
+use amux_core::agent::{AgentId, AgentState, TerminalId};
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
@@ -13,7 +13,7 @@ pub struct Size {
     pub rows: u16,
 }
 
-/// The sidebar's view of one agent.
+/// The sidebar's view of one agent (workspace).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AgentInfo {
     pub id: AgentId,
@@ -21,6 +21,8 @@ pub struct AgentInfo {
     pub branch: String,
     pub state: AgentState,
     pub last_activity: DateTime<Utc>,
+    /// The terminal that shows this agent's CLI (what "open in a pane" attaches to).
+    pub primary_terminal: TerminalId,
 }
 
 /// Messages the client sends to the daemon.
@@ -30,23 +32,30 @@ pub enum ClientMsg {
     Hello { proto_version: u32 },
     /// Request the current agent roster.
     ListAgents,
-    /// Create a new agent on `branch` (worktree + session).
+    /// Create a new agent on `branch` (worktree + a primary terminal).
     CreateAgent { branch: String },
-    /// Delete an agent — kills its session and removes its worktree. The only destructive op.
-    /// With `force = false` the daemon refuses if the worktree has uncommitted changes and
-    /// replies `DeleteNeedsConfirm`; `force = true` deletes regardless.
+    /// Delete an agent — kills all its terminals and removes its worktree. Only destructive op.
     DeleteAgent { id: AgentId, force: bool },
-    /// Resume a suspended (exited) agent's session in its existing worktree.
+    /// Resume a suspended agent's primary terminal in its existing worktree.
     ResumeAgent { id: AgentId },
-    /// Start streaming this agent (snapshot then live output). Multiple agents can be attached
-    /// at once — one per visible pane. Re-attaching an already-attached agent just resizes it.
-    Attach { id: AgentId, size: Size },
-    /// Stop streaming this agent (its pane was closed). The agent keeps running.
-    Detach { id: AgentId },
-    /// Keystroke bytes for a specific agent's PTY.
-    Input { id: AgentId, bytes: Vec<u8> },
-    /// Resize a specific agent's PTY.
-    Resize { id: AgentId, size: Size },
+    /// Split: spawn a `$SHELL` terminal (with new id `terminal`) in the same worktree as `like`.
+    SpawnShell {
+        terminal: TerminalId,
+        like: TerminalId,
+    },
+    /// Close a shell terminal (its pane was closed). No-op on a primary terminal.
+    CloseTerminal { terminal: TerminalId },
+    /// Start streaming a terminal into a pane (snapshot then live output).
+    Attach { terminal: TerminalId, size: Size },
+    /// Stop streaming a terminal (its pane closed / was replaced).
+    Detach { terminal: TerminalId },
+    /// Keystroke bytes for a terminal's PTY.
+    Input {
+        terminal: TerminalId,
+        bytes: Vec<u8>,
+    },
+    /// Resize a terminal's PTY.
+    Resize { terminal: TerminalId, size: Size },
 }
 
 /// Messages the daemon sends to the client.
@@ -60,14 +69,25 @@ pub enum DaemonMsg {
     AgentAdded(AgentInfo),
     /// An agent was deleted.
     AgentRemoved { id: AgentId },
-    /// Delete was refused because the worktree has uncommitted changes — confirm to force it.
-    DeleteNeedsConfirm { id: AgentId, message: String },
     /// An agent's state changed (the sidebar's live signal).
     StateChanged { id: AgentId, state: AgentState },
-    /// Full screen of the attached agent as a `contents_formatted()` dump, sent on attach.
-    OutputSnapshot { id: AgentId, bytes: Vec<u8> },
-    /// Incremental output from the attached agent.
-    Output { id: AgentId, bytes: Vec<u8> },
+    /// Delete was refused because the worktree has uncommitted changes — confirm to force it.
+    DeleteNeedsConfirm { id: AgentId, message: String },
+    /// Full screen of a terminal as a `contents_formatted()` dump, sent on attach.
+    OutputSnapshot {
+        terminal: TerminalId,
+        bytes: Vec<u8>,
+    },
+    /// Incremental output from a terminal.
+    Output {
+        terminal: TerminalId,
+        bytes: Vec<u8>,
+    },
+    /// A terminal's process exited (a shell finished, or a primary's CLI exited).
+    TerminalExited {
+        terminal: TerminalId,
+        code: Option<i32>,
+    },
     /// A daemon-side error surfaced to the client.
     Error { message: String },
 }

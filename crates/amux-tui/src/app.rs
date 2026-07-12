@@ -1,7 +1,7 @@
-//! The TUI: a persistent agent sidebar beside a **tmux-style tiled pane area**. Focus is
-//! spatial — the sidebar plus every pane form one grid, and `Ctrl+hjkl` moves between them
-//! (into/out of the sidebar too). `Ctrl+B` is a prefix for structure (`%`/`"` split, `x`
-//! close, `r` resize). `Ctrl+Q` quits. See `docs/SPLITS.md`.
+//! The TUI: an agent sidebar beside a tmux-style tiled pane area. Panes stream **terminals**;
+//! the sidebar lists **agents** (workspaces). Splitting a pane spawns a `$SHELL` in the same
+//! worktree. Focus is spatial — `Ctrl+hjkl` moves between panes and into/out of the sidebar;
+//! `Ctrl+B` is a prefix (`%`/`"` split, `x` close, `r` resize). `Ctrl+Q` quits. See `SPLITS.md`.
 
 use std::collections::HashMap;
 
@@ -19,11 +19,11 @@ use tokio::net::UnixStream;
 use tokio_util::codec::Framed;
 use tui_term::widget::PseudoTerminal;
 
-use amux_core::agent::{sort_for_sidebar, AgentId, AgentState, RosterItem};
+use amux_core::agent::{sort_for_sidebar, AgentId, AgentState, RosterItem, TerminalId};
 use amux_proto::{AgentInfo, ClientCodec, ClientMsg, DaemonMsg, Size};
 
 use crate::input::key_to_bytes;
-use crate::pane::{Axis, Dir, PaneTree};
+use crate::pane::{Axis, Dir, Nav, PaneTree};
 
 const SIDEBAR_W: u16 = 30;
 const RESIZE_STEP: f32 = 0.05;
@@ -69,7 +69,7 @@ async fn event_loop(
     loop {
         tokio::select! {
             msg = stream.next() => match msg {
-                Some(Ok(dm)) => app.on_daemon(dm),
+                Some(Ok(dm)) => app.on_daemon(dm, &mut sink).await?,
                 _ => break,
             },
             ev = events.next() => match ev {
@@ -88,7 +88,6 @@ async fn event_loop(
     Ok(())
 }
 
-/// The rectangle the tiled panes occupy (right of the sidebar, above the status row).
 fn main_area(cols: u16, rows: u16) -> Rect {
     Rect::new(
         SIDEBAR_W,
@@ -98,7 +97,6 @@ fn main_area(cols: u16, rows: u16) -> Rect {
     )
 }
 
-/// PTY size for a pane rect (inside its 1-cell border).
 fn pane_size(rect: Rect) -> Size {
     Size {
         cols: rect.width.saturating_sub(2).max(1),
@@ -109,9 +107,10 @@ fn pane_size(rect: Rect) -> Size {
 struct App {
     agents: Vec<AgentInfo>,
     sidebar_sel: Option<AgentId>,
-    tree: PaneTree,
-    parsers: HashMap<AgentId, vt100::Parser>,
-    attached: HashMap<AgentId, Size>,
+    tree: PaneTree<TerminalId>,
+    terminals: HashMap<TerminalId, AgentId>,
+    parsers: HashMap<TerminalId, vt100::Parser>,
+    attached: HashMap<TerminalId, Size>,
     focus: Focus,
     input: InputMode,
     prefix: bool,
@@ -129,6 +128,7 @@ impl App {
             agents: Vec::new(),
             sidebar_sel: None,
             tree: PaneTree::new(),
+            terminals: HashMap::new(),
             parsers: HashMap::new(),
             attached: HashMap::new(),
             focus: Focus::Sidebar,
@@ -143,9 +143,13 @@ impl App {
         }
     }
 
+    fn is_primary(&self, terminal: TerminalId) -> bool {
+        self.agents.iter().any(|a| a.primary_terminal == terminal)
+    }
+
     // --- daemon events ---
 
-    fn on_daemon(&mut self, msg: DaemonMsg) {
+    async fn on_daemon(&mut self, msg: DaemonMsg, sink: &mut Sink) -> Result<()> {
         match msg {
             DaemonMsg::Agents(list) => {
                 self.agents = list;
@@ -156,14 +160,27 @@ impl App {
                 self.ensure_sidebar_sel();
             }
             DaemonMsg::AgentRemoved { id } => {
+                let terms: Vec<TerminalId> = self
+                    .terminals
+                    .iter()
+                    .filter(|(_, a)| **a == id)
+                    .map(|(t, _)| *t)
+                    .collect();
+                for t in terms {
+                    self.tree.close_payload(t);
+                    self.parsers.remove(&t);
+                    self.attached.remove(&t);
+                    self.terminals.remove(&t);
+                }
                 self.agents.retain(|a| a.id != id);
-                self.tree.remove_agent(id);
-                self.parsers.remove(&id);
-                self.attached.remove(&id);
                 if self.sidebar_sel == Some(id) {
                     self.sidebar_sel = None;
                 }
+                if self.tree.is_empty() {
+                    self.focus = Focus::Sidebar;
+                }
                 self.ensure_sidebar_sel();
+                self.reconcile(sink).await?;
             }
             DaemonMsg::DeleteNeedsConfirm { id, message } => {
                 self.confirm_id = Some(id);
@@ -176,21 +193,32 @@ impl App {
                     agent.last_activity = Utc::now();
                 }
             }
-            DaemonMsg::OutputSnapshot { id, bytes } => {
-                if let Some(&size) = self.attached.get(&id) {
+            DaemonMsg::OutputSnapshot { terminal, bytes } => {
+                if let Some(&size) = self.attached.get(&terminal) {
                     let mut parser = vt100::Parser::new(size.rows, size.cols, 2000);
                     parser.process(&bytes);
-                    self.parsers.insert(id, parser);
+                    self.parsers.insert(terminal, parser);
                 }
             }
-            DaemonMsg::Output { id, bytes } => {
-                if let Some(parser) = self.parsers.get_mut(&id) {
+            DaemonMsg::Output { terminal, bytes } => {
+                if let Some(parser) = self.parsers.get_mut(&terminal) {
                     parser.process(&bytes);
                 }
+            }
+            DaemonMsg::TerminalExited { terminal, .. } => {
+                self.tree.close_payload(terminal);
+                self.parsers.remove(&terminal);
+                self.attached.remove(&terminal);
+                self.terminals.remove(&terminal);
+                if self.tree.is_empty() {
+                    self.focus = Focus::Sidebar;
+                }
+                self.reconcile(sink).await?;
             }
             DaemonMsg::Error { message } => self.status = message,
             DaemonMsg::Hello { .. } => {}
         }
+        Ok(())
     }
 
     // --- key handling ---
@@ -234,7 +262,7 @@ impl App {
                 }
             }
             Focus::Panes => {
-                if let crate::pane::Nav::ExitLeft = self.tree.navigate(dir, self.area) {
+                if let Nav::ExitLeft = self.tree.navigate(dir, self.area) {
                     self.focus = Focus::Sidebar;
                 }
             }
@@ -261,27 +289,40 @@ impl App {
                     sink.send(ClientMsg::ResumeAgent { id }).await?;
                 }
             }
-            KeyCode::Enter | KeyCode::Char('l') => {
-                if let Some(id) = self.sidebar_sel {
-                    self.tree.open(id);
-                    self.focus = Focus::Panes;
-                    self.reconcile(sink).await?;
-                }
-            }
+            KeyCode::Enter | KeyCode::Char('l') => self.open_selected(sink).await?,
             _ => {}
         }
         Ok(Flow::Continue)
     }
 
+    /// Open the selected agent's primary terminal into the focused pane.
+    async fn open_selected(&mut self, sink: &mut Sink) -> Result<()> {
+        let Some(id) = self.sidebar_sel else {
+            return Ok(());
+        };
+        let Some(terminal) = self
+            .agents
+            .iter()
+            .find(|a| a.id == id)
+            .map(|a| a.primary_terminal)
+        else {
+            return Ok(());
+        };
+        self.terminals.insert(terminal, id);
+        self.tree.open(terminal);
+        self.focus = Focus::Panes;
+        self.reconcile(sink).await
+    }
+
     async fn key_pane(&mut self, key: KeyEvent, sink: &mut Sink) -> Result<Flow> {
-        if let Some(agent) = self.tree.focused_agent() {
+        if let Some(terminal) = self.tree.focused_payload() {
             let app_cursor = self
                 .parsers
-                .get(&agent)
+                .get(&terminal)
                 .map(|p| p.screen().application_cursor())
                 .unwrap_or(false);
             if let Some(bytes) = key_to_bytes(key, app_cursor) {
-                sink.send(ClientMsg::Input { id: agent, bytes }).await?;
+                sink.send(ClientMsg::Input { terminal, bytes }).await?;
             }
         }
         Ok(Flow::Continue)
@@ -289,16 +330,8 @@ impl App {
 
     async fn key_prefix(&mut self, key: KeyEvent, sink: &mut Sink) -> Result<Flow> {
         match key.code {
-            KeyCode::Char('%') if !self.tree.is_empty() => {
-                self.tree.split(Axis::LeftRight);
-                self.focus = Focus::Panes;
-                self.reconcile(sink).await?;
-            }
-            KeyCode::Char('"') if !self.tree.is_empty() => {
-                self.tree.split(Axis::TopBottom);
-                self.focus = Focus::Panes;
-                self.reconcile(sink).await?;
-            }
+            KeyCode::Char('%') => self.split(Axis::LeftRight, sink).await?,
+            KeyCode::Char('"') => self.split(Axis::TopBottom, sink).await?,
             KeyCode::Char('x') => {
                 self.tree.close();
                 if self.tree.is_empty() {
@@ -307,11 +340,10 @@ impl App {
                 self.reconcile(sink).await?;
             }
             KeyCode::Char('r') if !self.tree.is_empty() => self.resize_mode = true,
-            // Escape hatch: Ctrl+B then a Ctrl-key sends that literal to the focused agent.
             KeyCode::Char(c) if key.modifiers.contains(KeyModifiers::CONTROL) => {
-                if let (Some(agent), Some(byte)) = (self.tree.focused_agent(), ctrl_byte(c)) {
+                if let (Some(terminal), Some(byte)) = (self.tree.focused_payload(), ctrl_byte(c)) {
                     sink.send(ClientMsg::Input {
-                        id: agent,
+                        terminal,
                         bytes: vec![byte],
                     })
                     .await?;
@@ -320,6 +352,27 @@ impl App {
             _ => {}
         }
         Ok(Flow::Continue)
+    }
+
+    /// Split: spawn a `$SHELL` terminal in the same worktree as the focused pane.
+    async fn split(&mut self, axis: Axis, sink: &mut Sink) -> Result<()> {
+        let Some(from) = self.tree.focused_payload() else {
+            return Ok(());
+        };
+        let Some(&agent) = self.terminals.get(&from) else {
+            return Ok(());
+        };
+        let terminal = TerminalId::new();
+        self.terminals.insert(terminal, agent);
+        self.tree.split(axis);
+        self.tree.open(terminal);
+        self.focus = Focus::Panes;
+        sink.send(ClientMsg::SpawnShell {
+            terminal,
+            like: from,
+        })
+        .await?;
+        self.reconcile(sink).await
     }
 
     async fn key_resize(&mut self, key: KeyEvent, sink: &mut Sink) -> Result<Flow> {
@@ -382,39 +435,45 @@ impl App {
         self.reconcile(sink).await
     }
 
-    /// Attach/detach/resize agents to match what the panes now show.
+    /// Attach/detach/resize terminals to match what the panes now show. A pane that leaves the
+    /// layout is detached (primary — agent keeps running) or closed (shell — killed).
     async fn reconcile(&mut self, sink: &mut Sink) -> Result<()> {
-        let mut desired: HashMap<AgentId, Size> = HashMap::new();
+        let mut desired: HashMap<TerminalId, Size> = HashMap::new();
         for place in self.tree.layout(self.area) {
-            if let Some(agent) = place.agent {
-                desired.insert(agent, pane_size(place.rect));
+            if let Some(t) = place.payload {
+                desired.insert(t, pane_size(place.rect));
             }
         }
 
-        for (&agent, &size) in &desired {
-            if self.attached.get(&agent) != Some(&size) {
-                match self.parsers.get_mut(&agent) {
+        for (&terminal, &size) in &desired {
+            if self.attached.get(&terminal) != Some(&size) {
+                match self.parsers.get_mut(&terminal) {
                     Some(parser) => parser.screen_mut().set_size(size.rows, size.cols),
                     None => {
                         self.parsers
-                            .insert(agent, vt100::Parser::new(size.rows, size.cols, 2000));
+                            .insert(terminal, vt100::Parser::new(size.rows, size.cols, 2000));
                     }
                 }
-                sink.send(ClientMsg::Attach { id: agent, size }).await?;
-                self.attached.insert(agent, size);
+                sink.send(ClientMsg::Attach { terminal, size }).await?;
+                self.attached.insert(terminal, size);
             }
         }
 
-        let gone: Vec<AgentId> = self
+        let gone: Vec<TerminalId> = self
             .attached
             .keys()
-            .filter(|a| !desired.contains_key(a))
+            .filter(|t| !desired.contains_key(t))
             .copied()
             .collect();
-        for agent in gone {
-            sink.send(ClientMsg::Detach { id: agent }).await?;
-            self.attached.remove(&agent);
-            self.parsers.remove(&agent);
+        for terminal in gone {
+            if self.is_primary(terminal) {
+                sink.send(ClientMsg::Detach { terminal }).await?;
+            } else {
+                sink.send(ClientMsg::CloseTerminal { terminal }).await?;
+            }
+            self.attached.remove(&terminal);
+            self.parsers.remove(&terminal);
+            self.terminals.remove(&terminal);
         }
         Ok(())
     }
@@ -476,7 +535,6 @@ fn ctrl_dir(key: KeyEvent) -> Option<Dir> {
     }
 }
 
-/// The control byte for `Ctrl+<c>` (e.g. `l` → 0x0c), for the escape hatch.
 fn ctrl_byte(c: char) -> Option<u8> {
     let up = c.to_ascii_uppercase();
     match up {
@@ -543,7 +601,7 @@ fn render_sidebar(frame: &mut Frame, area: Rect, app: &App) {
     frame.render_widget(block, area);
 
     let by_id: HashMap<_, _> = app.agents.iter().map(|a| (a.id, a)).collect();
-    let shown = app.tree.agents();
+    let open: Vec<AgentId> = app.terminals.values().copied().collect();
     let mut lines = Vec::new();
     if app.agents.is_empty() {
         lines.push(Line::from(Span::styled(
@@ -556,14 +614,14 @@ fn render_sidebar(frame: &mut Frame, area: Rect, app: &App) {
             continue;
         };
         let selected = app.sidebar_sel == Some(id);
-        let open = shown.contains(&id);
+        let is_open = open.contains(&id);
         let marker = if selected { "\u{25b8}" } else { " " };
         let name_style = if selected {
             Style::default().add_modifier(Modifier::BOLD)
         } else {
             Style::default()
         };
-        let name = if open {
+        let name = if is_open {
             format!("{:<12.12}*", agent.name)
         } else {
             format!("{:<13.13}", agent.name)
@@ -603,11 +661,7 @@ fn render_panes(frame: &mut Frame, area: Rect, app: &App) {
             Paragraph::new(vec![
                 Line::from(""),
                 Line::from(Span::styled(
-                    "  Select an agent (Enter) to open it here,",
-                    Style::default().fg(Color::DarkGray),
-                )),
-                Line::from(Span::styled(
-                    "  or Ctrl+B % / \" to split.",
+                    "  Select an agent (Enter) to open it here.",
                     Style::default().fg(Color::DarkGray),
                 )),
             ]),
@@ -619,11 +673,15 @@ fn render_panes(frame: &mut Frame, area: Rect, app: &App) {
     let by_id: HashMap<_, _> = app.agents.iter().map(|a| (a.id, a)).collect();
     for place in app.tree.layout(area) {
         let focused = place.focused && app.focus == Focus::Panes;
-        let (title, color) = match place.agent.and_then(|id| by_id.get(&id)) {
-            Some(agent) => (
-                format!(" {} {} ", agent.state.glyph(), agent.branch),
-                color_for(&agent.state),
-            ),
+        let (title, color) = match place.payload {
+            Some(terminal) => match app.terminals.get(&terminal).and_then(|id| by_id.get(id)) {
+                Some(agent) if agent.primary_terminal == terminal => (
+                    format!(" {} {} ", agent.state.glyph(), agent.branch),
+                    color_for(&agent.state),
+                ),
+                Some(agent) => (format!(" sh \u{b7} {} ", agent.branch), Color::Blue),
+                None => (" terminal ".to_string(), Color::DarkGray),
+            },
             None => (" empty ".to_string(), Color::DarkGray),
         };
         let border = if focused {
@@ -640,20 +698,10 @@ fn render_panes(frame: &mut Frame, area: Rect, app: &App) {
         let inner = block.inner(place.rect);
         frame.render_widget(block, place.rect);
 
-        match place.agent {
-            Some(agent) => match app.parsers.get(&agent) {
-                Some(parser) => {
-                    frame.render_widget(PseudoTerminal::new(parser.screen()), inner);
-                }
-                None => frame.render_widget(
-                    Paragraph::new("  starting\u{2026}")
-                        .style(Style::default().fg(Color::DarkGray)),
-                    inner,
-                ),
-            },
+        match place.payload.and_then(|t| app.parsers.get(&t)) {
+            Some(parser) => frame.render_widget(PseudoTerminal::new(parser.screen()), inner),
             None => frame.render_widget(
-                Paragraph::new("  empty \u{b7} open an agent from the sidebar")
-                    .style(Style::default().fg(Color::DarkGray)),
+                Paragraph::new("  \u{2026}").style(Style::default().fg(Color::DarkGray)),
                 inner,
             ),
         }
@@ -689,7 +737,7 @@ fn render_status(frame: &mut Frame, area: Rect, app: &App) {
                 " n new \u{b7} j/k select \u{b7} enter open \u{b7} d del \u{b7} r resume \u{b7} ctrl+hjkl move \u{b7} ctrl+q quit"
             }
             Focus::Panes => {
-                " ctrl+hjkl move \u{b7} ctrl+b %/\"/x/r \u{b7} type to talk to the agent \u{b7} ctrl+q quit"
+                " ctrl+hjkl move \u{b7} ctrl+b %/\"/x/r \u{b7} type to talk \u{b7} ctrl+q quit"
             }
         };
         (hint.to_string(), Style::default().fg(Color::DarkGray))

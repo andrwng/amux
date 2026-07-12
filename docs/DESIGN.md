@@ -340,6 +340,14 @@ Length-delimited frames (`tokio_util::codec::LengthDelimitedCodec`). Body encodi
 `postcard`/`bincode` for compact output frames; the handshake carries a protocol version and
 both sides refuse mismatches.
 
+> **Implemented contract (proto v4) lives in `crates/amux-proto/src/message.rs`.** It refined the
+> sketch below to the **terminal model**: the sidebar lists agents (workspaces), but output is
+> keyed by `TerminalId`, not `AgentId`. `SubscribeOutput`/`Unsubscribe` became
+> `Attach { terminal, size }`/`Detach { terminal }`; `Input`/`Resize`/`Output`/`OutputSnapshot`
+> all carry a `terminal`. A split adds a shell terminal in the same worktree via
+> `SpawnShell { terminal, like }`, closed with `CloseTerminal { terminal }`. `AgentInfo` carries
+> its `primary_terminal`. The sketch below is kept for the shape of the create/roster half.
+
 ```rust
 enum ClientMsg {
     Hello { proto_version: u32, client_size: Size },

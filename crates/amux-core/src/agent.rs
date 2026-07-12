@@ -35,6 +35,33 @@ impl fmt::Display for AgentId {
     }
 }
 
+/// Stable identity for a terminal — a PTY within a worktree. An agent has a primary terminal
+/// (its CLI) plus any shell terminals split off in the same worktree. See `docs/SPLITS.md`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub struct TerminalId(Uuid);
+
+impl TerminalId {
+    pub fn new() -> Self {
+        Self(Uuid::new_v4())
+    }
+
+    pub fn as_uuid(self) -> Uuid {
+        self.0
+    }
+}
+
+impl Default for TerminalId {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl fmt::Display for TerminalId {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{:.8}", self.0.as_simple().to_string())
+    }
+}
+
 /// Why an agent wants the user's attention. Only produced from Phase 2 hook signals.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum AttentionKind {

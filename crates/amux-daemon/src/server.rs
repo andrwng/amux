@@ -1,7 +1,7 @@
 //! The control server. One client connection multiplexes agent management (create/delete/
-//! resume/list) and **several** live terminal streams at once — one per visible pane, each
-//! tagged by `AgentId`. Lifecycle events (added/removed/state) are pushed to every client.
-//! See `docs/DESIGN.md` §5–6 and `docs/SPLITS.md`.
+//! resume) and **terminal** streams — one per visible pane, tagged by `TerminalId`. Splitting a
+//! pane spawns a `$SHELL` terminal in the same worktree. Lifecycle events (agent added/removed/
+//! state, terminal exited) are pushed to every client. See `docs/DESIGN.md` §5–6, `SPLITS.md`.
 
 use std::collections::HashMap;
 use std::io::ErrorKind;
@@ -17,7 +17,7 @@ use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
 use tokio_util::codec::Framed;
 
-use amux_core::agent::AgentId;
+use amux_core::agent::TerminalId;
 use amux_proto::{check_version, ClientMsg, DaemonMsg, ServerCodec, Size, PROTO_VERSION};
 
 use crate::registry::{DeleteOutcome, Registry};
@@ -53,8 +53,8 @@ pub async fn serve(listener: UnixListener, registry: Arc<Registry>) -> Result<()
     }
 }
 
-/// The agents this client is currently streaming, each with its output-forwarder task.
-type Attachments = HashMap<AgentId, JoinHandle<()>>;
+/// The terminals this client is streaming, each with its output-forwarder task.
+type Attachments = HashMap<TerminalId, JoinHandle<()>>;
 
 async fn handle_client(stream: UnixStream, registry: Arc<Registry>) -> Result<()> {
     let mut framed = Framed::new(stream, ServerCodec::new());
@@ -80,7 +80,6 @@ async fn handle_client(stream: UnixStream, registry: Arc<Registry>) -> Result<()
     framed.send(DaemonMsg::Agents(registry.infos())).await?;
 
     let (mut sink, mut stream) = framed.split();
-    // Merged outbound: command replies + every attached agent's output funnel through here.
     let (out_tx, mut out_rx) = mpsc::unbounded_channel::<DaemonMsg>();
     let mut events = registry.subscribe_events();
     let mut attached: Attachments = HashMap::new();
@@ -89,7 +88,7 @@ async fn handle_client(stream: UnixStream, registry: Arc<Registry>) -> Result<()
         tokio::select! {
             command = stream.next() => match command {
                 Some(Ok(msg)) => handle_command(msg, &registry, &out_tx, &mut attached),
-                _ => break, // client disconnected
+                _ => break,
             },
             outbound = out_rx.recv() => match outbound {
                 Some(msg) => if sink.send(msg).await.is_err() { break; },
@@ -117,20 +116,22 @@ fn handle_command(
     out_tx: &mpsc::UnboundedSender<DaemonMsg>,
     attached: &mut Attachments,
 ) {
+    let report_err = |result: Result<()>| {
+        if let Err(e) = result {
+            let _ = out_tx.send(DaemonMsg::Error {
+                message: format!("{e:#}"),
+            });
+        }
+    };
+
     match msg {
         ClientMsg::Hello { .. } => {}
         ClientMsg::ListAgents => {
             let _ = out_tx.send(DaemonMsg::Agents(registry.infos()));
         }
-        ClientMsg::CreateAgent { branch } => {
-            if let Err(e) = registry.create(&branch) {
-                let _ = out_tx.send(DaemonMsg::Error {
-                    message: format!("{e:#}"),
-                });
-            }
-        }
+        ClientMsg::CreateAgent { branch } => report_err(registry.create(&branch).map(|_| ())),
         ClientMsg::DeleteAgent { id, force } => match registry.delete(id, force) {
-            Ok(DeleteOutcome::Deleted) => detach(attached, id),
+            Ok(DeleteOutcome::Deleted) => {}
             Ok(DeleteOutcome::NeedsConfirm(message)) => {
                 let _ = out_tx.send(DaemonMsg::DeleteNeedsConfirm { id, message });
             }
@@ -140,48 +141,48 @@ fn handle_command(
                 });
             }
         },
-        ClientMsg::ResumeAgent { id } => {
-            if let Err(e) = registry.resume(id) {
-                let _ = out_tx.send(DaemonMsg::Error {
-                    message: format!("{e:#}"),
-                });
-            }
+        ClientMsg::ResumeAgent { id } => report_err(registry.resume(id)),
+        ClientMsg::SpawnShell { terminal, like } => {
+            report_err(registry.spawn_shell(terminal, like))
         }
-        ClientMsg::Attach { id, size } => attach(attached, registry, out_tx, id, size),
-        ClientMsg::Detach { id } => detach(attached, id),
-        ClientMsg::Input { id, bytes } => {
-            if let Some(session) = registry.session(id) {
+        ClientMsg::CloseTerminal { terminal } => {
+            detach(attached, terminal);
+            registry.close_terminal(terminal);
+        }
+        ClientMsg::Attach { terminal, size } => attach(attached, registry, out_tx, terminal, size),
+        ClientMsg::Detach { terminal } => detach(attached, terminal),
+        ClientMsg::Input { terminal, bytes } => {
+            if let Some(session) = registry.session(terminal) {
                 let _ = session.write_input(&bytes);
             }
         }
-        ClientMsg::Resize { id, size } => {
-            if let Some(session) = registry.session(id) {
+        ClientMsg::Resize { terminal, size } => {
+            if let Some(session) = registry.session(terminal) {
                 let _ = session.resize(size);
             }
         }
     }
 }
 
-/// Attach `id`: resize its session and (if not already streaming) start forwarding its output.
 fn attach(
     attached: &mut Attachments,
     registry: &Arc<Registry>,
     out_tx: &mpsc::UnboundedSender<DaemonMsg>,
-    id: AgentId,
+    terminal: TerminalId,
     size: Size,
 ) {
-    let Some(session) = registry.session(id) else {
+    let Some(session) = registry.session(terminal) else {
         let _ = out_tx.send(DaemonMsg::Error {
-            message: "agent has no live session — resume it first".to_string(),
+            message: "terminal has no live session".to_string(),
         });
         return;
     };
     let _ = session.resize(size);
-    if attached.contains_key(&id) {
-        return; // already streaming; the resize above is the only effect
+    if attached.contains_key(&terminal) {
+        return;
     }
     let _ = out_tx.send(DaemonMsg::OutputSnapshot {
-        id,
+        terminal,
         bytes: session.snapshot(),
     });
     let tx = out_tx.clone();
@@ -190,20 +191,20 @@ fn attach(
         loop {
             match rx.recv().await {
                 Ok(bytes) => {
-                    if tx.send(DaemonMsg::Output { id, bytes }).is_err() {
+                    if tx.send(DaemonMsg::Output { terminal, bytes }).is_err() {
                         break;
                     }
                 }
-                Err(RecvError::Lagged(_)) => {} // snapshot already covered the gap
+                Err(RecvError::Lagged(_)) => {}
                 Err(RecvError::Closed) => break,
             }
         }
     });
-    attached.insert(id, forwarder);
+    attached.insert(terminal, forwarder);
 }
 
-fn detach(attached: &mut Attachments, id: AgentId) {
-    if let Some(forwarder) = attached.remove(&id) {
+fn detach(attached: &mut Attachments, terminal: TerminalId) {
+    if let Some(forwarder) = attached.remove(&terminal) {
         forwarder.abort();
     }
 }
