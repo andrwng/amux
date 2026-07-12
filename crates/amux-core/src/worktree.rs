@@ -223,14 +223,27 @@ fn sanitize(branch: &str) -> String {
     branch.replace('/', "-")
 }
 
-/// Count uncommitted changes (staged, unstaged, untracked) in the worktree at `path`.
+/// Count uncommitted changes (staged, unstaged, untracked) in the worktree at `path`, excluding
+/// amux's own injected artifacts (the hook settings we write) so they never trip the delete
+/// guard — only real user work counts as dirty.
 fn dirty_at(path: &Path) -> Result<usize> {
     let repo = Repository::open(path).context("open worktree")?;
     let mut opts = git2::StatusOptions::new();
-    opts.include_untracked(true).include_ignored(false);
+    // Recurse untracked dirs so a fully-untracked `.claude/` is reported as the file path (not
+    // collapsed to the directory), letting us exclude exactly our injected settings.
+    opts.include_untracked(true)
+        .recurse_untracked_dirs(true)
+        .include_ignored(false);
     let statuses = repo.statuses(Some(&mut opts)).context("git status")?;
-    Ok(statuses.len())
+    let count = statuses
+        .iter()
+        .filter(|e| e.path().ok() != Some(AMUX_SETTINGS_PATH))
+        .count();
+    Ok(count)
 }
+
+/// The hook settings file amux writes into each worktree (relative to its root).
+const AMUX_SETTINGS_PATH: &str = ".claude/settings.local.json";
 
 /// `~/.amux/worktrees/<basename>-<hash>` — stable per repo, disambiguated by path hash.
 fn global_base(repo: &Path) -> Result<PathBuf> {
@@ -323,6 +336,25 @@ mod tests {
             err.contains("already checked out") && err.contains("different branch"),
             "expected a friendly checkout error, got: {err}"
         );
+    }
+
+    #[test]
+    fn injected_hook_settings_do_not_count_as_dirty() {
+        let tmp = tempfile::tempdir().unwrap();
+        let repo_path = tmp.path().join("repo");
+        std::fs::create_dir(&repo_path).unwrap();
+        init_repo(&repo_path);
+        let svc = WorktreeService::with_base(&repo_path, tmp.path().join("wt")).unwrap();
+        let wt = svc.create("feat/x").unwrap();
+
+        // amux's own hook settings must not read as user changes.
+        std::fs::create_dir_all(wt.join(".claude")).unwrap();
+        std::fs::write(wt.join(".claude/settings.local.json"), "{}").unwrap();
+        assert_eq!(svc.dirty_count("feat/x").unwrap(), 0);
+
+        // A real user file does count.
+        std::fs::write(wt.join("scratch.txt"), "wip").unwrap();
+        assert_eq!(svc.dirty_count("feat/x").unwrap(), 1);
     }
 
     #[test]
