@@ -1,0 +1,10 @@
+[package]
+name = "amux-tui"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "The amux ratatui client: sidebar, main window, floating minis, input routing."
+
+[dependencies]
+amux-proto = { workspace = true }
+anyhow = { workspace = true }

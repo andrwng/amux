@@ -1,0 +1,11 @@
+[package]
+name = "amux-daemon"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "The amuxd runtime: control server, PTY pool, mailbox, session registry."
+
+[dependencies]
+amux-proto = { workspace = true }
+amux-core = { workspace = true }
+anyhow = { workspace = true }

@@ -1,0 +1,12 @@
+[package]
+name = "amux-core"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Pure domain logic for amux: agent state machine, adapters, worktree, config."
+
+[dependencies]
+anyhow = { workspace = true }
+serde = { workspace = true }
+uuid = { workspace = true }
+chrono = { workspace = true }

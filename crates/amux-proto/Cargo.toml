@@ -1,0 +1,9 @@
+[package]
+name = "amux-proto"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Wire protocol between the amux client and the amuxd daemon."
+
+[dependencies]
+serde = { workspace = true }

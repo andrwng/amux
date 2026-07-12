@@ -1,0 +1,65 @@
+[workspace]
+members = ["crates/*"]
+resolver = "2"
+
+[workspace.package]
+version = "0.0.0"
+edition = "2021"
+license = "MIT"
+
+# Pinned, mutually-compatible dependency set — see docs/DESIGN.md §11.
+# Declaring a dep here does not compile it; only crates that opt in pull it.
+[workspace.dependencies]
+# internal crates
+amux-proto = { path = "crates/amux-proto" }
+amux-core = { path = "crates/amux-core" }
+amux-daemon = { path = "crates/amux-daemon" }
+amux-tui = { path = "crates/amux-tui" }
+
+# external
+anyhow = "1"
+thiserror = "2"
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "time", "net", "io-util", "process"] }
+tokio-util = { version = "0.7", features = ["codec"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+postcard = { version = "1", features = ["use-std"] }
+bytes = "1"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+ratatui = "0.30"
+crossterm = { version = "0.29", features = ["event-stream"] }
+tui-term = "0.3"
+vt100 = "0.16"
+portable-pty = "0.9"
+git2 = { version = "0.21", default-features = false, features = ["vendored-libgit2"] }
+uuid = { version = "1", features = ["v4", "serde"] }
+clap = { version = "4", features = ["derive"] }
+directories = "6"
+nix = { version = "0.30", features = ["process", "fs", "signal"] }
+chrono = { version = "0.4", features = ["serde"] }
+
+[package]
+name = "amux"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "A terminal UI for multiplexing AI coding agents in isolated git worktrees."
+default-run = "amux"
+
+[[bin]]
+name = "amux"
+path = "src/main.rs"
+
+[dependencies]
+anyhow = { workspace = true }
+clap = { workspace = true }
+
+# The Phase 0.1 spike (examples/spike.rs) is a throwaway that owns the render stack here
+# so the shipped `amux` binary stays lean until amux-tui takes over (Phase 0.5).
+[dev-dependencies]
+anyhow = { workspace = true }
+portable-pty = { workspace = true }
+vt100 = { workspace = true }
+tui-term = { workspace = true }
+ratatui = { workspace = true }
