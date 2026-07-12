@@ -11,5 +11,6 @@ pub use message::{AgentInfo, ClientMsg, DaemonMsg, RepoInfo, Size};
 /// Protocol version. The client and daemon refuse to talk across a mismatch (the client
 /// auto-recovers). v1 multi-agent; v2 dirty-delete; v3 multi-attach; v4 agents-own-terminals;
 /// v5 multi-repo; v6 doctor (prune orphaned worktrees); v7 hook mailbox + real `claude` (bumped
-/// so a pre-hook daemon is auto-refreshed even though the control wire is unchanged).
-pub const PROTO_VERSION: u32 = 7;
+/// so a pre-hook daemon is auto-refreshed even though the control wire is unchanged); v8 inbox
+/// read/unread (AgentInfo.unread, Focus, UnreadChanged).
+pub const PROTO_VERSION: u32 = 8;

@@ -14,7 +14,9 @@ use chrono::{DateTime, Utc};
 use tokio::sync::broadcast;
 
 use amux_core::adapter::{AgentAdapter, HookSetup, LaunchContext};
-use amux_core::agent::{next_state, AgentId, AgentState, RepoId, TerminalId};
+use amux_core::agent::{
+    is_notable_transition, next_state, AgentId, AgentState, RepoId, TerminalId,
+};
 use amux_core::hook::{classify, HookReport};
 use amux_core::worktree::{WorktreeLocation, WorktreeService};
 use amux_proto::{AgentInfo, DaemonMsg, RepoInfo, Size};
@@ -48,6 +50,8 @@ struct Agent {
     created_at: DateTime<Utc>,
     last_activity: DateTime<Utc>,
     state: AgentState,
+    /// Inbox unread bit — a notable moment the user hasn't seen yet (see `is_notable_transition`).
+    unread: bool,
     primary: TerminalId,
 }
 
@@ -60,6 +64,7 @@ impl Agent {
             branch: self.branch.clone(),
             state: self.state.clone(),
             last_activity: self.last_activity,
+            unread: self.unread,
             primary_terminal: self.primary,
         }
     }
@@ -83,6 +88,9 @@ struct State {
     repos: HashMap<RepoId, RepoEntry>,
     agents: HashMap<AgentId, Agent>,
     terminals: HashMap<TerminalId, Terminal>,
+    /// The agent the user is currently viewing, if any. A notable event on this agent does not
+    /// mark it unread (you're watching it); everyone else's does.
+    focused: Option<AgentId>,
 }
 
 /// Where the daemon's hook mailbox lives and how to invoke the bridge, so launched CLIs can
@@ -270,6 +278,7 @@ impl Registry {
                 created_at: now,
                 last_activity: now,
                 state: AgentState::Working,
+                unread: false,
                 primary: terminal_id,
             };
             let info = agent.info();
@@ -307,37 +316,61 @@ impl Registry {
     }
 
     /// Apply a hook report from a launched CLI: capture its session id (for resume) and drive the
-    /// state machine. Broadcasts `StateChanged` when the state actually moves. Unknown agents and
-    /// no-op events are silently ignored.
+    /// state machine. Broadcasts `StateChanged` / `UnreadChanged` when things move. Unknown agents
+    /// and no-op events are silently ignored.
     pub fn on_hook(&self, report: HookReport) {
         let classified = classify(&report.event);
-        let change = {
+        let (state_change, unread_change) = {
             let mut state = self.state.lock().unwrap();
-            let Some(agent) = state.agents.get_mut(&report.agent) else {
+            if !state.agents.contains_key(&report.agent) {
                 return;
-            };
+            }
             if let Some(sid) = classified.session_id {
-                agent.ai_session_id = Some(sid);
+                if let Some(agent) = state.agents.get_mut(&report.agent) {
+                    agent.ai_session_id = Some(sid);
+                }
             }
             match classified.event {
                 Some(event) => {
-                    let next = next_state(&agent.state, &event);
-                    agent.last_activity = Utc::now();
-                    if next != agent.state {
-                        agent.state = next.clone();
-                        Some(next)
-                    } else {
-                        None
-                    }
+                    let next = {
+                        let agent = state.agents.get(&report.agent).unwrap();
+                        next_state(&agent.state, &event)
+                    };
+                    set_state(&mut state, report.agent, next)
                 }
-                None => None,
+                None => (None, None),
             }
         };
-        if let Some(state) = change {
-            let _ = self.events.send(DaemonMsg::StateChanged {
-                id: report.agent,
-                state,
-            });
+        self.broadcast_changes(report.agent, state_change, unread_change);
+    }
+
+    /// Set (or clear) which agent the user is currently viewing. Focusing an agent clears its
+    /// unread bit; while focused, notable events on it won't re-mark it unread.
+    pub fn focus(&self, agent: Option<AgentId>) {
+        let cleared = {
+            let mut state = self.state.lock().unwrap();
+            state.focused = agent;
+            match agent.and_then(|id| state.agents.get_mut(&id).map(|a| (id, a))) {
+                Some((id, a)) if a.unread => {
+                    a.unread = false;
+                    Some(id)
+                }
+                _ => None,
+            }
+        };
+        if let Some(id) = cleared {
+            let _ = self
+                .events
+                .send(DaemonMsg::UnreadChanged { id, unread: false });
+        }
+    }
+
+    fn broadcast_changes(&self, id: AgentId, state: Option<AgentState>, unread: Option<bool>) {
+        if let Some(state) = state {
+            let _ = self.events.send(DaemonMsg::StateChanged { id, state });
+        }
+        if let Some(unread) = unread {
+            let _ = self.events.send(DaemonMsg::UnreadChanged { id, unread });
         }
     }
 
@@ -499,24 +532,18 @@ impl Registry {
     }
 
     fn on_primary_exit(&self, agent: AgentId, terminal: TerminalId, code: Option<i32>) {
-        let state_change = {
+        let (state_change, unread_change) = {
             let mut state = self.state.lock().unwrap();
             if let Some(term) = state.terminals.get_mut(&terminal) {
                 term.session = None;
             }
-            match state.agents.get_mut(&agent) {
-                Some(a) => {
-                    a.state = AgentState::Exited { code };
-                    a.last_activity = Utc::now();
-                    a.state.clone()
-                }
-                None => return,
+            if !state.agents.contains_key(&agent) {
+                return;
             }
+            // Exit is a notable transition, so this also flags unread if you weren't watching.
+            set_state(&mut state, agent, AgentState::Exited { code })
         };
-        let _ = self.events.send(DaemonMsg::StateChanged {
-            id: agent,
-            state: state_change,
-        });
+        self.broadcast_changes(agent, state_change, unread_change);
     }
 
     fn spawn_shell_monitor(self: &Arc<Self>, terminal: TerminalId, session: Arc<Session>) {
@@ -535,4 +562,33 @@ impl Registry {
 
 fn agent_name(branch: &str) -> String {
     branch.rsplit('/').next().unwrap_or(branch).to_string()
+}
+
+/// Apply `next` to `id` inside the locked state: update the state + activity, and flag the agent
+/// unread on a notable transition — unless it's the agent the user is currently viewing. Returns
+/// `(state change, unread change)` for the caller to broadcast. A no-op transition returns
+/// `(None, None)`.
+fn set_state(
+    state: &mut State,
+    id: AgentId,
+    next: AgentState,
+) -> (Option<AgentState>, Option<bool>) {
+    let focused = state.focused;
+    let Some(agent) = state.agents.get_mut(&id) else {
+        return (None, None);
+    };
+    let prev = agent.state.clone();
+    agent.last_activity = Utc::now();
+    if next == prev {
+        return (None, None);
+    }
+    let notable = is_notable_transition(&prev, &next);
+    agent.state = next.clone();
+    let unread_change = if notable && focused != Some(id) && !agent.unread {
+        agent.unread = true;
+        Some(true)
+    } else {
+        None
+    };
+    (Some(next), unread_change)
 }

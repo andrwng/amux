@@ -36,6 +36,8 @@ pub struct AgentInfo {
     pub branch: String,
     pub state: AgentState,
     pub last_activity: DateTime<Utc>,
+    /// Inbox unread bit: a notable moment (blocked / finished / exited) the user hasn't seen yet.
+    pub unread: bool,
     /// The terminal that shows this agent's CLI (what "open in a pane" attaches to).
     pub primary_terminal: TerminalId,
 }
@@ -69,6 +71,10 @@ pub enum ClientMsg {
     /// Prune orphaned worktrees in `repo` (git-tracked worktrees no live agent holds) to reclaim
     /// wedged branches. The daemon replies with a `DoctorReport`.
     DoctorRepo { repo: RepoId },
+    /// The agent the user is currently viewing (`None` = focus is in the sidebar / no pane). The
+    /// daemon clears its unread bit and, while it's focused, keeps notable events from marking it
+    /// unread — so "Claude finished while you were watching" stays read.
+    Focus { agent: Option<AgentId> },
     /// Start streaming a terminal into a pane (snapshot then live output).
     Attach { terminal: TerminalId, size: Size },
     /// Stop streaming a terminal (its pane closed / was replaced).
@@ -99,6 +105,8 @@ pub enum DaemonMsg {
     AgentRemoved { id: AgentId },
     /// An agent's state changed (the sidebar's live signal).
     StateChanged { id: AgentId, state: AgentState },
+    /// An agent's inbox unread bit changed (set by a notable event, cleared when you view it).
+    UnreadChanged { id: AgentId, unread: bool },
     /// Delete was refused because the worktree has uncommitted changes — confirm to force it.
     DeleteNeedsConfirm { id: AgentId, message: String },
     /// Full screen of a terminal as a `contents_formatted()` dump, sent on attach.

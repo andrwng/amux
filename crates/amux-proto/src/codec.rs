@@ -139,6 +139,7 @@ mod tests {
             branch: "feat/auth".into(),
             state: AgentState::Working,
             last_activity: Utc::now(),
+            unread: true,
             primary_terminal: TerminalId::new(),
         }
     }
@@ -172,6 +173,8 @@ mod tests {
         roundtrip(ClientMsg::DoctorRepo {
             repo: RepoId::from_canonical_path(&PathBuf::from("/repos/amux")),
         });
+        roundtrip(ClientMsg::Focus { agent: Some(id) });
+        roundtrip(ClientMsg::Focus { agent: None });
         roundtrip(ClientMsg::Attach {
             terminal: t,
             size: Size {
@@ -206,6 +209,7 @@ mod tests {
             id,
             state: AgentState::Exited { code: Some(0) },
         });
+        roundtrip(DaemonMsg::UnreadChanged { id, unread: true });
         roundtrip(DaemonMsg::DeleteNeedsConfirm {
             id,
             message: "2 uncommitted changes".into(),

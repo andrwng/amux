@@ -207,21 +207,41 @@ pub fn next_state(current: &AgentState, event: &AgentEvent) -> AgentState {
 pub struct RosterItem {
     pub id: AgentId,
     pub state: AgentState,
+    /// Whether the user hasn't yet seen this agent's latest notable moment (blocked / finished).
+    pub unread: bool,
     pub last_activity: DateTime<Utc>,
 }
 
-/// Order agents for the sidebar: those needing attention first, then everything else by
-/// most-recent activity, terminal (exited/error) states last. Stable.
+/// Order agents for the sidebar inbox: by **condition** first (needs-attention → working → idle →
+/// terminal), then **unread before read** within a condition, then most-recent activity. Stable.
 ///
-/// This is the tweak point. To instead float the **longest-waiting** attention item to the
-/// very top, reverse the recency comparison for the `priority() == 0` bucket.
+/// This yields the inbox ordering: 🔴 needs-you-new → 🟠 needs-you-seen → 🔵 finished-unread →
+/// ⚪ quiet. The tweak point for the whole "how is the inbox ordered" policy.
 pub fn sort_for_sidebar(items: &mut [RosterItem]) {
     items.sort_by(|a, b| {
         a.state
             .priority()
             .cmp(&b.state.priority())
+            .then_with(|| b.unread.cmp(&a.unread)) // unread (true) sorts before read (false)
             .then_with(|| b.last_activity.cmp(&a.last_activity))
     });
+}
+
+/// Whether a state transition is worth surfacing as **unread** — the agent now wants your eyes:
+/// it became blocked, finished a turn (was working, now quiet), or exited/errored. Routine
+/// `→ Working` is not notable. Pure and tested; the daemon consults this to set the unread bit.
+pub fn is_notable_transition(prev: &AgentState, next: &AgentState) -> bool {
+    use AgentState as S;
+    match (prev, next) {
+        // Became blocked on the user (wasn't already).
+        (p, S::NeedsAttention { .. }) => !matches!(p, S::NeedsAttention { .. }),
+        // Finished a turn: was working/starting, now quiet.
+        (S::Working | S::Starting, S::Idle) => true,
+        // Done or crashed (wasn't already).
+        (p, S::Exited { .. }) => !matches!(p, S::Exited { .. }),
+        (p, S::Error { .. }) => !matches!(p, S::Error { .. }),
+        _ => false,
+    }
 }
 
 #[cfg(test)]
@@ -328,6 +348,7 @@ mod tests {
         let item = |state, secs| RosterItem {
             id: AgentId::new(),
             state,
+            unread: false,
             last_activity: at(secs),
         };
         let mut items = vec![
@@ -348,5 +369,39 @@ mod tests {
         let buckets: Vec<u8> = items.iter().map(|i| i.state.priority()).collect();
         assert_eq!(buckets, vec![0, 0, 1, 2, 3]); // attention, attention, working, idle, exited
         assert!(items[0].last_activity >= items[1].last_activity); // recent-first within a bucket
+    }
+
+    #[test]
+    fn unread_sorts_before_read_within_a_condition() {
+        let base = DateTime::parse_from_rfc3339("2026-01-01T00:00:00Z")
+            .unwrap()
+            .with_timezone(&Utc);
+        let item = |unread, secs| RosterItem {
+            id: AgentId::new(),
+            state: AgentState::Idle,
+            unread,
+            last_activity: base + chrono::Duration::seconds(secs),
+        };
+        // A newer *read* idle agent vs an older *unread* one: unread wins despite being older.
+        let mut items = vec![item(false, 100), item(true, 10)];
+        sort_for_sidebar(&mut items);
+        assert!(items[0].unread && !items[1].unread);
+    }
+
+    #[test]
+    fn notable_transitions_flag_unread() {
+        let working = AgentState::Working;
+        let idle = AgentState::Idle;
+        let attn = needs_attention();
+        let exited = AgentState::Exited { code: Some(0) };
+
+        // Finished a turn, became blocked, exited — all notable.
+        assert!(is_notable_transition(&working, &idle));
+        assert!(is_notable_transition(&working, &attn));
+        assert!(is_notable_transition(&idle, &exited));
+        // Routine / already-in-state — not notable.
+        assert!(!is_notable_transition(&idle, &working));
+        assert!(!is_notable_transition(&attn, &attn));
+        assert!(!is_notable_transition(&idle, &idle));
     }
 }

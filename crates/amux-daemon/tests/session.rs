@@ -283,6 +283,121 @@ async fn hooks_drive_the_state_machine_over_the_mailbox() {
     );
 }
 
+/// Read control-stream frames until the given agent's unread bit matches `want`.
+async fn wait_for_unread(client: &mut Client, id: AgentId, want: bool) -> bool {
+    tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            match client.next().await {
+                Some(Ok(DaemonMsg::UnreadChanged { id: uid, unread })) if uid == id => {
+                    if unread == want {
+                        return true;
+                    }
+                }
+                Some(Ok(_)) => {}
+                _ => return false,
+            }
+        }
+    })
+    .await
+    .unwrap_or(false)
+}
+
+#[tokio::test]
+async fn unread_is_set_on_finish_when_unfocused_and_cleared_on_focus() {
+    let tmp = tempfile::tempdir().unwrap();
+    let repo = tmp.path().join("repo");
+    std::fs::create_dir(&repo).unwrap();
+    init_repo(&repo);
+    let worktrees = WorktreeService::with_base(&repo, tmp.path().join("wt")).unwrap();
+    let adapter = Box::new(ClaudeAdapter::with_command(vec!["cat".into()]));
+    let registry = Registry::new(adapter);
+    let repo_id = registry.register(worktrees).id;
+
+    let socket = tmp.path().join("amuxd.sock");
+    let listener = UnixListener::bind(&socket).unwrap();
+    tokio::spawn(serve(listener, registry.clone()));
+    let mailbox = tmp.path().join("hooks.sock");
+    let hook_listener = bind_mailbox(&mailbox).unwrap();
+    tokio::spawn(serve_mailbox(hook_listener, registry.clone()));
+
+    let mut client = handshake(&socket).await;
+    let agent = create_agent(&mut client, repo_id, "feat/unread").await;
+
+    // Focus is in the sidebar (nothing viewed). Claude finishes a turn → unread.
+    send_hook(
+        &mailbox,
+        HookReport {
+            agent: agent.id,
+            event: hook("Stop", None, None),
+        },
+    )
+    .await;
+    assert!(
+        wait_for_unread(&mut client, agent.id, true).await,
+        "finishing a turn while unfocused should mark the agent unread"
+    );
+
+    // Viewing the agent clears it.
+    client
+        .send(ClientMsg::Focus {
+            agent: Some(agent.id),
+        })
+        .await
+        .unwrap();
+    assert!(
+        wait_for_unread(&mut client, agent.id, false).await,
+        "focusing the agent should clear unread"
+    );
+
+    // While it's focused, a real notable transition (Working → Idle) must NOT re-mark it unread.
+    // Drive activity then finish, then round-trip ListAgents: the Agents reply must show it still
+    // read (any UnreadChanged{true} in between fails the assertion).
+    send_hook(
+        &mailbox,
+        HookReport {
+            agent: agent.id,
+            event: hook("PreToolUse", None, None),
+        },
+    )
+    .await;
+    assert!(
+        wait_for_state(&mut client, agent.id, |s| matches!(s, AgentState::Working)).await,
+        "activity should move the focused agent to Working"
+    );
+    send_hook(
+        &mailbox,
+        HookReport {
+            agent: agent.id,
+            event: hook("Stop", None, None),
+        },
+    )
+    .await;
+    client.send(ClientMsg::ListAgents).await.unwrap();
+    let still_read = tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            match client.next().await {
+                Some(Ok(DaemonMsg::UnreadChanged { id, unread: true })) if id == agent.id => {
+                    return false
+                }
+                Some(Ok(DaemonMsg::Agents(list))) => {
+                    return list
+                        .iter()
+                        .find(|a| a.id == agent.id)
+                        .is_some_and(|a| !a.unread)
+                }
+                Some(Ok(_)) => {}
+                _ => return false,
+            }
+        }
+    })
+    .await
+    .unwrap_or(false);
+    assert!(
+        still_read,
+        "a finish while the agent is focused must stay read"
+    );
+}
+
 #[tokio::test]
 async fn two_repos_keep_their_agents_separate() {
     // Register two independent repos on one daemon; each agent should carry its own repo id and

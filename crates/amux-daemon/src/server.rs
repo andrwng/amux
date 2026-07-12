@@ -108,6 +108,8 @@ async fn handle_client(stream: UnixStream, registry: Arc<Registry>) -> Result<()
     for (_, forwarder) in attached {
         forwarder.abort();
     }
+    // The viewer is gone, so nothing is being watched — a later notable event should mark unread.
+    registry.focus(None);
     Ok(())
 }
 
@@ -158,6 +160,7 @@ fn handle_command(
             detach(attached, terminal);
             registry.close_terminal(terminal);
         }
+        ClientMsg::Focus { agent } => registry.focus(agent),
         ClientMsg::DoctorRepo { repo } => match registry.doctor(repo) {
             Ok(report) => {
                 let _ = out_tx.send(DaemonMsg::DoctorReport {

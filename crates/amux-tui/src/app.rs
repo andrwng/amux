@@ -106,6 +106,8 @@ async fn event_loop(
                 _ => break,
             },
         }
+        // Report focus changes so the daemon can track read/unread.
+        app.sync_focus(&mut sink).await?;
         draw(terminal, &app)?;
     }
     Ok(())
@@ -136,6 +138,8 @@ struct App {
     parsers: HashMap<TerminalId, vt100::Parser>,
     attached: HashMap<TerminalId, Size>,
     focus: Focus,
+    /// The agent last reported to the daemon as "being viewed" (drives read/unread).
+    focus_agent: Option<AgentId>,
     input: InputMode,
     prefix: bool,
     resize_mode: bool,
@@ -165,6 +169,7 @@ impl App {
             parsers: HashMap::new(),
             attached: HashMap::new(),
             focus: Focus::Sidebar,
+            focus_agent: None,
             input: InputMode::Normal,
             prefix: false,
             resize_mode: false,
@@ -241,6 +246,11 @@ impl App {
                 if let Some(agent) = self.agents.iter_mut().find(|a| a.id == id) {
                     agent.state = state;
                     agent.last_activity = Utc::now();
+                }
+            }
+            DaemonMsg::UnreadChanged { id, unread } => {
+                if let Some(agent) = self.agents.iter_mut().find(|a| a.id == id) {
+                    agent.unread = unread;
                 }
             }
             DaemonMsg::OutputSnapshot { terminal, bytes } => {
@@ -418,6 +428,8 @@ impl App {
                 self.reconcile(sink).await?;
             }
             KeyCode::Char('r') if !self.tree.is_empty() => self.resize_mode = true,
+            // Jump to the next unread agent (inbox navigation).
+            KeyCode::Tab => self.jump_next_unread(sink).await?,
             KeyCode::Char(c) if key.modifiers.contains(KeyModifiers::CONTROL) => {
                 if let (Some(terminal), Some(byte)) = (self.tree.focused_payload(), ctrl_byte(c)) {
                     sink.send(ClientMsg::Input {
@@ -612,6 +624,7 @@ impl App {
             .map(|a| RosterItem {
                 id: a.id,
                 state: a.state.clone(),
+                unread: a.unread,
                 last_activity: a.last_activity,
             })
             .collect();
@@ -648,6 +661,58 @@ impl App {
             Row::Agent(id) => Some(id),
             Row::Repo(_) => None,
         }
+    }
+
+    /// The agent the user is currently viewing: the one owning the focused terminal (when focus
+    /// is in the panes), else `None`. This is what "seen" is anchored to.
+    fn current_focus_agent(&self) -> Option<AgentId> {
+        if self.focus != Focus::Panes {
+            return None;
+        }
+        let terminal = self.tree.focused_payload()?;
+        self.terminals.get(&terminal).copied()
+    }
+
+    /// Tell the daemon which agent is being viewed, when it changes — so it can clear/keep unread.
+    async fn sync_focus(&mut self, sink: &mut Sink) -> Result<()> {
+        let current = self.current_focus_agent();
+        if current != self.focus_agent {
+            self.focus_agent = current;
+            sink.send(ClientMsg::Focus { agent: current }).await?;
+        }
+        Ok(())
+    }
+
+    /// Jump to the next unread agent (in sidebar order, wrapping) and open it — which views it,
+    /// clearing its unread. The inbox payoff. No-op with a notice if nothing is unread.
+    async fn jump_next_unread(&mut self, sink: &mut Sink) -> Result<()> {
+        let order: Vec<AgentId> = self
+            .sidebar_rows()
+            .into_iter()
+            .filter_map(|r| match r {
+                Row::Agent(id) => Some(id),
+                Row::Repo(_) => None,
+            })
+            .collect();
+        let is_unread = |id: &AgentId| self.agents.iter().any(|a| a.id == *id && a.unread);
+        if !order.iter().any(is_unread) {
+            self.info = "no unread agents".to_string();
+            return Ok(());
+        }
+        let start = self
+            .selected_agent()
+            .and_then(|c| order.iter().position(|&i| i == c))
+            .map(|i| i + 1)
+            .unwrap_or(0);
+        let n = order.len();
+        let next = (0..n)
+            .map(|k| order[(start + k) % n])
+            .find(|id| is_unread(id));
+        if let Some(id) = next {
+            self.sidebar_sel = Some(Row::Agent(id));
+            self.open_selected(sink).await?;
+        }
+        Ok(())
     }
 
     fn move_sidebar_sel(&mut self, delta: i32) {
@@ -763,13 +828,9 @@ fn render(frame: &mut Frame, app: &App) {
 }
 
 fn render_sidebar(frame: &mut Frame, area: Rect, app: &App) {
-    let waiting = app
-        .agents
-        .iter()
-        .filter(|a| matches!(a.state, AgentState::NeedsAttention { .. }))
-        .count();
-    let title = if waiting > 0 {
-        format!(" agents · {waiting} need you ")
+    let unread = app.agents.iter().filter(|a| a.unread).count();
+    let title = if unread > 0 {
+        format!(" agents · {unread} unread ")
     } else {
         " agents ".to_string()
     };
@@ -829,18 +890,20 @@ fn render_sidebar(frame: &mut Frame, area: Rect, app: &App) {
                     continue;
                 };
                 let is_open = open.contains(&id);
-                let name_style = if selected {
+                // Unread agents render bold with a leading • dot; read ones are plain.
+                let name_style = if agent.unread || selected {
                     Style::default().add_modifier(Modifier::BOLD)
                 } else {
                     Style::default()
                 };
+                let dot = if agent.unread { "\u{2022}" } else { " " };
                 let name = if is_open {
                     format!("{:<10.10}*", agent.name)
                 } else {
                     format!("{:<11.11}", agent.name)
                 };
                 lines.push(Line::from(vec![
-                    Span::styled(format!("{marker}   "), Style::default().fg(Color::Cyan)),
+                    Span::styled(format!("{marker} {dot} "), Style::default().fg(Color::Cyan)),
                     Span::styled(
                         format!("{} ", agent.state.glyph()),
                         Style::default().fg(color_for(&agent.state)),
@@ -964,7 +1027,8 @@ fn render_status(frame: &mut Frame, area: Rect, app: &App) {
         )
     } else if app.prefix {
         (
-            " Ctrl+B — % split \u{b7} \" split \u{b7} x close \u{b7} r resize".to_string(),
+            " Ctrl+B — % split \u{b7} \" split \u{b7} x close \u{b7} r resize \u{b7} tab next unread"
+                .to_string(),
             Style::default().fg(Color::Black).bg(Color::Cyan),
         )
     } else if !app.status.is_empty() {

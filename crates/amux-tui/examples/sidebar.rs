@@ -145,6 +145,7 @@ fn main() -> std::io::Result<()> {
         .map(|a| RosterItem {
             id: a.id,
             state: a.state.clone(),
+            unread: false,
             last_activity: a.last_activity,
         })
         .collect();
