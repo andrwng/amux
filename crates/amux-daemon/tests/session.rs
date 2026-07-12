@@ -303,6 +303,33 @@ async fn wait_for_unread(client: &mut Client, id: AgentId, want: bool) -> bool {
 }
 
 #[tokio::test]
+async fn heartbeat_settles_a_silent_working_agent_to_idle() {
+    // A backstop for a missed Stop hook: with no PTY output for the idle window, a Working agent
+    // settles to Idle on its own. `cat` is silent until fed input, so it goes quiet immediately.
+    let tmp = tempfile::tempdir().unwrap();
+    let repo = tmp.path().join("repo");
+    std::fs::create_dir(&repo).unwrap();
+    init_repo(&repo);
+    let worktrees = WorktreeService::with_base(&repo, tmp.path().join("wt")).unwrap();
+    let adapter = Box::new(ClaudeAdapter::with_command(vec!["cat".into()]));
+    let registry = Registry::with_idle_timeout(adapter, Duration::from_millis(200));
+    let repo_id = registry.register(worktrees).id;
+
+    let socket = tmp.path().join("amuxd.sock");
+    let listener = UnixListener::bind(&socket).unwrap();
+    tokio::spawn(serve(listener, registry.clone()));
+
+    let mut client = handshake(&socket).await;
+    let agent = create_agent(&mut client, repo_id, "feat/idle").await;
+    assert!(matches!(agent.state, AgentState::Working));
+
+    assert!(
+        wait_for_state(&mut client, agent.id, |s| matches!(s, AgentState::Idle)).await,
+        "the heartbeat should settle a silent Working agent to Idle"
+    );
+}
+
+#[tokio::test]
 async fn unread_is_set_on_finish_when_unfocused_and_cleared_on_focus() {
     let tmp = tempfile::tempdir().unwrap();
     let repo = tmp.path().join("repo");

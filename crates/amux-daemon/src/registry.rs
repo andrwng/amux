@@ -8,6 +8,7 @@
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 use anyhow::{Context, Result};
 use chrono::{DateTime, Utc};
@@ -15,7 +16,7 @@ use tokio::sync::broadcast;
 
 use amux_core::adapter::{AgentAdapter, HookSetup, LaunchContext};
 use amux_core::agent::{
-    is_notable_transition, next_state, AgentId, AgentState, RepoId, TerminalId,
+    is_notable_transition, next_state, AgentEvent, AgentId, AgentState, RepoId, TerminalId,
 };
 use amux_core::hook::{classify, HookReport};
 use amux_core::worktree::{WorktreeLocation, WorktreeService};
@@ -25,6 +26,11 @@ use crate::pty::Session;
 
 const EVENT_BACKLOG: usize = 256;
 const DEFAULT_SIZE: Size = Size { cols: 80, rows: 24 };
+/// How long a primary terminal may go with **no PTY output** before the heartbeat settles a
+/// `Working` agent to `Idle` — a backstop for a missed `Stop` hook. Generous, so genuine mid-work
+/// pauses (a silent tool) rarely cause a false idle; the uncommon real miss recovers within this
+/// window, and a later hook (`PostToolUse`, etc.) corrects an over-eager idle immediately.
+const DEFAULT_IDLE_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// Outcome of a delete request.
 pub enum DeleteOutcome {
@@ -105,11 +111,13 @@ pub struct Registry {
     adapter: Box<dyn AgentAdapter>,
     events: broadcast::Sender<DaemonMsg>,
     hooks: Option<HookIntegration>,
+    /// PTY-silence window after which the heartbeat settles a `Working` agent to `Idle`.
+    idle_timeout: Duration,
 }
 
 impl Registry {
     pub fn new(adapter: Box<dyn AgentAdapter>) -> Arc<Self> {
-        Self::build(adapter, None)
+        Self::build(adapter, None, DEFAULT_IDLE_TIMEOUT)
     }
 
     /// Build a registry that wires launched agents' hooks to `socket`, invoking `amux_exe hook`.
@@ -118,16 +126,31 @@ impl Registry {
         socket: PathBuf,
         amux_exe: PathBuf,
     ) -> Arc<Self> {
-        Self::build(adapter, Some(HookIntegration { socket, amux_exe }))
+        Self::build(
+            adapter,
+            Some(HookIntegration { socket, amux_exe }),
+            DEFAULT_IDLE_TIMEOUT,
+        )
     }
 
-    fn build(adapter: Box<dyn AgentAdapter>, hooks: Option<HookIntegration>) -> Arc<Self> {
+    /// Build a registry with a custom heartbeat idle timeout — used by tests to exercise the
+    /// backstop on a human timescale.
+    pub fn with_idle_timeout(adapter: Box<dyn AgentAdapter>, idle_timeout: Duration) -> Arc<Self> {
+        Self::build(adapter, None, idle_timeout)
+    }
+
+    fn build(
+        adapter: Box<dyn AgentAdapter>,
+        hooks: Option<HookIntegration>,
+        idle_timeout: Duration,
+    ) -> Arc<Self> {
         let (events, _) = broadcast::channel(EVENT_BACKLOG);
         Arc::new(Self {
             state: Mutex::new(State::default()),
             adapter,
             events,
             hooks,
+            idle_timeout,
         })
     }
 
@@ -320,28 +343,28 @@ impl Registry {
     /// and no-op events are silently ignored.
     pub fn on_hook(&self, report: HookReport) {
         let classified = classify(&report.event);
+        if let Some(sid) = classified.session_id {
+            if let Some(agent) = self.state.lock().unwrap().agents.get_mut(&report.agent) {
+                agent.ai_session_id = Some(sid);
+            }
+        }
+        if let Some(event) = classified.event {
+            self.apply_event(report.agent, event);
+        }
+    }
+
+    /// Fold an [`AgentEvent`] into an agent's state via the pure state machine, flag unread on a
+    /// notable transition, and broadcast what changed. Shared by hooks and the idle heartbeat.
+    fn apply_event(&self, agent: AgentId, event: AgentEvent) {
         let (state_change, unread_change) = {
             let mut state = self.state.lock().unwrap();
-            if !state.agents.contains_key(&report.agent) {
+            let Some(a) = state.agents.get(&agent) else {
                 return;
-            }
-            if let Some(sid) = classified.session_id {
-                if let Some(agent) = state.agents.get_mut(&report.agent) {
-                    agent.ai_session_id = Some(sid);
-                }
-            }
-            match classified.event {
-                Some(event) => {
-                    let next = {
-                        let agent = state.agents.get(&report.agent).unwrap();
-                        next_state(&agent.state, &event)
-                    };
-                    set_state(&mut state, report.agent, next)
-                }
-                None => (None, None),
-            }
+            };
+            let next = next_state(&a.state.clone(), &event);
+            set_state(&mut state, agent, next)
         };
-        self.broadcast_changes(report.agent, state_change, unread_change);
+        self.broadcast_changes(agent, state_change, unread_change);
     }
 
     /// Set (or clear) which agent the user is currently viewing. Focusing an agent clears its
@@ -523,11 +546,46 @@ impl Registry {
         terminal: TerminalId,
         session: Arc<Session>,
     ) {
+        // Exit watcher: flips the agent to Exited when its process dies.
         let registry = Arc::clone(self);
         let mut exit_rx = session.exit_rx();
+        let exit_session = Arc::clone(&session);
         tokio::spawn(async move {
             let _ = exit_rx.changed().await;
-            registry.on_primary_exit(agent, terminal, session.exit_code());
+            registry.on_primary_exit(agent, terminal, exit_session.exit_code());
+        });
+        // Idle heartbeat: settles a stuck `Working` to `Idle` after prolonged PTY silence.
+        self.spawn_heartbeat(agent, session);
+    }
+
+    /// Watch a primary terminal's PTY output; if it goes quiet for `idle_timeout`, apply a
+    /// `WentIdle` event — the backstop for a missed `Stop` hook. Output resets the clock; the task
+    /// ends when the session's broadcast closes (the process exited). This is server-side and
+    /// runs whether or not a client is attached.
+    fn spawn_heartbeat(self: &Arc<Self>, agent: AgentId, session: Arc<Session>) {
+        let registry = Arc::clone(self);
+        let idle = self.idle_timeout;
+        let mut rx = session.subscribe();
+        tokio::spawn(async move {
+            use tokio::sync::broadcast::error::RecvError;
+            loop {
+                match tokio::time::timeout(idle, rx.recv()).await {
+                    // Output (or a dropped-lag notice) means it's alive — re-arm the timer.
+                    Ok(Ok(_)) | Ok(Err(RecvError::Lagged(_))) => {}
+                    // The session's output channel closed — the process is gone.
+                    Ok(Err(RecvError::Closed)) => break,
+                    // Prolonged silence: settle to Idle (a no-op unless it's still Working).
+                    Err(_elapsed) => {
+                        registry.apply_event(agent, AgentEvent::WentIdle);
+                        // Wait for activity to resume before timing again (don't re-fire while
+                        // legitimately idle).
+                        match rx.recv().await {
+                            Ok(_) | Err(RecvError::Lagged(_)) => {}
+                            Err(RecvError::Closed) => break,
+                        }
+                    }
+                }
+            }
         });
     }
 
