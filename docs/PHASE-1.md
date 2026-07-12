@@ -37,7 +37,7 @@ The CLI boundary: `spawn_spec` (command/args/env/cwd to launch in a worktree), `
 
 **DoD:** `spawn_spec` yields the right command+cwd+env; unit-tested.
 
-## 1.4 — Protocol v1 (`amux-proto`)
+## 1.4 — Protocol v1 (`amux-proto`) &nbsp; · &nbsp; **✓ code-complete** (agent-id'd messages + AgentInfo; 8 codec tests; PROTO_VERSION=1)
 
 Introduce `AgentId` into the wire. New messages: `CreateAgent`, `DeleteAgent`, `ListAgents` /
 `AgentList` / `AgentAdded` / `AgentRemoved` / `StateChanged`; per-agent `Attach` / `Subscribe` /
@@ -46,18 +46,30 @@ Bump `PROTO_VERSION` (breaking; single-user, no back-compat needed).
 
 **DoD:** round-trip + property tests for the new messages; version bump.
 
-## 1.5 — Daemon: keyed registry + agent lifecycle
+## 1.5 — Daemon: durable agents over generic sessions &nbsp; · &nbsp; **✓ code-complete** (create/attach/echo/delete integration test; exit→suspend monitor; per-repo daemon)
 
-`Registry` → `HashMap<AgentId, Agent>` (metadata + `Session`). `CreateAgent` (worktree via 1.2 +
-`spawn_spec` → `Session`), `DeleteAgent` (kill + remove worktree), `ListAgents`, per-agent
-attach/subscribe, `StateChanged` broadcast (coarse: activity → Working, idle timer → Idle,
-exit → Exited). Persist agent metadata to `~/.amux/state.json` (live processes still die with the
-daemon; metadata enables listing/resume).
+**Agent ≠ Session.** A `Session` (Phase 0's `pty::Session`) is a *generic* PTY process — it just
+runs a command. An **Agent** is the *durable* record: id + worktree + branch + adapter +
+`ai_session_id` + timestamps, holding **zero-or-one** live `Session`. `Registry` →
+`HashMap<AgentId, Agent>`, each agent optionally attached to a session.
 
-**DoD:** integration test — create 2 agents on a temp repo, list them, attach/echo each,
-delete one, all via the headless client; green on macOS + Ubuntu.
+Lifecycle (the safety net for accidental exits + daemon restarts):
+- `CreateAgent` — worktree (1.2) + `spawn_spec` → a fresh `Session`.
+- **Session exits** (accidental `exit`, crash, daemon restart) → the agent becomes
+  **Suspended/resumable**, NOT removed: worktree stays, metadata persisted, sidebar shows it as
+  resumable (`□ · r to resume`).
+- **Resume** — new `Session` via `spawn_spec(resume = ai_session_id)` → `claude --resume <id>` in
+  the same worktree, continuing the conversation. `ai_session_id` comes from Phase-2 hook payloads
+  (`session_id`); `claude --continue` is the pre-hook fallback.
+- `DeleteAgent` — the **only** destructive op: kill + remove worktree + drop the record.
+- Per-agent attach/subscribe/`StateChanged`; agent metadata persisted to `~/.amux/state.json`
+  (survives daemon restart; live sessions don't, so agents reload Suspended).
 
-## 1.6 — TUI: the sidebar
+**DoD:** integration test — create 2 agents on a temp repo, list them, attach/echo each; let one
+exit → it stays resumable and resumes into the *same* worktree; delete one → worktree gone. Green
+on macOS + Ubuntu.
+
+## 1.6 — TUI: the sidebar &nbsp; · &nbsp; **✓ code-complete** (sidebar + main + nav/terminal/create modes; grove keymap; builds clean)
 
 Left **sidebar** (agent roster + status glyph, selection) + **main window** (selected agent's
 terminal). Keymap **mirrors grove** for muscle memory: `j`/`k` select, `n` new, `d` delete,
@@ -76,9 +88,18 @@ interactive run confirms; `TestBackend` snapshot test for the sidebar layout.
 - **Agent CLI:** `ClaudeAdapter` defaults to `claude`; configurable; `$SHELL`/`cat` in tests.
 - **Keymap:** mirror grove (muscle-memory reuse is a stated goal).
 - **Protocol:** clean breaking bump to v1 — single-user, so no compatibility shims.
+- **Agent ≠ Session** (durable workspace vs. disposable PTY process). Exiting suspends (keeps the
+  worktree + metadata, resumable); only **delete** destroys. **Resume is ALWAYS manual** — no
+  auto-resume, no auto-continue-on-restart. Nothing ever respawns on its own, so a crash stays
+  visible and is recovered by an explicit `r`.
 - **Minis stay out** (Phase 3); **hook status stays out** (Phase 2).
 
-### Exit of Phase 1
+### Exit of Phase 1 &nbsp; · &nbsp; **✓ COMPLETE (1.1–1.6)**
 
-Multiple Claude agents in worktrees, listed in a live sidebar, one interactive at a time.
-Phase 2 swaps coarse status for exact hook signals; Phase 3 adds the floating minis.
+Multiple agents in isolated worktrees, listed in a live sidebar (needs-attention-sorted), one
+open in the main window at a time; create/delete/resume; exit suspends (resumable), delete
+destroys. 25 tests green; clippy + fmt clean. **Deferred within Phase 1** (follow-ups, not
+blockers): idle-timer Working↔Idle status refinement, `~/.amux/state.json` metadata persistence,
+per-repo socket keying (currently one global socket → one repo per daemon), and running real
+`claude` instead of `$SHELL` (that pairs with Phase 2 hooks). Phase 2 swaps coarse status for
+exact hook signals; Phase 3 adds the floating minis.

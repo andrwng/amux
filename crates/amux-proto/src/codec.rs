@@ -106,7 +106,9 @@ pub type ServerCodec = WireCodec<DaemonMsg, ClientMsg>;
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::Size;
+    use crate::{AgentInfo, Size};
+    use amux_core::agent::{AgentId, AgentState};
+    use chrono::Utc;
     use proptest::prelude::*;
 
     /// Encode then decode with a symmetric codec; assert we get the same value back and the
@@ -123,37 +125,79 @@ mod tests {
         assert!(buf.is_empty(), "buffer not fully consumed");
     }
 
+    fn sample_info() -> AgentInfo {
+        AgentInfo {
+            id: AgentId::new(),
+            name: "auth".into(),
+            branch: "feat/auth".into(),
+            state: AgentState::Working,
+            last_activity: Utc::now(),
+        }
+    }
+
     #[test]
     fn client_messages_roundtrip() {
+        let id = AgentId::new();
         roundtrip(ClientMsg::Hello {
             proto_version: PROTO_VERSION,
+        });
+        roundtrip(ClientMsg::ListAgents);
+        roundtrip(ClientMsg::CreateAgent {
+            branch: "feat/x".into(),
+        });
+        roundtrip(ClientMsg::DeleteAgent { id });
+        roundtrip(ClientMsg::ResumeAgent { id });
+        roundtrip(ClientMsg::Attach {
+            id,
             size: Size {
                 cols: 120,
                 rows: 40,
             },
         });
-        roundtrip(ClientMsg::Input(vec![0x1b, b'[', b'A']));
-        roundtrip(ClientMsg::Resize(Size { cols: 80, rows: 24 }));
-        roundtrip(ClientMsg::Shutdown);
+        roundtrip(ClientMsg::Input {
+            id,
+            bytes: vec![0x1b, b'[', b'A'],
+        });
+        roundtrip(ClientMsg::Resize {
+            id,
+            size: Size { cols: 80, rows: 24 },
+        });
     }
 
     #[test]
     fn daemon_messages_roundtrip() {
+        let id = AgentId::new();
         roundtrip(DaemonMsg::Hello {
             proto_version: PROTO_VERSION,
         });
-        roundtrip(DaemonMsg::OutputSnapshot(vec![1, 2, 3]));
-        roundtrip(DaemonMsg::Output(b"hello\r\n".to_vec()));
-        roundtrip(DaemonMsg::Exited { code: Some(0) });
-        roundtrip(DaemonMsg::Exited { code: None });
-        roundtrip(DaemonMsg::Error("boom".into()));
+        roundtrip(DaemonMsg::Agents(vec![sample_info(), sample_info()]));
+        roundtrip(DaemonMsg::AgentAdded(sample_info()));
+        roundtrip(DaemonMsg::AgentRemoved { id });
+        roundtrip(DaemonMsg::StateChanged {
+            id,
+            state: AgentState::Exited { code: Some(0) },
+        });
+        roundtrip(DaemonMsg::OutputSnapshot {
+            id,
+            bytes: vec![1, 2, 3],
+        });
+        roundtrip(DaemonMsg::Output {
+            id,
+            bytes: b"hello\r\n".to_vec(),
+        });
+        roundtrip(DaemonMsg::Error {
+            message: "boom".into(),
+        });
     }
 
     #[test]
     fn partial_frame_yields_none_until_complete() {
         let mut codec = WireCodec::<ClientMsg, ClientMsg>::new();
         let mut full = BytesMut::new();
-        let msg = ClientMsg::Input(vec![1, 2, 3, 4, 5]);
+        let msg = ClientMsg::Input {
+            id: AgentId::new(),
+            bytes: vec![1, 2, 3, 4, 5],
+        };
         codec.encode(msg.clone(), &mut full).unwrap();
         let bytes = full.to_vec();
 
@@ -173,24 +217,15 @@ mod tests {
     fn decodes_two_frames_from_one_buffer() {
         let mut codec = WireCodec::<ClientMsg, ClientMsg>::new();
         let mut buf = BytesMut::new();
-        codec.encode(ClientMsg::Shutdown, &mut buf).unwrap();
+        codec.encode(ClientMsg::ListAgents, &mut buf).unwrap();
         codec
-            .encode(
-                ClientMsg::Resize(Size {
-                    cols: 100,
-                    rows: 40,
-                }),
-                &mut buf,
-            )
+            .encode(ClientMsg::CreateAgent { branch: "x".into() }, &mut buf)
             .unwrap();
 
-        assert_eq!(codec.decode(&mut buf).unwrap(), Some(ClientMsg::Shutdown));
+        assert_eq!(codec.decode(&mut buf).unwrap(), Some(ClientMsg::ListAgents));
         assert_eq!(
             codec.decode(&mut buf).unwrap(),
-            Some(ClientMsg::Resize(Size {
-                cols: 100,
-                rows: 40
-            }))
+            Some(ClientMsg::CreateAgent { branch: "x".into() })
         );
         assert_eq!(codec.decode(&mut buf).unwrap(), None);
     }
@@ -218,17 +253,12 @@ mod tests {
     proptest! {
         #[test]
         fn input_bytes_roundtrip(bytes in prop::collection::vec(any::<u8>(), 0..4096)) {
-            roundtrip(ClientMsg::Input(bytes));
+            roundtrip(ClientMsg::Input { id: AgentId::new(), bytes });
         }
 
         #[test]
         fn output_bytes_roundtrip(bytes in prop::collection::vec(any::<u8>(), 0..4096)) {
-            roundtrip(DaemonMsg::Output(bytes));
-        }
-
-        #[test]
-        fn resize_roundtrips(cols in any::<u16>(), rows in any::<u16>()) {
-            roundtrip(ClientMsg::Resize(Size { cols, rows }));
+            roundtrip(DaemonMsg::Output { id: AgentId::new(), bytes });
         }
     }
 }

@@ -7,6 +7,7 @@
 //! treat both `Ok(0)` (macOS EOF) and `Err` (Linux EIO) as "closed".
 
 use std::io::{Read, Write};
+use std::path::Path;
 use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
 
@@ -40,7 +41,12 @@ pub struct Session {
 }
 
 impl Session {
-    pub fn spawn(command: &[String], size: Size) -> Result<Arc<Self>> {
+    pub fn spawn(
+        command: &[String],
+        cwd: &Path,
+        env: &[(String, String)],
+        size: Size,
+    ) -> Result<Arc<Self>> {
         anyhow::ensure!(!command.is_empty(), "cannot spawn an empty command");
 
         let pty = native_pty_system();
@@ -57,7 +63,11 @@ impl Session {
         for arg in &command[1..] {
             cmd.arg(arg);
         }
+        cmd.cwd(cwd);
         cmd.env("TERM", "xterm-256color");
+        for (key, value) in env {
+            cmd.env(key, value);
+        }
 
         let child = pair.slave.spawn_command(cmd).context("spawn child")?;
         drop(pair.slave); // child owns the only slave fd → its exit is observable

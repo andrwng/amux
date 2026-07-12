@@ -9,6 +9,7 @@ description = "The amux ratatui client: sidebar, main window, floating minis, in
 amux-proto = { workspace = true }
 amux-core = { workspace = true }
 anyhow = { workspace = true }
+chrono = { workspace = true }
 tokio = { workspace = true }
 tokio-util = { workspace = true }
 futures = { workspace = true }

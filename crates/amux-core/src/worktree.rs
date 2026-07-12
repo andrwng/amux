@@ -135,6 +135,15 @@ impl WorktreeService {
     }
 }
 
+/// Find the working directory of the git repository containing `from` (walking up).
+pub fn discover_repo(from: &Path) -> Result<PathBuf> {
+    let repo = Repository::discover(from)
+        .with_context(|| format!("not inside a git repository: {}", from.display()))?;
+    repo.workdir()
+        .map(Path::to_path_buf)
+        .context("bare repository has no working directory")
+}
+
 fn canonical_repo(repo_path: &Path) -> Result<PathBuf> {
     std::fs::canonicalize(repo_path)
         .with_context(|| format!("repository path does not exist: {}", repo_path.display()))

@@ -6,7 +6,7 @@ mod codec;
 mod message;
 
 pub use codec::{check_version, ClientCodec, ProtoError, ServerCodec, WireCodec, MAX_FRAME_BYTES};
-pub use message::{ClientMsg, DaemonMsg, Size};
+pub use message::{AgentInfo, ClientMsg, DaemonMsg, Size};
 
-/// Protocol version. The client and daemon refuse to talk across a mismatch.
-pub const PROTO_VERSION: u32 = 0;
+/// Protocol version. The client and daemon refuse to talk across a mismatch. v1 = multi-agent.
+pub const PROTO_VERSION: u32 = 1;

@@ -4,6 +4,8 @@
 //! Phase 0.1: subcommands are scaffolded but not yet implemented. The working artifact for
 //! this milestone is the throwaway spike — run `cargo run --example spike`.
 
+use std::path::PathBuf;
+
 use clap::{Parser, Subcommand};
 
 /// Multiplex AI coding agents in isolated git worktrees.
@@ -24,6 +26,9 @@ enum Command {
         /// Stop a running daemon (kills its sessions) instead of starting one.
         #[arg(long)]
         stop: bool,
+        /// The git repository this daemon manages (defaults to the current directory).
+        #[arg(long)]
+        repo: Option<PathBuf>,
     },
     /// Bridge a Claude Code hook event to the daemon mailbox (invoked by Claude's hooks).
     Hook,
@@ -33,15 +38,22 @@ fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
     match cli.command {
         None => amux_tui::run()?,
-        Some(Command::Daemon { foreground, stop }) => {
+        Some(Command::Daemon {
+            foreground,
+            stop,
+            repo,
+        }) => {
             if stop {
                 amux_daemon::stop()?;
             } else {
+                // Resolve the repo to an absolute path BEFORE daemonizing (which chdirs to /).
+                let repo = repo.unwrap_or_else(|| std::env::current_dir().unwrap_or_default());
+                let repo = std::fs::canonicalize(&repo).unwrap_or(repo);
                 // Detach BEFORE building the tokio runtime (fork-safety — see DESIGN §11).
                 if !foreground {
                     amux_daemon::daemonize()?;
                 }
-                amux_daemon::run_blocking()?;
+                amux_daemon::run_blocking(repo)?;
             }
         }
         Some(Command::Hook) => eprintln!("amux hook is not implemented yet (Phase 2)."),

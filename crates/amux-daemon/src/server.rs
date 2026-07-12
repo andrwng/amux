@@ -1,83 +1,24 @@
-//! The control server + session registry. Clients *attach* to a persistent session (spawning
-//! it on first attach); disconnecting **detaches** (the session lives on); `Shutdown` or the
-//! shell exiting tears it down. See `docs/DESIGN.md` §5, §6.
+//! The control server. One client connection multiplexes agent management (create/delete/
+//! resume/list) and a **single** live terminal stream (the selected agent — minis are Phase 3).
+//! Lifecycle events (added/removed/state) are pushed to every client. See `docs/DESIGN.md` §5–6.
 
 use std::io::ErrorKind;
 use std::os::unix::net::UnixStream as StdUnixStream;
 use std::path::Path;
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 
 use anyhow::{bail, Context, Result};
 use futures::{SinkExt, StreamExt};
 use tokio::net::{UnixListener, UnixStream};
 use tokio::sync::broadcast::error::RecvError;
+use tokio::sync::mpsc;
+use tokio::task::JoinHandle;
 use tokio_util::codec::Framed;
 
-use amux_proto::{check_version, ClientMsg, DaemonMsg, ServerCodec, Size, PROTO_VERSION};
+use amux_core::agent::AgentId;
+use amux_proto::{check_version, ClientMsg, DaemonMsg, ServerCodec, PROTO_VERSION};
 
-use crate::pty::Session;
-
-/// What the daemon spawns for a session. Phase 0: a single command (default: `$SHELL`).
-#[derive(Debug, Clone)]
-pub struct DaemonConfig {
-    pub command: Vec<String>,
-}
-
-impl Default for DaemonConfig {
-    fn default() -> Self {
-        let shell = std::env::var("SHELL").unwrap_or_else(|_| "/bin/sh".to_string());
-        Self {
-            command: vec![shell],
-        }
-    }
-}
-
-/// Holds the persistent session(s). Phase 0 keeps a single session; the shape generalizes to a
-/// keyed map of agents in Phase 1.
-pub struct Registry {
-    config: DaemonConfig,
-    session: Mutex<Option<Arc<Session>>>,
-}
-
-impl Registry {
-    pub fn new(config: DaemonConfig) -> Self {
-        Self {
-            config,
-            session: Mutex::new(None),
-        }
-    }
-
-    /// Attach to the live session (resizing it to the client), or spawn one if none exists.
-    pub fn attach(&self, size: Size) -> Result<Arc<Session>> {
-        let mut slot = self.session.lock().unwrap();
-        if let Some(existing) = slot.as_ref() {
-            if !existing.is_exited() {
-                let session = Arc::clone(existing);
-                drop(slot);
-                let _ = session.resize(size);
-                return Ok(session);
-            }
-        }
-        let session = Session::spawn(&self.config.command, size)?;
-        *slot = Some(Arc::clone(&session));
-        Ok(session)
-    }
-
-    /// Remove `target` from the registry if it is still the current session.
-    pub fn remove_if(&self, target: &Arc<Session>) {
-        let mut slot = self.session.lock().unwrap();
-        if slot.as_ref().is_some_and(|s| Arc::ptr_eq(s, target)) {
-            *slot = None;
-        }
-    }
-
-    /// Kill and drop the current session (daemon shutdown).
-    pub fn shutdown_all(&self) {
-        if let Some(session) = self.session.lock().unwrap().take() {
-            session.kill();
-        }
-    }
-}
+use crate::registry::Registry;
 
 /// Bind the control socket, detecting whether a live daemon already owns it.
 pub fn bind_or_detect(path: &Path) -> Result<UnixListener> {
@@ -97,7 +38,7 @@ pub fn bind_or_detect(path: &Path) -> Result<UnixListener> {
     }
 }
 
-/// Accept clients forever, each attaching to the shared registry on its own task.
+/// Accept clients forever, each on its own task.
 pub async fn serve(listener: UnixListener, registry: Arc<Registry>) -> Result<()> {
     loop {
         let (stream, _addr) = listener.accept().await.context("accept connection")?;
@@ -110,88 +51,143 @@ pub async fn serve(listener: UnixListener, registry: Arc<Registry>) -> Result<()
     }
 }
 
+/// The single agent whose PTY is currently streaming to this client, plus its forwarder task.
+type Attachment = Option<(AgentId, JoinHandle<()>)>;
+
 async fn handle_client(stream: UnixStream, registry: Arc<Registry>) -> Result<()> {
     let mut framed = Framed::new(stream, ServerCodec::new());
 
-    let size = match framed.next().await {
-        Some(Ok(ClientMsg::Hello {
-            proto_version,
-            size,
-        })) => {
+    match framed.next().await {
+        Some(Ok(ClientMsg::Hello { proto_version })) => {
             if let Err(e) = check_version(proto_version) {
-                let _ = framed.send(DaemonMsg::Error(e.to_string())).await;
+                let _ = framed
+                    .send(DaemonMsg::Error {
+                        message: e.to_string(),
+                    })
+                    .await;
                 return Ok(());
             }
-            size
         }
-        Some(Ok(_)) => {
-            let _ = framed
-                .send(DaemonMsg::Error("expected Hello as the first frame".into()))
-                .await;
-            return Ok(());
-        }
-        Some(Err(e)) => return Err(e).context("read hello frame"),
-        None => return Ok(()),
-    };
+        _ => return Ok(()),
+    }
     framed
         .send(DaemonMsg::Hello {
             proto_version: PROTO_VERSION,
         })
         .await?;
+    framed.send(DaemonMsg::Agents(registry.infos())).await?;
 
-    // Attach to (or create) the persistent session and send its current screen.
-    let session = registry.attach(size)?;
-    let mut output_rx = session.subscribe();
-    let mut exit_rx = session.exit_rx();
     let (mut sink, mut stream) = framed.split();
-    sink.send(DaemonMsg::OutputSnapshot(session.snapshot()))
-        .await?;
-
-    // If it already exited between attach and here, report and go.
-    if *exit_rx.borrow_and_update() {
-        let _ = sink
-            .send(DaemonMsg::Exited {
-                code: session.exit_code(),
-            })
-            .await;
-        registry.remove_if(&session);
-        return Ok(());
-    }
+    // Merged outbound: command replies + the attached agent's output funnel through here.
+    let (out_tx, mut out_rx) = mpsc::unbounded_channel::<DaemonMsg>();
+    let mut events = registry.subscribe_events();
+    let mut attached: Attachment = None;
 
     loop {
         tokio::select! {
-            output = output_rx.recv() => match output {
-                Ok(bytes) => {
-                    if sink.send(DaemonMsg::Output(bytes)).await.is_err() {
-                        break; // client disconnected → detach
-                    }
-                }
+            command = stream.next() => match command {
+                Some(Ok(msg)) => handle_command(msg, &registry, &out_tx, &mut attached),
+                _ => break, // client disconnected
+            },
+            outbound = out_rx.recv() => match outbound {
+                Some(msg) => if sink.send(msg).await.is_err() { break; },
+                None => break,
+            },
+            event = events.recv() => match event {
+                Ok(msg) => if sink.send(msg).await.is_err() { break; },
+                // Missed lifecycle events → resend the full roster to resync.
                 Err(RecvError::Lagged(_)) => {
-                    // Fell behind → resync from the authoritative screen.
-                    if sink.send(DaemonMsg::OutputSnapshot(session.snapshot())).await.is_err() {
-                        break;
-                    }
+                    if sink.send(DaemonMsg::Agents(registry.infos())).await.is_err() { break; }
                 }
                 Err(RecvError::Closed) => break,
             },
-            msg = stream.next() => match msg {
-                Some(Ok(ClientMsg::Input(bytes))) => { let _ = session.write_input(&bytes); }
-                Some(Ok(ClientMsg::Resize(size))) => { let _ = session.resize(size); }
-                Some(Ok(ClientMsg::Shutdown)) => {
-                    session.kill();
-                    registry.remove_if(&session);
-                    break;
+        }
+    }
+
+    if let Some((_, forwarder)) = attached {
+        forwarder.abort();
+    }
+    Ok(())
+}
+
+fn handle_command(
+    msg: ClientMsg,
+    registry: &Arc<Registry>,
+    out_tx: &mpsc::UnboundedSender<DaemonMsg>,
+    attached: &mut Attachment,
+) {
+    let report_err = |result: Result<()>| {
+        if let Err(e) = result {
+            let _ = out_tx.send(DaemonMsg::Error {
+                message: format!("{e:#}"),
+            });
+        }
+    };
+
+    match msg {
+        ClientMsg::Hello { .. } => {}
+        ClientMsg::ListAgents => {
+            let _ = out_tx.send(DaemonMsg::Agents(registry.infos()));
+        }
+        ClientMsg::CreateAgent { branch } => report_err(registry.create(&branch).map(|_| ())),
+        ClientMsg::DeleteAgent { id } => {
+            detach_if(attached, id);
+            report_err(registry.delete(id));
+        }
+        ClientMsg::ResumeAgent { id } => report_err(registry.resume(id)),
+        ClientMsg::Attach { id, size } => {
+            // Re-target the single live stream.
+            if let Some((_, forwarder)) = attached.take() {
+                forwarder.abort();
+            }
+            match registry.session(id) {
+                Some(session) => {
+                    let _ = session.resize(size);
+                    let _ = out_tx.send(DaemonMsg::OutputSnapshot {
+                        id,
+                        bytes: session.snapshot(),
+                    });
+                    let tx = out_tx.clone();
+                    let mut rx = session.subscribe();
+                    let forwarder = tokio::spawn(async move {
+                        loop {
+                            match rx.recv().await {
+                                Ok(bytes) => {
+                                    if tx.send(DaemonMsg::Output { id, bytes }).is_err() {
+                                        break;
+                                    }
+                                }
+                                Err(RecvError::Lagged(_)) => {} // snapshot already covers the gap
+                                Err(RecvError::Closed) => break,
+                            }
+                        }
+                    });
+                    *attached = Some((id, forwarder));
                 }
-                Some(Ok(ClientMsg::Hello { .. })) => {}
-                // Client gone: DETACH — leave the session running for a future reattach.
-                Some(Err(_)) | None => break,
-            },
-            _ = exit_rx.changed() => {
-                let _ = sink.send(DaemonMsg::Exited { code: session.exit_code() }).await;
-                registry.remove_if(&session);
-                break;
+                None => {
+                    let _ = out_tx.send(DaemonMsg::Error {
+                        message: "agent has no live session — resume it first".to_string(),
+                    });
+                }
+            }
+        }
+        ClientMsg::Input { id, bytes } => {
+            if let Some(session) = registry.session(id) {
+                let _ = session.write_input(&bytes);
+            }
+        }
+        ClientMsg::Resize { id, size } => {
+            if let Some(session) = registry.session(id) {
+                let _ = session.resize(size);
             }
         }
     }
-    Ok(())
+}
+
+fn detach_if(attached: &mut Attachment, id: AgentId) {
+    if attached.as_ref().is_some_and(|(a, _)| *a == id) {
+        if let Some((_, forwarder)) = attached.take() {
+            forwarder.abort();
+        }
+    }
 }

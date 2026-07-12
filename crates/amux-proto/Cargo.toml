@@ -6,11 +6,13 @@ license.workspace = true
 description = "Wire protocol between the amux client and the amuxd daemon."
 
 [dependencies]
+amux-core = { workspace = true }
 serde = { workspace = true }
 postcard = { workspace = true }
 bytes = { workspace = true }
 tokio-util = { workspace = true }
 thiserror = { workspace = true }
+chrono = { workspace = true }
 
 [dev-dependencies]
 proptest = { workspace = true }
