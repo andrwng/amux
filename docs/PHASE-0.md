@@ -110,7 +110,7 @@ and panic both restore the terminal.
 
 ---
 
-## 0.6 — Detach / reattach
+## 0.6 — Detach / reattach &nbsp; · &nbsp; **✓ code-complete** (detach/reattach + shell-exit tests green; `--stop` smoke-tested)
 
 **Deliverables**
 - A detach key leaves the daemon + shell running; reattach resumes identically.
@@ -125,7 +125,11 @@ OSes, and the persistence guarantee (agent survives client exit) is proven by an
 
 ---
 
-### Exit of Phase 0
+### Exit of Phase 0 &nbsp; · &nbsp; **✓ COMPLETE (0.1–0.6)**
 
-The riskiest plumbing is proven and CI-green cross-platform. Phase 1 layers agents, worktrees,
-and the sidebar on top of a spine we trust.
+The riskiest plumbing is proven — the daemon owns persistent PTY sessions, clients attach/detach
+without killing them, and reattach restores the live screen. 19 tests green; clippy + fmt clean;
+real-binary smoke-tests for detach and `--stop`. (Interactive `amux` verified by the user;
+Ubuntu CI pending a git remote.) Phase 1 layers agents, worktrees, and the sidebar on top of a
+spine we trust — the `Registry`'s single session becomes a keyed map of agents, and the
+per-connection attach becomes per-agent.

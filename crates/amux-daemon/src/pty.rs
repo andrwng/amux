@@ -1,38 +1,46 @@
-//! A single PTY session: spawn a command, stream its output, feed its input, resize it.
+//! A persistent PTY session, shared across client attach/detach. The reader thread feeds a
+//! vt100 parser (for snapshots) and a broadcast channel (for live attach); a waiter thread
+//! reaps the child and flips a `watch` on exit. Killing is by PID, so no one has to own the
+//! `Child` mutably while others read/write. See `docs/DESIGN.md` §5.
 //!
-//! The reader is blocking, so it runs on a dedicated OS thread and forwards chunks to the
-//! async world over an unbounded channel (see `docs/DESIGN.md` §11 gotcha 1). We drop the
-//! pty *slave* after spawn so the child owns the only slave fd — otherwise the child never
-//! sees EOF. The reader treats both `Ok(0)` (macOS EOF) and `Err` (Linux EIO) as "closed".
+//! Load-bearing details (§11): reader on a dedicated thread, drop the slave after spawn, and
+//! treat both `Ok(0)` (macOS EOF) and `Err` (Linux EIO) as "closed".
 
 use std::io::{Read, Write};
 use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
 
 use anyhow::{Context, Result};
-use portable_pty::{native_pty_system, Child, CommandBuilder, MasterPty, PtySize};
-use tokio::sync::mpsc;
+use nix::sys::signal::{kill, Signal};
+use nix::unistd::Pid;
+use portable_pty::{native_pty_system, CommandBuilder, MasterPty, PtySize};
+use tokio::sync::{broadcast, watch};
 
 use amux_proto::Size;
 
 /// Scrollback retained by the daemon-side parser (used for snapshots).
 const SCROLLBACK: usize = 2000;
+/// Broadcast backlog per session (chunks). On overflow a lagging client resyncs via snapshot.
+const OUTPUT_BACKLOG: usize = 1024;
 
-pub struct PtySession {
+struct SessionIo {
     master: Box<dyn MasterPty + Send>,
     writer: Box<dyn Write + Send>,
-    child: Box<dyn Child + Send + Sync>,
-    parser: Arc<Mutex<vt100::Parser>>,
-    reader: Option<JoinHandle<()>>,
 }
 
-impl PtySession {
-    /// Spawn `command` in a PTY sized to `size`. Returns the session and the receiver of raw
-    /// output chunks (fed by the reader thread).
-    pub fn spawn(
-        command: &[String],
-        size: Size,
-    ) -> Result<(Self, mpsc::UnboundedReceiver<Vec<u8>>)> {
+/// A live PTY session. Cheap to `Arc`-share; all methods take `&self`.
+pub struct Session {
+    io: Mutex<SessionIo>,
+    parser: Arc<Mutex<vt100::Parser>>,
+    output_tx: broadcast::Sender<Vec<u8>>,
+    pid: Option<u32>,
+    exit_rx: watch::Receiver<bool>,
+    exit_code: Arc<Mutex<Option<i32>>>,
+    threads: Mutex<Vec<JoinHandle<()>>>,
+}
+
+impl Session {
+    pub fn spawn(command: &[String], size: Size) -> Result<Arc<Self>> {
         anyhow::ensure!(!command.is_empty(), "cannot spawn an empty command");
 
         let pty = native_pty_system();
@@ -52,17 +60,22 @@ impl PtySession {
         cmd.env("TERM", "xterm-256color");
 
         let child = pair.slave.spawn_command(cmd).context("spawn child")?;
-        drop(pair.slave); // child now owns the only slave fd → its exit is observable
+        drop(pair.slave); // child owns the only slave fd → its exit is observable
+        let pid = child.process_id();
 
         let mut reader = pair.master.try_clone_reader().context("clone reader")?;
         let writer = pair.master.take_writer().context("take writer")?;
         let parser = Arc::new(Mutex::new(vt100::Parser::new(
             size.rows, size.cols, SCROLLBACK,
         )));
+        let (output_tx, _) = broadcast::channel::<Vec<u8>>(OUTPUT_BACKLOG);
+        let (exit_tx, exit_rx) = watch::channel(false);
+        let exit_code = Arc::new(Mutex::new(None));
 
-        let (tx, rx) = mpsc::unbounded_channel::<Vec<u8>>();
+        // Reader thread: pump PTY output into the parser and the broadcast.
         let reader_parser = Arc::clone(&parser);
-        let reader = thread::spawn(move || {
+        let reader_tx = output_tx.clone();
+        let reader_thread = thread::spawn(move || {
             let mut buf = [0u8; 8192];
             loop {
                 match reader.read(&mut buf) {
@@ -72,28 +85,39 @@ impl PtySession {
                         if let Ok(mut parser) = reader_parser.lock() {
                             parser.process(chunk);
                         }
-                        if tx.send(chunk.to_vec()).is_err() {
-                            break; // the async side is gone
-                        }
+                        let _ = reader_tx.send(chunk.to_vec()); // Err only means "no attached client"
                     }
                     Err(_) => break, // EIO on Linux, etc.
                 }
             }
         });
 
-        Ok((
-            Self {
+        // Waiter thread: own the child, reap it, then flip the exit watch.
+        let waiter_code = Arc::clone(&exit_code);
+        let waiter_thread = thread::spawn(move || {
+            let mut child = child;
+            let code = child.wait().ok().map(|status| status.exit_code() as i32);
+            *waiter_code.lock().unwrap() = code;
+            let _ = exit_tx.send(true);
+            // exit_tx drops here; receivers observe the change (and then Closed), which we treat
+            // as exit either way.
+        });
+
+        Ok(Arc::new(Self {
+            io: Mutex::new(SessionIo {
                 master: pair.master,
                 writer,
-                child,
-                parser,
-                reader: Some(reader),
-            },
-            rx,
-        ))
+            }),
+            parser,
+            output_tx,
+            pid,
+            exit_rx,
+            exit_code,
+            threads: Mutex::new(vec![reader_thread, waiter_thread]),
+        }))
     }
 
-    /// The current screen as a `contents_formatted()` dump — replays to reproduce the screen.
+    /// Current screen as a `contents_formatted()` dump — sent to a (re)attaching client.
     pub fn snapshot(&self) -> Vec<u8> {
         self.parser
             .lock()
@@ -101,17 +125,35 @@ impl PtySession {
             .unwrap_or_default()
     }
 
-    pub fn write_input(&mut self, bytes: &[u8]) -> Result<()> {
-        self.writer.write_all(bytes).context("write to pty")?;
-        self.writer.flush().context("flush pty")?;
+    pub fn subscribe(&self) -> broadcast::Receiver<Vec<u8>> {
+        self.output_tx.subscribe()
+    }
+
+    pub fn exit_rx(&self) -> watch::Receiver<bool> {
+        self.exit_rx.clone()
+    }
+
+    pub fn is_exited(&self) -> bool {
+        *self.exit_rx.borrow()
+    }
+
+    pub fn exit_code(&self) -> Option<i32> {
+        *self.exit_code.lock().unwrap()
+    }
+
+    pub fn write_input(&self, bytes: &[u8]) -> Result<()> {
+        let mut io = self.io.lock().unwrap();
+        io.writer.write_all(bytes).context("write to pty")?;
+        io.writer.flush().context("flush pty")?;
         Ok(())
     }
 
-    pub fn resize(&mut self, size: Size) -> Result<()> {
+    pub fn resize(&self, size: Size) -> Result<()> {
         if let Ok(mut parser) = self.parser.lock() {
             parser.screen_mut().set_size(size.rows, size.cols);
         }
-        self.master
+        let io = self.io.lock().unwrap();
+        io.master
             .resize(PtySize {
                 rows: size.rows,
                 cols: size.cols,
@@ -122,26 +164,21 @@ impl PtySession {
         Ok(())
     }
 
-    pub fn kill(&mut self) {
-        let _ = self.child.kill();
-    }
-
-    /// Reap the child and return its exit code, if available.
-    pub fn wait(&mut self) -> Option<i32> {
-        self.child
-            .wait()
-            .ok()
-            .map(|status| status.exit_code() as i32)
+    /// Terminate the child by PID (SIGKILL). The waiter thread then reaps and flips the watch.
+    pub fn kill(&self) {
+        if let Some(pid) = self.pid {
+            let _ = kill(Pid::from_raw(pid as i32), Signal::SIGKILL);
+        }
     }
 }
 
-impl Drop for PtySession {
+impl Drop for Session {
     fn drop(&mut self) {
-        // Kill so the reader thread's blocking read unblocks (child closes the slave fd),
-        // then join it so we never leak the thread.
-        let _ = self.child.kill();
-        if let Some(handle) = self.reader.take() {
-            let _ = handle.join();
+        self.kill();
+        if let Ok(mut threads) = self.threads.lock() {
+            for handle in threads.drain(..) {
+                let _ = handle.join();
+            }
         }
     }
 }

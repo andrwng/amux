@@ -1,21 +1,23 @@
-//! The control server: accept a client, do the version handshake, spawn a PTY, then pump
-//! output to the client and input/resize/shutdown from it. See `docs/DESIGN.md` §5, §6.
+//! The control server + session registry. Clients *attach* to a persistent session (spawning
+//! it on first attach); disconnecting **detaches** (the session lives on); `Shutdown` or the
+//! shell exiting tears it down. See `docs/DESIGN.md` §5, §6.
 
 use std::io::ErrorKind;
 use std::os::unix::net::UnixStream as StdUnixStream;
 use std::path::Path;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use anyhow::{bail, Context, Result};
 use futures::{SinkExt, StreamExt};
 use tokio::net::{UnixListener, UnixStream};
+use tokio::sync::broadcast::error::RecvError;
 use tokio_util::codec::Framed;
 
-use amux_proto::{check_version, ClientMsg, DaemonMsg, ServerCodec, PROTO_VERSION};
+use amux_proto::{check_version, ClientMsg, DaemonMsg, ServerCodec, Size, PROTO_VERSION};
 
-use crate::pty::PtySession;
+use crate::pty::Session;
 
-/// What the daemon spawns for each client. Phase 0: a single command (default: `$SHELL`).
+/// What the daemon spawns for a session. Phase 0: a single command (default: `$SHELL`).
 #[derive(Debug, Clone)]
 pub struct DaemonConfig {
     pub command: Vec<String>,
@@ -30,8 +32,54 @@ impl Default for DaemonConfig {
     }
 }
 
-/// Bind the control socket, detecting whether a live daemon already owns it. A stale socket
-/// file (no daemon accepting) is removed and rebound; a live one is an error.
+/// Holds the persistent session(s). Phase 0 keeps a single session; the shape generalizes to a
+/// keyed map of agents in Phase 1.
+pub struct Registry {
+    config: DaemonConfig,
+    session: Mutex<Option<Arc<Session>>>,
+}
+
+impl Registry {
+    pub fn new(config: DaemonConfig) -> Self {
+        Self {
+            config,
+            session: Mutex::new(None),
+        }
+    }
+
+    /// Attach to the live session (resizing it to the client), or spawn one if none exists.
+    pub fn attach(&self, size: Size) -> Result<Arc<Session>> {
+        let mut slot = self.session.lock().unwrap();
+        if let Some(existing) = slot.as_ref() {
+            if !existing.is_exited() {
+                let session = Arc::clone(existing);
+                drop(slot);
+                let _ = session.resize(size);
+                return Ok(session);
+            }
+        }
+        let session = Session::spawn(&self.config.command, size)?;
+        *slot = Some(Arc::clone(&session));
+        Ok(session)
+    }
+
+    /// Remove `target` from the registry if it is still the current session.
+    pub fn remove_if(&self, target: &Arc<Session>) {
+        let mut slot = self.session.lock().unwrap();
+        if slot.as_ref().is_some_and(|s| Arc::ptr_eq(s, target)) {
+            *slot = None;
+        }
+    }
+
+    /// Kill and drop the current session (daemon shutdown).
+    pub fn shutdown_all(&self) {
+        if let Some(session) = self.session.lock().unwrap().take() {
+            session.kill();
+        }
+    }
+}
+
+/// Bind the control socket, detecting whether a live daemon already owns it.
 pub fn bind_or_detect(path: &Path) -> Result<UnixListener> {
     match UnixListener::bind(path) {
         Ok(listener) => Ok(listener),
@@ -49,24 +97,22 @@ pub fn bind_or_detect(path: &Path) -> Result<UnixListener> {
     }
 }
 
-/// Accept clients forever, handling each on its own task.
-pub async fn serve(listener: UnixListener, config: DaemonConfig) -> Result<()> {
-    let config = Arc::new(config);
+/// Accept clients forever, each attaching to the shared registry on its own task.
+pub async fn serve(listener: UnixListener, registry: Arc<Registry>) -> Result<()> {
     loop {
         let (stream, _addr) = listener.accept().await.context("accept connection")?;
-        let config = Arc::clone(&config);
+        let registry = Arc::clone(&registry);
         tokio::spawn(async move {
-            if let Err(e) = handle_client(stream, config).await {
+            if let Err(e) = handle_client(stream, registry).await {
                 tracing::warn!("client handler error: {e:#}");
             }
         });
     }
 }
 
-async fn handle_client(stream: UnixStream, config: Arc<DaemonConfig>) -> Result<()> {
+async fn handle_client(stream: UnixStream, registry: Arc<Registry>) -> Result<()> {
     let mut framed = Framed::new(stream, ServerCodec::new());
 
-    // Handshake: the first frame must be a version-matching Hello.
     let size = match framed.next().await {
         Some(Ok(ClientMsg::Hello {
             proto_version,
@@ -93,39 +139,59 @@ async fn handle_client(stream: UnixStream, config: Arc<DaemonConfig>) -> Result<
         })
         .await?;
 
-    // Spawn the PTY and send the initial screen snapshot before the live stream.
-    let (mut session, mut output_rx) = PtySession::spawn(&config.command, size)?;
-    framed
-        .send(DaemonMsg::OutputSnapshot(session.snapshot()))
+    // Attach to (or create) the persistent session and send its current screen.
+    let session = registry.attach(size)?;
+    let mut output_rx = session.subscribe();
+    let mut exit_rx = session.exit_rx();
+    let (mut sink, mut stream) = framed.split();
+    sink.send(DaemonMsg::OutputSnapshot(session.snapshot()))
         .await?;
 
-    let (mut sink, mut stream) = framed.split();
-    loop {
-        tokio::select! {
-            out = output_rx.recv() => match out {
-                Some(bytes) => {
-                    if sink.send(DaemonMsg::Output(bytes)).await.is_err() {
-                        break; // client disconnected
-                    }
-                }
-                None => break, // PTY closed (child exited)
-            },
-            msg = stream.next() => match msg {
-                Some(Ok(ClientMsg::Input(bytes))) => {
-                    let _ = session.write_input(&bytes);
-                }
-                Some(Ok(ClientMsg::Resize(size))) => {
-                    let _ = session.resize(size);
-                }
-                Some(Ok(ClientMsg::Shutdown)) => break,
-                Some(Ok(ClientMsg::Hello { .. })) => {} // ignore a duplicate hello
-                Some(Err(_)) | None => break,
-            },
-        }
+    // If it already exited between attach and here, report and go.
+    if *exit_rx.borrow_and_update() {
+        let _ = sink
+            .send(DaemonMsg::Exited {
+                code: session.exit_code(),
+            })
+            .await;
+        registry.remove_if(&session);
+        return Ok(());
     }
 
-    session.kill();
-    let code = session.wait();
-    let _ = sink.send(DaemonMsg::Exited { code }).await;
+    loop {
+        tokio::select! {
+            output = output_rx.recv() => match output {
+                Ok(bytes) => {
+                    if sink.send(DaemonMsg::Output(bytes)).await.is_err() {
+                        break; // client disconnected → detach
+                    }
+                }
+                Err(RecvError::Lagged(_)) => {
+                    // Fell behind → resync from the authoritative screen.
+                    if sink.send(DaemonMsg::OutputSnapshot(session.snapshot())).await.is_err() {
+                        break;
+                    }
+                }
+                Err(RecvError::Closed) => break,
+            },
+            msg = stream.next() => match msg {
+                Some(Ok(ClientMsg::Input(bytes))) => { let _ = session.write_input(&bytes); }
+                Some(Ok(ClientMsg::Resize(size))) => { let _ = session.resize(size); }
+                Some(Ok(ClientMsg::Shutdown)) => {
+                    session.kill();
+                    registry.remove_if(&session);
+                    break;
+                }
+                Some(Ok(ClientMsg::Hello { .. })) => {}
+                // Client gone: DETACH — leave the session running for a future reattach.
+                Some(Err(_)) | None => break,
+            },
+            _ = exit_rx.changed() => {
+                let _ = sink.send(DaemonMsg::Exited { code: session.exit_code() }).await;
+                registry.remove_if(&session);
+                break;
+            }
+        }
+    }
     Ok(())
 }

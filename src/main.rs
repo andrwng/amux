@@ -21,6 +21,9 @@ enum Command {
         /// Run in the foreground without detaching — for debugging and tests.
         #[arg(long)]
         foreground: bool,
+        /// Stop a running daemon (kills its sessions) instead of starting one.
+        #[arg(long)]
+        stop: bool,
     },
     /// Bridge a Claude Code hook event to the daemon mailbox (invoked by Claude's hooks).
     Hook,
@@ -30,12 +33,16 @@ fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
     match cli.command {
         None => amux_tui::run()?,
-        Some(Command::Daemon { foreground }) => {
-            // Detach BEFORE building the tokio runtime (fork-safety — see DESIGN §11).
-            if !foreground {
-                amux_daemon::daemonize()?;
+        Some(Command::Daemon { foreground, stop }) => {
+            if stop {
+                amux_daemon::stop()?;
+            } else {
+                // Detach BEFORE building the tokio runtime (fork-safety — see DESIGN §11).
+                if !foreground {
+                    amux_daemon::daemonize()?;
+                }
+                amux_daemon::run_blocking()?;
             }
-            amux_daemon::run_blocking()?;
         }
         Some(Command::Hook) => eprintln!("amux hook is not implemented yet (Phase 2)."),
     }
