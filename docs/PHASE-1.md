@@ -29,7 +29,7 @@ temp git repo (`tempfile` + git2).
 
 **DoD:** create/remove/list round-trip on a temp repo, on macOS + Ubuntu.
 
-## 1.3 — `AgentAdapter` + `ClaudeAdapter` (`amux-core`)
+## 1.3 — `AgentAdapter` + `ClaudeAdapter` (`amux-core`) &nbsp; · &nbsp; **✓ code-complete** (spawn_spec/resume/custom-command tests green)
 
 The CLI boundary: `spawn_spec` (command/args/env/cwd to launch in a worktree), `prepare_worktree`
 (minimal in Phase 1 — hook install is Phase 2), `capabilities`. `ClaudeAdapter` defaults to

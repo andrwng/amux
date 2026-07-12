@@ -4,6 +4,7 @@
 //!
 //! Populated across Phases 0–1.
 
+pub mod adapter;
 pub mod agent;
 pub mod clock;
 pub mod paths;
