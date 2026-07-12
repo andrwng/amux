@@ -66,6 +66,9 @@ pub enum ClientMsg {
     },
     /// Close a shell terminal (its pane was closed). No-op on a primary terminal.
     CloseTerminal { terminal: TerminalId },
+    /// Prune orphaned worktrees in `repo` (git-tracked worktrees no live agent holds) to reclaim
+    /// wedged branches. The daemon replies with a `DoctorReport`.
+    DoctorRepo { repo: RepoId },
     /// Start streaming a terminal into a pane (snapshot then live output).
     Attach { terminal: TerminalId, size: Size },
     /// Stop streaming a terminal (its pane closed / was replaced).
@@ -112,6 +115,13 @@ pub enum DaemonMsg {
     TerminalExited {
         terminal: TerminalId,
         code: Option<i32>,
+    },
+    /// Result of a `DoctorRepo` run: worktrees pruned, and worktrees skipped for having
+    /// uncommitted changes (with their dirty counts).
+    DoctorReport {
+        repo: RepoId,
+        pruned: Vec<String>,
+        skipped: Vec<(String, usize)>,
     },
     /// A daemon-side error surfaced to the client.
     Error { message: String },

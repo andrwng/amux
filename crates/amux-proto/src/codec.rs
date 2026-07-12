@@ -169,6 +169,9 @@ mod tests {
             like: TerminalId::new(),
         });
         roundtrip(ClientMsg::CloseTerminal { terminal: t });
+        roundtrip(ClientMsg::DoctorRepo {
+            repo: RepoId::from_canonical_path(&PathBuf::from("/repos/amux")),
+        });
         roundtrip(ClientMsg::Attach {
             terminal: t,
             size: Size {
@@ -218,6 +221,11 @@ mod tests {
         roundtrip(DaemonMsg::TerminalExited {
             terminal: t,
             code: Some(0),
+        });
+        roundtrip(DaemonMsg::DoctorReport {
+            repo: RepoId::from_canonical_path(&PathBuf::from("/repos/amux")),
+            pruned: vec!["feat-a".into()],
+            skipped: vec![("feat-b".into(), 3)],
         });
         roundtrip(DaemonMsg::Error {
             message: "boom".into(),

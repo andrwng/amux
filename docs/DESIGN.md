@@ -257,6 +257,12 @@ cwd). The sidebar groups agents under repo headers; `CreateAgent { repo, .. }` t
 repo, and `CreateAgentAt { path, .. }` registers-then-creates for a repo given by path. Each repo
 owns its own `WorktreeService` (worktree base `~/.amux/worktrees/<repo>-<hash>/`).
 
+**Doctor.** A crash or an out-of-band deletion can leave a worktree that git still tracks but no
+live agent holds, wedging its branch as "already checked out". `DoctorRepo { repo }` (the `P` key
+in the sidebar, or `amux doctor` from a repo) prunes those orphans — only worktrees **under the
+repo's amux base** that no live agent references, and never one with uncommitted changes (those
+are reported and spared). It reclaims the branch without dropping to `git worktree prune`.
+
 ### 5.1 Sockets (unix domain, `0600`, in `$XDG_RUNTIME_DIR/amux/` or `~/.amux/run/`)
 
 - **Control socket** — clients connect here. Speaks `amux-proto`.

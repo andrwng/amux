@@ -4,6 +4,7 @@
 
 mod app;
 mod client;
+mod doctor;
 mod input;
 mod pane;
 
@@ -16,4 +17,12 @@ pub fn run() -> Result<()> {
         .enable_all()
         .build()?;
     runtime.block_on(app::run())
+}
+
+/// Entry point for `amux doctor`: prune orphaned worktrees in the current repo and print a report.
+pub fn doctor() -> Result<()> {
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()?;
+    runtime.block_on(doctor::run())
 }

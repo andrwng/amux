@@ -75,7 +75,8 @@ by adjusting the ratio of the nearest ancestor split of the matching axis (clamp
 ### Sidebar cell (when focused)
 `j`/`k` select · `n` new · `d` delete · `r` resume · `Enter`/`l` open the selected agent into the
 most-recently-focused pane (or the first pane if the layout is empty). Opening an agent attaches
-its **primary terminal**. `Ctrl+l` moves into panes.
+its **primary terminal**. `N` new agent in a repo by path · `P` doctor (prune the selected repo's
+orphaned worktrees). `Ctrl+l` moves into panes.
 
 **DoD:** pure unit tests for directional nav, split, close, and resize on the pane tree; the
 prefix + resize state machines tested; keys route to the right pane; interactive check.

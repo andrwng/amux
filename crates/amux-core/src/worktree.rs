@@ -8,6 +8,16 @@ use std::path::{Path, PathBuf};
 use anyhow::{Context, Result};
 use git2::{Repository, WorktreeAddOptions, WorktreePruneOptions};
 
+/// A git-tracked worktree that no live agent holds — a candidate for `doctor` to prune.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Orphan {
+    /// The worktree's git name (the sanitized branch, e.g. `feat-login`).
+    pub name: String,
+    pub path: PathBuf,
+    /// Uncommitted changes in the worktree dir (0 if the dir is already gone).
+    pub dirty: usize,
+}
+
 /// Where a repo's worktrees are stored.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum WorktreeLocation {
@@ -106,14 +116,18 @@ impl WorktreeService {
 
     /// Prune the worktree metadata and delete its directory.
     pub fn remove(&self, branch: &str) -> Result<()> {
+        self.prune_worktree(&sanitize(branch))
+    }
+
+    /// Prune a worktree by its git name (already sanitized): prune metadata + remove its dir.
+    pub fn prune_worktree(&self, name: &str) -> Result<()> {
         let repo = Repository::open(&self.repo).context("open repository")?;
-        let name = sanitize(branch);
-        if let Ok(worktree) = repo.find_worktree(&name) {
+        if let Ok(worktree) = repo.find_worktree(name) {
             let mut opts = WorktreePruneOptions::new();
             opts.valid(true).working_tree(true);
             worktree.prune(Some(&mut opts)).context("prune worktree")?;
         }
-        let path = self.base.join(&name);
+        let path = self.base.join(name);
         if path.exists() {
             std::fs::remove_dir_all(&path).context("remove worktree directory")?;
         }
@@ -131,14 +145,44 @@ impl WorktreeService {
             .collect())
     }
 
+    /// Orphaned worktrees: git-tracked worktrees **under our base** that no live agent holds
+    /// (`keep_branches` are the branches of live agents). These are what wedge a branch as
+    /// "already checked out" after a crash or an out-of-band deletion. Each reports its dirty
+    /// count so the caller can spare one with uncommitted work.
+    pub fn orphans(&self, keep_branches: &[String]) -> Result<Vec<Orphan>> {
+        let keep: Vec<String> = keep_branches.iter().map(|b| sanitize(b)).collect();
+        let repo = Repository::open(&self.repo).context("open repository")?;
+        // Compare canonicalized paths: git records a worktree's path resolved (e.g. `/private/…`
+        // on macOS), which won't share a prefix with a non-canonical base otherwise.
+        let base = std::fs::canonicalize(&self.base).unwrap_or_else(|_| self.base.clone());
+        let mut out = Vec::new();
+        for name in self.list()? {
+            if keep.contains(&name) {
+                continue;
+            }
+            let Ok(worktree) = repo.find_worktree(&name) else {
+                continue;
+            };
+            let path = worktree.path().to_path_buf();
+            let canon = std::fs::canonicalize(&path).unwrap_or_else(|_| path.clone());
+            // Safety: only ever touch worktrees that live under amux's own base directory, so a
+            // user's hand-made worktree elsewhere is never a prune candidate.
+            if !canon.starts_with(&base) {
+                continue;
+            }
+            let dirty = if path.exists() {
+                dirty_at(&path).unwrap_or(0)
+            } else {
+                0
+            };
+            out.push(Orphan { name, path, dirty });
+        }
+        Ok(out)
+    }
+
     /// Count uncommitted changes (staged, unstaged, and untracked) in a branch's worktree.
     pub fn dirty_count(&self, branch: &str) -> Result<usize> {
-        let path = self.path_for(branch);
-        let repo = Repository::open(&path).context("open worktree")?;
-        let mut opts = git2::StatusOptions::new();
-        opts.include_untracked(true).include_ignored(false);
-        let statuses = repo.statuses(Some(&mut opts)).context("git status")?;
-        Ok(statuses.len())
+        dirty_at(&self.path_for(branch))
     }
 
     /// Symlink shared files (e.g. `node_modules`, `.env`) from the repo into a worktree.
@@ -177,6 +221,15 @@ fn canonical_repo(repo_path: &Path) -> Result<PathBuf> {
 
 fn sanitize(branch: &str) -> String {
     branch.replace('/', "-")
+}
+
+/// Count uncommitted changes (staged, unstaged, untracked) in the worktree at `path`.
+fn dirty_at(path: &Path) -> Result<usize> {
+    let repo = Repository::open(path).context("open worktree")?;
+    let mut opts = git2::StatusOptions::new();
+    opts.include_untracked(true).include_ignored(false);
+    let statuses = repo.statuses(Some(&mut opts)).context("git status")?;
+    Ok(statuses.len())
 }
 
 /// `~/.amux/worktrees/<basename>-<hash>` — stable per repo, disambiguated by path hash.
@@ -270,6 +323,41 @@ mod tests {
             err.contains("already checked out") && err.contains("different branch"),
             "expected a friendly checkout error, got: {err}"
         );
+    }
+
+    #[test]
+    fn doctor_prunes_orphans_but_keeps_live_and_dirty() {
+        let tmp = tempfile::tempdir().unwrap();
+        let repo_path = tmp.path().join("repo");
+        std::fs::create_dir(&repo_path).unwrap();
+        init_repo(&repo_path);
+        let svc = WorktreeService::with_base(&repo_path, tmp.path().join("wt")).unwrap();
+
+        // Three worktrees: one stays live, one is a clean orphan, one is a dirty orphan.
+        svc.create("live").unwrap();
+        svc.create("orphan").unwrap();
+        let dirty = svc.create("dirty").unwrap();
+        std::fs::write(dirty.join("scratch.txt"), "wip").unwrap();
+
+        // Only "live" is held by an agent; the other two are orphans.
+        let orphans = svc.orphans(&["live".to_string()]).unwrap();
+        let names: Vec<&str> = orphans.iter().map(|o| o.name.as_str()).collect();
+        assert!(names.contains(&"orphan") && names.contains(&"dirty"));
+        assert!(
+            !names.contains(&"live"),
+            "a live worktree is never an orphan"
+        );
+        assert_eq!(
+            orphans.iter().find(|o| o.name == "dirty").unwrap().dirty,
+            1,
+            "the dirty orphan reports its uncommitted change"
+        );
+
+        // Prune the clean orphan; the branch (and dir) are gone, live + dirty survive.
+        svc.prune_worktree("orphan").unwrap();
+        assert!(!svc.exists("orphan"));
+        assert!(svc.exists("live"));
+        assert!(svc.exists("dirty"));
     }
 
     #[test]

@@ -29,6 +29,13 @@ pub enum DeleteOutcome {
     NeedsConfirm(String),
 }
 
+/// What a `doctor` run did: worktrees pruned, and worktrees left alone because they had
+/// uncommitted changes (name + dirty count).
+pub struct DoctorReport {
+    pub pruned: Vec<String>,
+    pub skipped: Vec<(String, usize)>,
+}
+
 struct Agent {
     id: AgentId,
     repo: RepoId,
@@ -366,6 +373,32 @@ impl Registry {
         }
         let _ = self.events.send(DaemonMsg::AgentRemoved { id });
         Ok(DeleteOutcome::Deleted)
+    }
+
+    /// Prune orphaned worktrees in `repo` — git-tracked worktrees under our base that no live
+    /// agent holds — to reclaim wedged branches. Worktrees with uncommitted changes are spared.
+    pub fn doctor(&self, repo: RepoId) -> Result<DoctorReport> {
+        let worktrees = self.worktrees_for(repo).context("no such repo")?;
+        let keep: Vec<String> = {
+            let state = self.state.lock().unwrap();
+            state
+                .agents
+                .values()
+                .filter(|a| a.repo == repo)
+                .map(|a| a.branch.clone())
+                .collect()
+        };
+        let mut pruned = Vec::new();
+        let mut skipped = Vec::new();
+        for orphan in worktrees.orphans(&keep)? {
+            if orphan.dirty > 0 {
+                skipped.push((orphan.name, orphan.dirty));
+            } else {
+                worktrees.prune_worktree(&orphan.name)?;
+                pruned.push(orphan.name);
+            }
+        }
+        Ok(DoctorReport { pruned, skipped })
     }
 
     pub fn shutdown_all(&self) {

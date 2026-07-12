@@ -10,5 +10,5 @@ pub use message::{AgentInfo, ClientMsg, DaemonMsg, RepoInfo, Size};
 
 /// Protocol version. The client and daemon refuse to talk across a mismatch (the client
 /// auto-recovers). v1 multi-agent; v2 dirty-delete; v3 multi-attach; v4 agents-own-terminals;
-/// v5 multi-repo.
-pub const PROTO_VERSION: u32 = 5;
+/// v5 multi-repo; v6 doctor (prune orphaned worktrees).
+pub const PROTO_VERSION: u32 = 6;

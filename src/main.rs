@@ -30,6 +30,9 @@ enum Command {
         #[arg(long)]
         repo: Option<PathBuf>,
     },
+    /// Prune orphaned worktrees in the current repo — reclaim branches wedged as "already
+    /// checked out" after a crash or an out-of-band deletion.
+    Doctor,
     /// Bridge a Claude Code hook event to the daemon mailbox (invoked by Claude's hooks).
     Hook,
 }
@@ -56,6 +59,7 @@ fn main() -> anyhow::Result<()> {
                 amux_daemon::run_blocking(repo)?;
             }
         }
+        Some(Command::Doctor) => amux_tui::doctor()?,
         Some(Command::Hook) => eprintln!("amux hook is not implemented yet (Phase 2)."),
     }
     Ok(())

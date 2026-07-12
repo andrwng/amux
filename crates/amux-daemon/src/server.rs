@@ -158,6 +158,20 @@ fn handle_command(
             detach(attached, terminal);
             registry.close_terminal(terminal);
         }
+        ClientMsg::DoctorRepo { repo } => match registry.doctor(repo) {
+            Ok(report) => {
+                let _ = out_tx.send(DaemonMsg::DoctorReport {
+                    repo,
+                    pruned: report.pruned,
+                    skipped: report.skipped,
+                });
+            }
+            Err(e) => {
+                let _ = out_tx.send(DaemonMsg::Error {
+                    message: format!("{e:#}"),
+                });
+            }
+        },
         ClientMsg::Attach { terminal, size } => attach(attached, registry, out_tx, terminal, size),
         ClientMsg::Detach { terminal } => detach(attached, terminal),
         ClientMsg::Input { terminal, bytes } => {

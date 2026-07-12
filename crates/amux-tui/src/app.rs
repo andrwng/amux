@@ -147,7 +147,10 @@ struct App {
     create_repo: Option<RepoId>,
     confirm_id: Option<AgentId>,
     confirm_msg: String,
+    /// Transient banners: `status` is an error (red), `info` a notice (green). Both dismiss on
+    /// the next keystroke.
     status: String,
+    info: String,
     area: Rect,
 }
 
@@ -172,6 +175,7 @@ impl App {
             confirm_id: None,
             confirm_msg: String::new(),
             status: String::new(),
+            info: String::new(),
             area: main_area(cols, rows),
         }
     }
@@ -261,6 +265,11 @@ impl App {
                 }
                 self.reconcile(sink).await?;
             }
+            DaemonMsg::DoctorReport {
+                pruned, skipped, ..
+            } => {
+                self.info = doctor_summary(&pruned, &skipped);
+            }
             DaemonMsg::Error { message } => self.status = message,
             DaemonMsg::Hello { .. } => {}
         }
@@ -273,9 +282,10 @@ impl App {
         if is_ctrl(key, 'q') {
             return Ok(Flow::Quit);
         }
-        // Any keystroke dismisses a lingering error banner (it still performs its action).
+        // Any keystroke dismisses a lingering banner (it still performs its action).
         if self.input == InputMode::Normal {
             self.status.clear();
+            self.info.clear();
         }
         match self.input {
             InputMode::Creating => return self.key_creating(key, sink).await,
@@ -349,6 +359,12 @@ impl App {
             KeyCode::Char('r') => {
                 if let Some(id) = self.selected_agent() {
                     sink.send(ClientMsg::ResumeAgent { id }).await?;
+                }
+            }
+            // `P`: doctor — prune the selected repo's orphaned worktrees (reclaim wedged branches).
+            KeyCode::Char('P') => {
+                if let Some(repo) = self.selected_repo() {
+                    sink.send(ClientMsg::DoctorRepo { repo }).await?;
                 }
             }
             KeyCode::Enter | KeyCode::Char('l') => self.open_selected(sink).await?,
@@ -656,6 +672,25 @@ impl App {
     }
 }
 
+/// A one-line summary of a doctor run for the notice banner.
+fn doctor_summary(pruned: &[String], skipped: &[(String, usize)]) -> String {
+    if pruned.is_empty() && skipped.is_empty() {
+        return "doctor: no orphaned worktrees — nothing to prune".to_string();
+    }
+    let mut parts = Vec::new();
+    if !pruned.is_empty() {
+        parts.push(format!("pruned {} ({})", pruned.len(), pruned.join(", ")));
+    }
+    if !skipped.is_empty() {
+        let names: Vec<String> = skipped
+            .iter()
+            .map(|(n, d)| format!("{n}: {d} uncommitted"))
+            .collect();
+        parts.push(format!("skipped {} ({})", skipped.len(), names.join(", ")));
+    }
+    format!("doctor: {}", parts.join(" · "))
+}
+
 /// Expand a leading `~` to the home directory; otherwise return the path unchanged.
 fn expand_path(input: &str) -> PathBuf {
     if let Some(rest) = input.strip_prefix("~/") {
@@ -937,10 +972,15 @@ fn render_status(frame: &mut Frame, area: Rect, app: &App) {
             format!(" \u{26a0} {} \u{b7} (press any key to dismiss)", app.status),
             Style::default().fg(Color::White).bg(Color::Red),
         )
+    } else if !app.info.is_empty() {
+        (
+            format!(" \u{2713} {} \u{b7} (press any key to dismiss)", app.info),
+            Style::default().fg(Color::Black).bg(Color::Green),
+        )
     } else {
         let hint = match app.focus {
             Focus::Sidebar => {
-                " n new \u{b7} N new+repo \u{b7} j/k select \u{b7} enter open \u{b7} d del \u{b7} r resume \u{b7} ctrl+hjkl \u{b7} ctrl+q quit"
+                " n new \u{b7} N new+repo \u{b7} j/k select \u{b7} enter open \u{b7} d del \u{b7} r resume \u{b7} P prune \u{b7} ctrl+q quit"
             }
             Focus::Panes => {
                 " ctrl+hjkl move \u{b7} ctrl+b %/\"/x/r \u{b7} type to talk \u{b7} ctrl+q quit"
