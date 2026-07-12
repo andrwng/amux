@@ -26,6 +26,11 @@ impl RuntimePaths {
     pub fn socket(&self) -> PathBuf {
         self.dir.join("amuxd.sock")
     }
+
+    /// The mailbox socket Claude Code hooks push status to (via `amux hook`).
+    pub fn mailbox(&self) -> PathBuf {
+        self.dir.join("amuxd-hooks.sock")
+    }
 }
 
 fn fallback_dir() -> Result<PathBuf> {

@@ -7,5 +7,6 @@
 pub mod adapter;
 pub mod agent;
 pub mod clock;
+pub mod hook;
 pub mod paths;
 pub mod worktree;
