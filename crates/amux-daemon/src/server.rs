@@ -18,7 +18,7 @@ use tokio_util::codec::Framed;
 use amux_core::agent::AgentId;
 use amux_proto::{check_version, ClientMsg, DaemonMsg, ServerCodec, PROTO_VERSION};
 
-use crate::registry::Registry;
+use crate::registry::{DeleteOutcome, Registry};
 
 /// Bind the control socket, detecting whether a live daemon already owns it.
 pub fn bind_or_detect(path: &Path) -> Result<UnixListener> {
@@ -130,10 +130,17 @@ fn handle_command(
             let _ = out_tx.send(DaemonMsg::Agents(registry.infos()));
         }
         ClientMsg::CreateAgent { branch } => report_err(registry.create(&branch).map(|_| ())),
-        ClientMsg::DeleteAgent { id } => {
-            detach_if(attached, id);
-            report_err(registry.delete(id));
-        }
+        ClientMsg::DeleteAgent { id, force } => match registry.delete(id, force) {
+            Ok(DeleteOutcome::Deleted) => detach_if(attached, id),
+            Ok(DeleteOutcome::NeedsConfirm(message)) => {
+                let _ = out_tx.send(DaemonMsg::DeleteNeedsConfirm { id, message });
+            }
+            Err(e) => {
+                let _ = out_tx.send(DaemonMsg::Error {
+                    message: format!("{e:#}"),
+                });
+            }
+        },
         ClientMsg::ResumeAgent { id } => report_err(registry.resume(id)),
         ClientMsg::Attach { id, size } => {
             // Re-target the single live stream.

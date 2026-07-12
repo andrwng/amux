@@ -30,6 +30,7 @@ enum Mode {
     Nav,
     Terminal,
     Creating,
+    Confirming,
 }
 
 enum Flow {
@@ -93,6 +94,8 @@ struct App {
     main_size: Size,
     mode: Mode,
     create_buf: String,
+    confirm_id: Option<AgentId>,
+    confirm_msg: String,
     status: String,
 }
 
@@ -106,6 +109,8 @@ impl App {
             main_size,
             mode: Mode::Nav,
             create_buf: String::new(),
+            confirm_id: None,
+            confirm_msg: String::new(),
             status: "n new · j/k select · enter open · d del · r resume · ctrl-q quit".into(),
         }
     }
@@ -129,6 +134,11 @@ impl App {
                     self.selected = None;
                 }
                 self.ensure_selection();
+            }
+            DaemonMsg::DeleteNeedsConfirm { id, message } => {
+                self.confirm_id = Some(id);
+                self.confirm_msg = message;
+                self.mode = Mode::Confirming;
             }
             DaemonMsg::StateChanged { id, state } => {
                 if let Some(agent) = self.agents.iter_mut().find(|a| a.id == id) {
@@ -161,6 +171,7 @@ impl App {
             Mode::Nav => self.key_nav(key, sink).await,
             Mode::Terminal => self.key_terminal(key, sink).await,
             Mode::Creating => self.key_creating(key, sink).await,
+            Mode::Confirming => self.key_confirm(key, sink).await,
         }
     }
 
@@ -175,7 +186,8 @@ impl App {
             }
             KeyCode::Char('d') => {
                 if let Some(id) = self.selected {
-                    sink.send(ClientMsg::DeleteAgent { id }).await?;
+                    sink.send(ClientMsg::DeleteAgent { id, force: false })
+                        .await?;
                 }
             }
             KeyCode::Char('r') => {
@@ -230,6 +242,20 @@ impl App {
             KeyCode::Char(c) => self.create_buf.push(c),
             _ => {}
         }
+        Ok(Flow::Continue)
+    }
+
+    async fn key_confirm(&mut self, key: KeyEvent, sink: &mut Sink) -> Result<Flow> {
+        match key.code {
+            KeyCode::Char('y') | KeyCode::Char('Y') => {
+                if let Some(id) = self.confirm_id.take() {
+                    sink.send(ClientMsg::DeleteAgent { id, force: true })
+                        .await?;
+                }
+            }
+            _ => self.confirm_id = None, // anything else cancels
+        }
+        self.mode = Mode::Nav;
         Ok(Flow::Continue)
     }
 
@@ -438,6 +464,10 @@ fn render_status(frame: &mut Frame, area: Rect, app: &App) {
         Mode::Terminal => (
             " TERMINAL — ctrl-b sidebar · ctrl-q quit".to_string(),
             Style::default().fg(Color::Black).bg(Color::Green),
+        ),
+        Mode::Confirming => (
+            format!(" {} — delete anyway? y/n", app.confirm_msg),
+            Style::default().fg(Color::White).bg(Color::Red),
         ),
         Mode::Nav => (
             format!(" {}", app.status),

@@ -145,7 +145,7 @@ mod tests {
         roundtrip(ClientMsg::CreateAgent {
             branch: "feat/x".into(),
         });
-        roundtrip(ClientMsg::DeleteAgent { id });
+        roundtrip(ClientMsg::DeleteAgent { id, force: true });
         roundtrip(ClientMsg::ResumeAgent { id });
         roundtrip(ClientMsg::Attach {
             id,
@@ -173,6 +173,10 @@ mod tests {
         roundtrip(DaemonMsg::Agents(vec![sample_info(), sample_info()]));
         roundtrip(DaemonMsg::AgentAdded(sample_info()));
         roundtrip(DaemonMsg::AgentRemoved { id });
+        roundtrip(DaemonMsg::DeleteNeedsConfirm {
+            id,
+            message: "2 uncommitted changes".into(),
+        });
         roundtrip(DaemonMsg::StateChanged {
             id,
             state: AgentState::Exited { code: Some(0) },

@@ -115,6 +115,16 @@ impl WorktreeService {
             .collect())
     }
 
+    /// Count uncommitted changes (staged, unstaged, and untracked) in a branch's worktree.
+    pub fn dirty_count(&self, branch: &str) -> Result<usize> {
+        let path = self.path_for(branch);
+        let repo = Repository::open(&path).context("open worktree")?;
+        let mut opts = git2::StatusOptions::new();
+        opts.include_untracked(true).include_ignored(false);
+        let statuses = repo.statuses(Some(&mut opts)).context("git status")?;
+        Ok(statuses.len())
+    }
+
     /// Symlink shared files (e.g. `node_modules`, `.env`) from the repo into a worktree.
     pub fn link_shared(&self, branch: &str, files: &[String]) -> Result<()> {
         let worktree = self.path_for(branch);

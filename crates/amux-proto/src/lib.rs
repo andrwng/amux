@@ -8,5 +8,6 @@ mod message;
 pub use codec::{check_version, ClientCodec, ProtoError, ServerCodec, WireCodec, MAX_FRAME_BYTES};
 pub use message::{AgentInfo, ClientMsg, DaemonMsg, Size};
 
-/// Protocol version. The client and daemon refuse to talk across a mismatch. v1 = multi-agent.
-pub const PROTO_VERSION: u32 = 1;
+/// Protocol version. The client and daemon refuse to talk across a mismatch (the client
+/// auto-recovers). v1 = multi-agent; v2 = dirty-delete confirmation.
+pub const PROTO_VERSION: u32 = 2;

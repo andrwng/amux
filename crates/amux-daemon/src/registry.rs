@@ -49,6 +49,13 @@ impl Agent {
     }
 }
 
+/// Outcome of a delete request.
+pub enum DeleteOutcome {
+    Deleted,
+    /// The worktree is dirty and `force` was not set; carries a human-readable reason.
+    NeedsConfirm(String),
+}
+
 pub struct Registry {
     agents: Mutex<HashMap<AgentId, Agent>>,
     worktrees: WorktreeService,
@@ -158,17 +165,31 @@ impl Registry {
         Ok(())
     }
 
-    /// Delete an agent — the only destructive op: kill its session and remove its worktree.
-    pub fn delete(&self, id: AgentId) -> Result<()> {
-        let agent = self.agents.lock().unwrap().remove(&id);
-        if let Some(agent) = agent {
+    /// Delete an agent — the only destructive op: kill its session and remove its worktree
+    /// (the git branch and its commits are kept). If `force` is false and the worktree has
+    /// uncommitted changes, returns `NeedsConfirm` without deleting anything.
+    pub fn delete(&self, id: AgentId, force: bool) -> Result<DeleteOutcome> {
+        let branch = match self.agents.lock().unwrap().get(&id) {
+            Some(agent) => agent.branch.clone(),
+            None => return Ok(DeleteOutcome::Deleted), // already gone — idempotent
+        };
+        if !force {
+            let dirty = self.worktrees.dirty_count(&branch).unwrap_or(0);
+            if dirty > 0 {
+                let plural = if dirty == 1 { "" } else { "s" };
+                return Ok(DeleteOutcome::NeedsConfirm(format!(
+                    "{dirty} uncommitted change{plural}"
+                )));
+            }
+        }
+        if let Some(agent) = self.agents.lock().unwrap().remove(&id) {
             if let Some(session) = &agent.session {
                 session.kill();
             }
             self.worktrees.remove(&agent.branch).ok();
             let _ = self.events.send(DaemonMsg::AgentRemoved { id });
         }
-        Ok(())
+        Ok(DeleteOutcome::Deleted)
     }
 
     /// Kill every live session (daemon shutdown). Worktrees are left on disk.

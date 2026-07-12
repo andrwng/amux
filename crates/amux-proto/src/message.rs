@@ -33,7 +33,9 @@ pub enum ClientMsg {
     /// Create a new agent on `branch` (worktree + session).
     CreateAgent { branch: String },
     /// Delete an agent — kills its session and removes its worktree. The only destructive op.
-    DeleteAgent { id: AgentId },
+    /// With `force = false` the daemon refuses if the worktree has uncommitted changes and
+    /// replies `DeleteNeedsConfirm`; `force = true` deletes regardless.
+    DeleteAgent { id: AgentId, force: bool },
     /// Resume a suspended (exited) agent's session in its existing worktree.
     ResumeAgent { id: AgentId },
     /// Stream this agent into the main window (re-targets the single live stream). Sends a
@@ -56,6 +58,8 @@ pub enum DaemonMsg {
     AgentAdded(AgentInfo),
     /// An agent was deleted.
     AgentRemoved { id: AgentId },
+    /// Delete was refused because the worktree has uncommitted changes — confirm to force it.
+    DeleteNeedsConfirm { id: AgentId, message: String },
     /// An agent's state changed (the sidebar's live signal).
     StateChanged { id: AgentId, state: AgentState },
     /// Full screen of the attached agent as a `contents_formatted()` dump, sent on attach.

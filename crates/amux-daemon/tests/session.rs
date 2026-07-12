@@ -142,7 +142,10 @@ async fn create_attach_echo_delete() {
         worktree_path.exists(),
         "worktree should exist before delete"
     );
-    client.send(ClientMsg::DeleteAgent { id }).await.unwrap();
+    client
+        .send(ClientMsg::DeleteAgent { id, force: true })
+        .await
+        .unwrap();
     let removed = tokio::time::timeout(Duration::from_secs(5), async {
         loop {
             match client.next().await {
@@ -155,6 +158,81 @@ async fn create_attach_echo_delete() {
     .await
     .unwrap_or(false);
     assert!(removed, "expected AgentRemoved after delete");
+
+    server.abort();
+}
+
+#[tokio::test]
+async fn dirty_worktree_requires_delete_confirmation() {
+    let tmp = tempfile::tempdir().unwrap();
+    let repo = tmp.path().join("repo");
+    std::fs::create_dir(&repo).unwrap();
+    init_repo(&repo);
+
+    let worktrees = WorktreeService::with_base(&repo, tmp.path().join("wt")).unwrap();
+    let adapter = Box::new(ClaudeAdapter::with_command(vec!["cat".into()]));
+    let registry = Registry::new(worktrees, adapter);
+
+    let socket = tmp.path().join("amuxd.sock");
+    let listener = UnixListener::bind(&socket).unwrap();
+    let server = tokio::spawn(serve(listener, registry));
+
+    let mut client = handshake(&socket).await;
+    client
+        .send(ClientMsg::CreateAgent {
+            branch: "feat/dirty".into(),
+        })
+        .await
+        .unwrap();
+    let id = wait_for_added(&mut client).await;
+
+    // Dirty the worktree with an untracked file.
+    let worktree = tmp.path().join("wt").join("feat-dirty");
+    std::fs::write(worktree.join("scratch.txt"), "uncommitted").unwrap();
+
+    // Delete without force → the daemon refuses and asks to confirm.
+    client
+        .send(ClientMsg::DeleteAgent { id, force: false })
+        .await
+        .unwrap();
+    let needs_confirm = tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            match client.next().await {
+                Some(Ok(DaemonMsg::DeleteNeedsConfirm { id: got, .. })) => return got == id,
+                Some(Ok(_)) => {}
+                _ => return false,
+            }
+        }
+    })
+    .await
+    .unwrap_or(false);
+    assert!(needs_confirm, "dirty worktree should require confirmation");
+    assert!(
+        worktree.exists(),
+        "worktree must survive an unconfirmed delete"
+    );
+
+    // Force delete → gone.
+    client
+        .send(ClientMsg::DeleteAgent { id, force: true })
+        .await
+        .unwrap();
+    let removed = tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            match client.next().await {
+                Some(Ok(DaemonMsg::AgentRemoved { id: got })) => return got == id,
+                Some(Ok(_)) => {}
+                _ => return false,
+            }
+        }
+    })
+    .await
+    .unwrap_or(false);
+    assert!(removed, "force delete should remove the agent");
+    assert!(
+        !worktree.exists(),
+        "worktree should be gone after force delete"
+    );
 
     server.abort();
 }
