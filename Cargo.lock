@@ -22,6 +22,7 @@ name = "amux"
 version = "0.0.0"
 dependencies = [
  "amux-daemon",
+ "amux-tui",
  "anyhow",
  "clap",
  "portable-pty",
@@ -75,8 +76,19 @@ dependencies = [
 name = "amux-tui"
 version = "0.0.0"
 dependencies = [
+ "amux-core",
+ "amux-daemon",
  "amux-proto",
  "anyhow",
+ "crossterm",
+ "futures",
+ "ratatui",
+ "tempfile",
+ "tokio",
+ "tokio-util",
+ "tracing",
+ "tui-term",
+ "vt100",
 ]
 
 [[package]]
@@ -430,6 +442,7 @@ dependencies = [
  "crossterm_winapi",
  "derive_more",
  "document-features",
+ "futures-core",
  "mio",
  "parking_lot",
  "rustix",

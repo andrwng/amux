@@ -76,7 +76,7 @@ the workspace builds clean; CI is green.
 
 ---
 
-## 0.4 — Client auto-spawn + attach
+## 0.4 — Client auto-spawn + attach &nbsp; · &nbsp; **✓ code-complete** (connect/handshake tested; detached-daemon + live-detection smoke-tested)
 
 **Deliverables**
 - `amux` (default): connect to the control socket; if absent, spawn `amux daemon`, wait for the
@@ -92,7 +92,7 @@ the workspace builds clean; CI is green.
 
 ---
 
-## 0.5 — `amux-tui`: render + input + resize + clean teardown
+## 0.5 — `amux-tui`: render + input + resize + clean teardown &nbsp; · &nbsp; **✓ code-complete** (input+render tests green; interactive run pending; terminal restore via `ratatui::init` panic hook)
 
 **Deliverables**
 - ratatui/crossterm app: full-frame `tui-term` render of the PTY; key forwarding (KeyEvent→bytes,

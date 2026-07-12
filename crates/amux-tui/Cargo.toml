@@ -7,4 +7,17 @@ description = "The amux ratatui client: sidebar, main window, floating minis, in
 
 [dependencies]
 amux-proto = { workspace = true }
+amux-core = { workspace = true }
 anyhow = { workspace = true }
+tokio = { workspace = true }
+tokio-util = { workspace = true }
+futures = { workspace = true }
+ratatui = { workspace = true }
+crossterm = { workspace = true }
+tui-term = { workspace = true }
+vt100 = { workspace = true }
+tracing = { workspace = true }
+
+[dev-dependencies]
+amux-daemon = { workspace = true }
+tempfile = { workspace = true }

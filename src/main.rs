@@ -29,10 +29,7 @@ enum Command {
 fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
     match cli.command {
-        None => {
-            eprintln!("amux TUI client is not implemented yet (Phase 0.5).");
-            eprintln!("Phase 0.1 spike:  cargo run --example spike");
-        }
+        None => amux_tui::run()?,
         Some(Command::Daemon { foreground }) => {
             // Detach BEFORE building the tokio runtime (fork-safety — see DESIGN §11).
             if !foreground {
