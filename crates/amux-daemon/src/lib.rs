@@ -7,11 +7,13 @@
 //! (resumable), and only an explicit delete removes a worktree.
 
 mod daemonize;
+mod mailbox;
 mod pty;
 mod registry;
 mod server;
 
 pub use daemonize::daemonize;
+pub use mailbox::{bind_mailbox, run_hook, serve_mailbox};
 pub use registry::Registry;
 pub use server::{bind_or_detect, serve};
 
@@ -46,32 +48,43 @@ pub fn run_blocking(repo: PathBuf) -> Result<()> {
     std::fs::set_permissions(&paths.dir, std::fs::Permissions::from_mode(0o700)).ok();
 
     let socket = paths.socket();
-    anyhow::ensure!(
-        socket.as_os_str().len() < MAX_SOCKET_PATH,
-        "socket path is too long ({} bytes): {}",
-        socket.as_os_str().len(),
-        socket.display()
-    );
+    let mailbox = paths.mailbox();
+    for path in [&socket, &mailbox] {
+        anyhow::ensure!(
+            path.as_os_str().len() < MAX_SOCKET_PATH,
+            "socket path is too long ({} bytes): {}",
+            path.as_os_str().len(),
+            path.display()
+        );
+    }
     let pidfile = pid_file(&paths.dir);
 
-    // Phase 1 runs a shell per worktree (exercises worktree isolation + the sidebar without
-    // depending on `claude` being spawnable); Phase 2 switches to `claude` + hook status.
-    let shell = std::env::var("SHELL").unwrap_or_else(|_| "/bin/sh".to_string());
-    let adapter = Box::new(ClaudeAdapter::with_command(vec![shell]));
+    // The agent CLI. Phase 2 runs real `claude` (hooks push exact status); override with
+    // `AMUX_AGENT_CMD` (space-separated) to point at a shell or a fake agent for testing.
+    let command = match std::env::var("AMUX_AGENT_CMD") {
+        Ok(c) if !c.trim().is_empty() => c.split_whitespace().map(String::from).collect(),
+        _ => vec!["claude".to_string()],
+    };
+    let adapter = Box::new(ClaudeAdapter::with_command(command));
+    // The bridge Claude's hooks invoke (absolute path — hooks run with cwd = the worktree).
+    let amux_exe = std::env::current_exe().context("locate the amux executable")?;
 
     let runtime = tokio::runtime::Runtime::new().context("build tokio runtime")?;
     runtime.block_on(async move {
         let listener = server::bind_or_detect(&socket)?;
         std::fs::set_permissions(&socket, std::fs::Permissions::from_mode(0o600)).ok();
+        let hook_listener = mailbox::bind_mailbox(&mailbox)?;
+        std::fs::set_permissions(&mailbox, std::fs::Permissions::from_mode(0o600)).ok();
         std::fs::write(&pidfile, std::process::id().to_string()).ok();
         tracing::info!(
-            "amux daemon for {} listening at {} (pid {})",
+            "amux daemon for {} listening at {} (mailbox {}, pid {})",
             repo.display(),
             socket.display(),
+            mailbox.display(),
             std::process::id()
         );
 
-        let registry = Registry::new(adapter);
+        let registry = Registry::with_hooks(adapter, mailbox.clone(), amux_exe);
         // Pre-register the launching repo so `amux` in a repo dir works out of the box; clients
         // also register their own cwd on connect, so the daemon serves many repos over time.
         if let Err(e) = registry.register_path(&repo, WorktreeLocation::Global) {
@@ -82,12 +95,14 @@ pub fn run_blocking(repo: PathBuf) -> Result<()> {
 
         let outcome = tokio::select! {
             r = server::serve(listener, registry.clone()) => r,
+            r = mailbox::serve_mailbox(hook_listener, registry.clone()) => r,
             _ = sigterm.recv() => { tracing::info!("SIGTERM, shutting down"); Ok(()) }
             _ = sigint.recv() => { tracing::info!("SIGINT, shutting down"); Ok(()) }
         };
 
         registry.shutdown_all();
         std::fs::remove_file(&socket).ok();
+        std::fs::remove_file(&mailbox).ok();
         std::fs::remove_file(&pidfile).ok();
         outcome
     })

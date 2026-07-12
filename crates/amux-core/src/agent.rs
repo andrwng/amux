@@ -21,6 +21,17 @@ impl AgentId {
     pub fn as_uuid(self) -> Uuid {
         self.0
     }
+
+    /// The full, round-trippable form (hyphenated uuid) — for env vars and the hook bridge.
+    /// Distinct from `Display`, which is the short 8-char sidebar form.
+    pub fn to_full_string(self) -> String {
+        self.0.to_string()
+    }
+
+    /// Parse the full form produced by [`AgentId::to_full_string`].
+    pub fn parse(s: &str) -> Option<Self> {
+        Uuid::parse_str(s).ok().map(Self)
+    }
 }
 
 impl Default for AgentId {

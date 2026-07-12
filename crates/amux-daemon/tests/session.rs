@@ -6,12 +6,14 @@ use std::path::Path;
 use std::time::Duration;
 
 use amux_core::adapter::ClaudeAdapter;
-use amux_core::agent::{RepoId, TerminalId};
+use amux_core::agent::{AgentId, AgentState, RepoId, TerminalId};
+use amux_core::hook::{HookEvent, HookReport};
 use amux_core::worktree::WorktreeService;
-use amux_daemon::{serve, Registry};
+use amux_daemon::{bind_mailbox, serve, serve_mailbox, Registry};
 use amux_proto::{AgentInfo, ClientCodec, ClientMsg, DaemonMsg, Size, PROTO_VERSION};
 use futures::{SinkExt, StreamExt};
 use git2::Repository;
+use tokio::io::AsyncWriteExt;
 use tokio::net::{UnixListener, UnixStream};
 use tokio_util::codec::Framed;
 
@@ -120,6 +122,47 @@ async fn wait_for_output(client: &mut Client, needle: &str) -> bool {
     .unwrap_or(false)
 }
 
+/// Deliver one hook report the way `amux hook` does: a single postcard frame, then EOF.
+async fn send_hook(mailbox: &Path, report: HookReport) {
+    let mut stream = UnixStream::connect(mailbox).await.expect("connect mailbox");
+    let bytes = postcard::to_stdvec(&report).unwrap();
+    stream.write_all(&bytes).await.unwrap();
+    stream.shutdown().await.unwrap();
+}
+
+fn hook(name: &str, notification_type: Option<&str>, message: Option<&str>) -> HookEvent {
+    HookEvent {
+        hook_event_name: name.into(),
+        session_id: Some("sess-1".into()),
+        notification_type: notification_type.map(Into::into),
+        message: message.map(Into::into),
+        tool_name: None,
+    }
+}
+
+/// Read control-stream frames until the given agent reaches a state matching `pred`.
+async fn wait_for_state(
+    client: &mut Client,
+    id: AgentId,
+    pred: impl Fn(&AgentState) -> bool,
+) -> bool {
+    tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            match client.next().await {
+                Some(Ok(DaemonMsg::StateChanged { id: sid, state })) if sid == id => {
+                    if pred(&state) {
+                        return true;
+                    }
+                }
+                Some(Ok(_)) => {}
+                _ => return false,
+            }
+        }
+    })
+    .await
+    .unwrap_or(false)
+}
+
 const SIZE: Size = Size { cols: 80, rows: 24 };
 
 #[tokio::test]
@@ -166,6 +209,78 @@ async fn create_attach_echo_delete() {
     .await
     .unwrap_or(false);
     assert!(removed, "expected AgentRemoved after delete");
+}
+
+#[tokio::test]
+async fn hooks_drive_the_state_machine_over_the_mailbox() {
+    let tmp = tempfile::tempdir().unwrap();
+    let repo = tmp.path().join("repo");
+    std::fs::create_dir(&repo).unwrap();
+    init_repo(&repo);
+    let worktrees = WorktreeService::with_base(&repo, tmp.path().join("wt")).unwrap();
+    let adapter = Box::new(ClaudeAdapter::with_command(vec!["cat".into()]));
+    let registry = Registry::new(adapter);
+    let repo_id = registry.register(worktrees).id;
+
+    let socket = tmp.path().join("amuxd.sock");
+    let listener = UnixListener::bind(&socket).unwrap();
+    tokio::spawn(serve(listener, registry.clone()));
+    let mailbox = tmp.path().join("hooks.sock");
+    let hook_listener = bind_mailbox(&mailbox).unwrap();
+    tokio::spawn(serve_mailbox(hook_listener, registry.clone()));
+
+    let mut client = handshake(&socket).await;
+    let agent = create_agent(&mut client, repo_id, "feat/hooks").await;
+
+    // A permission Notification lights up the sidebar (⚠).
+    send_hook(
+        &mailbox,
+        HookReport {
+            agent: agent.id,
+            event: hook(
+                "Notification",
+                Some("permission_prompt"),
+                Some("Claude needs your permission to use Bash"),
+            ),
+        },
+    )
+    .await;
+    assert!(
+        wait_for_state(&mut client, agent.id, |s| matches!(
+            s,
+            AgentState::NeedsAttention { .. }
+        ))
+        .await,
+        "a permission hook should flip the agent to NeedsAttention"
+    );
+
+    // Activity (the user answered → tools run) clears attention back to Working.
+    send_hook(
+        &mailbox,
+        HookReport {
+            agent: agent.id,
+            event: hook("PreToolUse", None, None),
+        },
+    )
+    .await;
+    assert!(
+        wait_for_state(&mut client, agent.id, |s| matches!(s, AgentState::Working)).await,
+        "activity should return the agent to Working"
+    );
+
+    // Stop (Claude finished) settles to Idle.
+    send_hook(
+        &mailbox,
+        HookReport {
+            agent: agent.id,
+            event: hook("Stop", None, None),
+        },
+    )
+    .await;
+    assert!(
+        wait_for_state(&mut client, agent.id, |s| matches!(s, AgentState::Idle)).await,
+        "Stop should settle the agent to Idle"
+    );
 }
 
 #[tokio::test]

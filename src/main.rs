@@ -60,7 +60,7 @@ fn main() -> anyhow::Result<()> {
             }
         }
         Some(Command::Doctor) => amux_tui::doctor()?,
-        Some(Command::Hook) => eprintln!("amux hook is not implemented yet (Phase 2)."),
+        Some(Command::Hook) => amux_daemon::run_hook()?,
     }
     Ok(())
 }

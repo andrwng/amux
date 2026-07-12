@@ -13,8 +13,9 @@ use anyhow::{Context, Result};
 use chrono::{DateTime, Utc};
 use tokio::sync::broadcast;
 
-use amux_core::adapter::{AgentAdapter, LaunchContext};
-use amux_core::agent::{AgentId, AgentState, RepoId, TerminalId};
+use amux_core::adapter::{AgentAdapter, HookSetup, LaunchContext};
+use amux_core::agent::{next_state, AgentId, AgentState, RepoId, TerminalId};
+use amux_core::hook::{classify, HookReport};
 use amux_core::worktree::{WorktreeLocation, WorktreeService};
 use amux_proto::{AgentInfo, DaemonMsg, RepoInfo, Size};
 
@@ -84,19 +85,49 @@ struct State {
     terminals: HashMap<TerminalId, Terminal>,
 }
 
+/// Where the daemon's hook mailbox lives and how to invoke the bridge, so launched CLIs can
+/// push status back. Absent in tests (the fake `cat` agent has no hooks).
+struct HookIntegration {
+    socket: PathBuf,
+    amux_exe: PathBuf,
+}
+
 pub struct Registry {
     state: Mutex<State>,
     adapter: Box<dyn AgentAdapter>,
     events: broadcast::Sender<DaemonMsg>,
+    hooks: Option<HookIntegration>,
 }
 
 impl Registry {
     pub fn new(adapter: Box<dyn AgentAdapter>) -> Arc<Self> {
+        Self::build(adapter, None)
+    }
+
+    /// Build a registry that wires launched agents' hooks to `socket`, invoking `amux_exe hook`.
+    pub fn with_hooks(
+        adapter: Box<dyn AgentAdapter>,
+        socket: PathBuf,
+        amux_exe: PathBuf,
+    ) -> Arc<Self> {
+        Self::build(adapter, Some(HookIntegration { socket, amux_exe }))
+    }
+
+    fn build(adapter: Box<dyn AgentAdapter>, hooks: Option<HookIntegration>) -> Arc<Self> {
         let (events, _) = broadcast::channel(EVENT_BACKLOG);
         Arc::new(Self {
             state: Mutex::new(State::default()),
             adapter,
             events,
+            hooks,
+        })
+    }
+
+    /// The hook wiring to hand an adapter, if hook integration is enabled.
+    fn hook_setup(&self) -> Option<HookSetup<'_>> {
+        self.hooks.as_ref().map(|h| HookSetup {
+            socket: &h.socket,
+            amux_exe: &h.amux_exe,
         })
     }
 
@@ -202,16 +233,20 @@ impl Registry {
             }
         }
         let worktree = worktrees.create(branch).context("create worktree")?;
+        // The agent id is exported to the CLI's hooks, so it must exist before we launch.
+        let agent_id = AgentId::new();
+        let agent_full = agent_id.to_full_string();
         let ctx = LaunchContext {
             worktree: &worktree,
             branch,
             resume: None,
+            agent_id: &agent_full,
+            hooks: self.hook_setup(),
         };
         self.adapter.prepare_worktree(&ctx)?;
         let spec = self.adapter.spawn_spec(&ctx);
         let session = Session::spawn(&spec.command, &spec.cwd, &spec.env, DEFAULT_SIZE)?;
 
-        let agent_id = AgentId::new();
         let terminal_id = TerminalId::new();
         let now = Utc::now();
         let info = {
@@ -271,6 +306,41 @@ impl Registry {
         Ok(())
     }
 
+    /// Apply a hook report from a launched CLI: capture its session id (for resume) and drive the
+    /// state machine. Broadcasts `StateChanged` when the state actually moves. Unknown agents and
+    /// no-op events are silently ignored.
+    pub fn on_hook(&self, report: HookReport) {
+        let classified = classify(&report.event);
+        let change = {
+            let mut state = self.state.lock().unwrap();
+            let Some(agent) = state.agents.get_mut(&report.agent) else {
+                return;
+            };
+            if let Some(sid) = classified.session_id {
+                agent.ai_session_id = Some(sid);
+            }
+            match classified.event {
+                Some(event) => {
+                    let next = next_state(&agent.state, &event);
+                    agent.last_activity = Utc::now();
+                    if next != agent.state {
+                        agent.state = next.clone();
+                        Some(next)
+                    } else {
+                        None
+                    }
+                }
+                None => None,
+            }
+        };
+        if let Some(state) = change {
+            let _ = self.events.send(DaemonMsg::StateChanged {
+                id: report.agent,
+                state,
+            });
+        }
+    }
+
     /// Kill a shell terminal (its pane closed). No-op on a primary terminal.
     pub fn close_terminal(&self, terminal: TerminalId) {
         let mut state = self.state.lock().unwrap();
@@ -301,11 +371,15 @@ impl Registry {
         if already_live {
             return Ok(());
         }
+        let agent_full = id.to_full_string();
         let ctx = LaunchContext {
             worktree: &worktree,
             branch: &branch,
             resume: resume_id.as_deref(),
+            agent_id: &agent_full,
+            hooks: self.hook_setup(),
         };
+        self.adapter.prepare_worktree(&ctx)?;
         let spec = self.adapter.spawn_spec(&ctx);
         let session = Session::spawn(&spec.command, &spec.cwd, &spec.env, DEFAULT_SIZE)?;
         let state_change = {
