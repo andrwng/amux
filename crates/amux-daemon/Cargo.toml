@@ -9,3 +9,14 @@ description = "The amuxd runtime: control server, PTY pool, mailbox, session reg
 amux-proto = { workspace = true }
 amux-core = { workspace = true }
 anyhow = { workspace = true }
+tokio = { workspace = true }
+tokio-util = { workspace = true }
+portable-pty = { workspace = true }
+vt100 = { workspace = true }
+nix = { workspace = true }
+futures = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }

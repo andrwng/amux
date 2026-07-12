@@ -39,6 +39,8 @@ directories = "6"
 nix = { version = "0.30", features = ["process", "fs", "signal"] }
 chrono = { version = "0.4", features = ["serde"] }
 proptest = "1"
+futures = "0.3"
+tempfile = "3"
 
 [package]
 name = "amux"
@@ -53,6 +55,7 @@ name = "amux"
 path = "src/main.rs"
 
 [dependencies]
+amux-daemon = { workspace = true }
 anyhow = { workspace = true }
 clap = { workspace = true }
 

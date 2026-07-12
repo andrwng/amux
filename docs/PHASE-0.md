@@ -58,7 +58,7 @@ the workspace builds clean; CI is green.
 
 ---
 
-## 0.3 — `amux-daemon`: control socket + one PTY + I/O tasks
+## 0.3 — `amux-daemon`: control socket + one PTY + I/O tasks &nbsp; · &nbsp; **✓ code-complete** (2 integration tests + binary smoke-test green)
 
 **Deliverables**
 - `amux daemon`: self-daemonize (nix double-fork + `setsid`) **before** starting tokio; create

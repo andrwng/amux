@@ -17,7 +17,11 @@ struct Cli {
 #[derive(Subcommand)]
 enum Command {
     /// Run the background daemon (normally auto-spawned by the client).
-    Daemon,
+    Daemon {
+        /// Run in the foreground without detaching — for debugging and tests.
+        #[arg(long)]
+        foreground: bool,
+    },
     /// Bridge a Claude Code hook event to the daemon mailbox (invoked by Claude's hooks).
     Hook,
 }
@@ -29,7 +33,13 @@ fn main() -> anyhow::Result<()> {
             eprintln!("amux TUI client is not implemented yet (Phase 0.5).");
             eprintln!("Phase 0.1 spike:  cargo run --example spike");
         }
-        Some(Command::Daemon) => eprintln!("amux daemon is not implemented yet (Phase 0.3)."),
+        Some(Command::Daemon { foreground }) => {
+            // Detach BEFORE building the tokio runtime (fork-safety — see DESIGN §11).
+            if !foreground {
+                amux_daemon::daemonize()?;
+            }
+            amux_daemon::run_blocking()?;
+        }
         Some(Command::Hook) => eprintln!("amux hook is not implemented yet (Phase 2)."),
     }
     Ok(())
