@@ -1,5 +1,7 @@
 //! Connecting to the repo's daemon: discover the git repo from the cwd, connect to the control
-//! socket, auto-spawn `amux daemon --repo <root>` if it isn't there, then handshake.
+//! socket, and handshake. If no usable daemon answers — absent, stale, or an incompatible
+//! protocol version — clear the socket and auto-spawn a fresh `amux daemon --repo <root>`, so a
+//! leftover daemon from an older build never wedges the client.
 
 use std::path::Path;
 use std::time::Duration;
@@ -11,13 +13,35 @@ use tokio_util::codec::Framed;
 
 use amux_proto::{check_version, ClientCodec, ClientMsg, DaemonMsg, PROTO_VERSION};
 
-/// Connect to the daemon for the current repository, auto-spawning it if needed, and handshake.
-pub async fn connect() -> Result<Framed<UnixStream, ClientCodec>> {
+type Connection = Framed<UnixStream, ClientCodec>;
+
+/// Connect to the daemon for the current repository (auto-spawning/recovering it) and handshake.
+pub async fn connect() -> Result<Connection> {
     let cwd = std::env::current_dir().context("get current directory")?;
     let repo = amux_core::worktree::discover_repo(&cwd)?;
     let socket = amux_core::paths::RuntimePaths::resolve()?.socket();
 
-    let stream = connect_or_spawn(&socket, &repo).await?;
+    // Reuse a running, compatible daemon if there is one.
+    if let Ok(connection) = try_handshake(&socket).await {
+        return Ok(connection);
+    }
+
+    // Otherwise the daemon is absent, stale, or speaks a different protocol version. Clear the
+    // socket so a fresh daemon can bind it, then spawn one and wait for it to come up.
+    std::fs::remove_file(&socket).ok();
+    spawn_daemon(&repo).await?;
+    for _ in 0..100 {
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        if let Ok(connection) = try_handshake(&socket).await {
+            return Ok(connection);
+        }
+    }
+    bail!("amux daemon did not come up at {}", socket.display());
+}
+
+/// Connect and complete the version handshake, or fail (so the caller can recover).
+async fn try_handshake(socket: &Path) -> Result<Connection> {
+    let stream = UnixStream::connect(socket).await.context("connect")?;
     let mut framed = Framed::new(stream, ClientCodec::new());
     framed
         .send(ClientMsg::Hello {
@@ -25,27 +49,15 @@ pub async fn connect() -> Result<Framed<UnixStream, ClientCodec>> {
         })
         .await?;
     match framed.next().await {
-        Some(Ok(DaemonMsg::Hello { proto_version })) => check_version(proto_version)?,
+        Some(Ok(DaemonMsg::Hello { proto_version })) => {
+            check_version(proto_version)?;
+            Ok(framed)
+        }
         Some(Ok(DaemonMsg::Error { message })) => bail!("daemon rejected connection: {message}"),
         Some(Ok(other)) => bail!("unexpected first frame from daemon: {other:?}"),
-        Some(Err(e)) => return Err(e).context("read daemon hello"),
+        Some(Err(e)) => Err(e).context("read daemon hello"),
         None => bail!("daemon closed the connection during handshake"),
     }
-    Ok(framed)
-}
-
-async fn connect_or_spawn(socket: &Path, repo: &Path) -> Result<UnixStream> {
-    if let Ok(stream) = UnixStream::connect(socket).await {
-        return Ok(stream);
-    }
-    spawn_daemon(repo).await?;
-    for _ in 0..100 {
-        tokio::time::sleep(Duration::from_millis(20)).await;
-        if let Ok(stream) = UnixStream::connect(socket).await {
-            return Ok(stream);
-        }
-    }
-    bail!("amux daemon did not come up at {}", socket.display());
 }
 
 async fn spawn_daemon(repo: &Path) -> Result<()> {
