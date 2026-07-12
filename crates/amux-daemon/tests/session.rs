@@ -200,6 +200,13 @@ async fn two_repos_keep_their_agents_separate() {
     assert!(tmp.path().join("alpha-wt").join("feat-a").exists());
     assert!(tmp.path().join("beta-wt").join("feat-b").exists());
 
+    // A duplicate agent on the same (repo, branch) is refused with a clear message.
+    let dup = registry.create(a.id, "feat/a").unwrap_err();
+    assert!(
+        dup.to_string().contains("already exists"),
+        "duplicate branch should be refused: {dup}"
+    );
+
     registry.shutdown_all();
 }
 

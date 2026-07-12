@@ -273,6 +273,10 @@ impl App {
         if is_ctrl(key, 'q') {
             return Ok(Flow::Quit);
         }
+        // Any keystroke dismisses a lingering error banner (it still performs its action).
+        if self.input == InputMode::Normal {
+            self.status.clear();
+        }
         match self.input {
             InputMode::Creating => return self.key_creating(key, sink).await,
             InputMode::CreatingRepo => return self.key_creating_repo(key, sink).await,
@@ -929,7 +933,10 @@ fn render_status(frame: &mut Frame, area: Rect, app: &App) {
             Style::default().fg(Color::Black).bg(Color::Cyan),
         )
     } else if !app.status.is_empty() {
-        (format!(" {}", app.status), Style::default().fg(Color::Red))
+        (
+            format!(" \u{26a0} {} \u{b7} (press any key to dismiss)", app.status),
+            Style::default().fg(Color::White).bg(Color::Red),
+        )
     } else {
         let hint = match app.focus {
             Focus::Sidebar => {

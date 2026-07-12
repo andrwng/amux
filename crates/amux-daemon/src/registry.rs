@@ -182,6 +182,18 @@ impl Registry {
     /// Create an agent in `repo`: worktree + a primary terminal running the agent CLI.
     pub fn create(self: &Arc<Self>, repo: RepoId, branch: &str) -> Result<AgentInfo> {
         let worktrees = self.worktrees_for(repo).context("no such repo")?;
+        // One agent per (repo, branch): a branch maps to a single worktree, so a duplicate would
+        // just collide. Refuse early with a clear message rather than a raw git error.
+        {
+            let state = self.state.lock().unwrap();
+            if state
+                .agents
+                .values()
+                .any(|a| a.repo == repo && a.branch == branch)
+            {
+                anyhow::bail!("an agent for branch '{branch}' already exists");
+            }
+        }
         let worktree = worktrees.create(branch).context("create worktree")?;
         let ctx = LaunchContext {
             worktree: &worktree,

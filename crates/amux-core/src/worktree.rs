@@ -90,8 +90,17 @@ impl WorktreeService {
 
         let mut opts = WorktreeAddOptions::new();
         opts.reference(Some(&reference));
-        repo.worktree(&name, &path, Some(&opts))
-            .with_context(|| format!("create worktree for {branch}"))?;
+        if let Err(e) = repo.worktree(&name, &path, Some(&opts)) {
+            // The branch is checked out elsewhere (the main repo, or a leftover worktree git
+            // still tracks). Surface a plain-language message instead of the raw libgit2 error.
+            if e.class() == git2::ErrorClass::Worktree {
+                anyhow::bail!(
+                    "branch '{branch}' is already checked out (in the main repo or another agent) \
+                     — choose a different branch"
+                );
+            }
+            return Err(e).with_context(|| format!("create worktree for {branch}"));
+        }
         Ok(path)
     }
 
@@ -240,6 +249,27 @@ mod tests {
         svc.remove("feature/login").unwrap();
         assert!(!path.exists(), "worktree dir should be gone");
         assert!(!svc.exists("feature/login"));
+    }
+
+    #[test]
+    fn checked_out_branch_yields_a_friendly_error() {
+        let tmp = tempfile::tempdir().unwrap();
+        let repo_path = tmp.path().join("repo");
+        std::fs::create_dir(&repo_path).unwrap();
+        init_repo(&repo_path);
+
+        // The repo's own HEAD branch is checked out in the main worktree, so making a linked
+        // worktree for it must fail — but with our message, not the raw libgit2 one.
+        let repo = Repository::open(&repo_path).unwrap();
+        let head = repo.head().unwrap();
+        let branch = head.shorthand().unwrap().to_string();
+
+        let svc = WorktreeService::with_base(&repo_path, tmp.path().join("wt")).unwrap();
+        let err = svc.create(&branch).unwrap_err().to_string();
+        assert!(
+            err.contains("already checked out") && err.contains("different branch"),
+            "expected a friendly checkout error, got: {err}"
+        );
     }
 
     #[test]
