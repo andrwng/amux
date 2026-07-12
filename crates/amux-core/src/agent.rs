@@ -3,6 +3,7 @@
 //! `docs/DESIGN.md` §4.2.
 
 use std::fmt;
+use std::path::Path;
 
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
@@ -60,6 +61,35 @@ impl fmt::Display for TerminalId {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(f, "{:.8}", self.0.as_simple().to_string())
     }
+}
+
+/// Stable identity for a **repository** the daemon manages. Derived from the repo's canonical
+/// path so registering the same repo twice yields the same id (idempotent), and the id is stable
+/// across daemon restarts. The client treats it as opaque — it only echoes ids the daemon sent.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+pub struct RepoId(u64);
+
+impl RepoId {
+    /// Derive the id from an already-canonicalized repo path (pure — no filesystem access).
+    pub fn from_canonical_path(path: &Path) -> Self {
+        Self(fnv1a64(path.to_string_lossy().as_bytes()))
+    }
+}
+
+impl fmt::Display for RepoId {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{:016x}", self.0)
+    }
+}
+
+/// FNV-1a 64-bit — a tiny, version-stable hash (unlike `DefaultHasher`) for deriving stable ids.
+fn fnv1a64(bytes: &[u8]) -> u64 {
+    let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
+    for byte in bytes {
+        hash ^= *byte as u64;
+        hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
+    }
+    hash
 }
 
 /// Why an agent wants the user's attention. Only produced from Phase 2 hook signals.

@@ -6,7 +6,7 @@ use std::path::Path;
 use std::time::Duration;
 
 use amux_core::adapter::ClaudeAdapter;
-use amux_core::agent::TerminalId;
+use amux_core::agent::{RepoId, TerminalId};
 use amux_core::worktree::WorktreeService;
 use amux_daemon::{serve, Registry};
 use amux_proto::{AgentInfo, ClientCodec, ClientMsg, DaemonMsg, Size, PROTO_VERSION};
@@ -34,8 +34,8 @@ fn init_repo(dir: &Path) {
         .unwrap();
 }
 
-/// Spin up a daemon over a fresh temp repo with a `cat` primary; return (client, socket, tmp).
-async fn setup() -> (Client, tempfile::TempDir) {
+/// Spin up a daemon over a fresh temp repo with a `cat` primary; return (client, repo id, tmp).
+async fn setup() -> (Client, RepoId, tempfile::TempDir) {
     let tmp = tempfile::tempdir().unwrap();
     let repo = tmp.path().join("repo");
     std::fs::create_dir(&repo).unwrap();
@@ -43,14 +43,15 @@ async fn setup() -> (Client, tempfile::TempDir) {
 
     let worktrees = WorktreeService::with_base(&repo, tmp.path().join("wt")).unwrap();
     let adapter = Box::new(ClaudeAdapter::with_command(vec!["cat".into()]));
-    let registry = Registry::new(worktrees, adapter);
+    let registry = Registry::new(adapter);
+    let repo_id = registry.register(worktrees).id;
 
     let socket = tmp.path().join("amuxd.sock");
     let listener = UnixListener::bind(&socket).unwrap();
     tokio::spawn(serve(listener, registry));
 
     let client = handshake(&socket).await;
-    (client, tmp)
+    (client, repo_id, tmp)
 }
 
 async fn handshake(socket: &Path) -> Client {
@@ -67,15 +68,20 @@ async fn handshake(socket: &Path) -> Client {
         other => panic!("expected Hello, got {other:?}"),
     }
     match client.next().await {
+        Some(Ok(DaemonMsg::Repos(_))) => {}
+        other => panic!("expected Repos, got {other:?}"),
+    }
+    match client.next().await {
         Some(Ok(DaemonMsg::Agents(_))) => {}
         other => panic!("expected Agents, got {other:?}"),
     }
     client
 }
 
-async fn create_agent(client: &mut Client, branch: &str) -> AgentInfo {
+async fn create_agent(client: &mut Client, repo: RepoId, branch: &str) -> AgentInfo {
     client
         .send(ClientMsg::CreateAgent {
+            repo,
             branch: branch.into(),
         })
         .await
@@ -118,8 +124,8 @@ const SIZE: Size = Size { cols: 80, rows: 24 };
 
 #[tokio::test]
 async fn create_attach_echo_delete() {
-    let (mut client, _tmp) = setup().await;
-    let agent = create_agent(&mut client, "feat/x").await;
+    let (mut client, repo, _tmp) = setup().await;
+    let agent = create_agent(&mut client, repo, "feat/x").await;
     let term = agent.primary_terminal;
 
     client
@@ -163,9 +169,44 @@ async fn create_attach_echo_delete() {
 }
 
 #[tokio::test]
+async fn two_repos_keep_their_agents_separate() {
+    // Register two independent repos on one daemon; each agent should carry its own repo id and
+    // land in the matching worktree base — the core of multi-repo management.
+    let tmp = tempfile::tempdir().unwrap();
+    let make = |name: &str| {
+        let repo = tmp.path().join(name);
+        std::fs::create_dir(&repo).unwrap();
+        init_repo(&repo);
+        WorktreeService::with_base(&repo, tmp.path().join(format!("{name}-wt"))).unwrap()
+    };
+    let adapter = Box::new(ClaudeAdapter::with_command(vec!["cat".into()]));
+    let registry = Registry::new(adapter);
+    let a = registry.register(make("alpha"));
+    let b = registry.register(make("beta"));
+    assert_ne!(a.id, b.id, "distinct repos get distinct ids");
+
+    let agent_a = registry.create(a.id, "feat/a").unwrap();
+    let agent_b = registry.create(b.id, "feat/b").unwrap();
+    assert_eq!(agent_a.repo, a.id);
+    assert_eq!(agent_b.repo, b.id);
+
+    // Registering the same path again is idempotent (same id, still two repos).
+    let alpha_again =
+        WorktreeService::with_base(tmp.path().join("alpha"), tmp.path().join("alpha-wt")).unwrap();
+    assert_eq!(registry.register(alpha_again).id, a.id);
+    assert_eq!(registry.repos().len(), 2);
+
+    // Each agent's worktree lives under its own repo's base.
+    assert!(tmp.path().join("alpha-wt").join("feat-a").exists());
+    assert!(tmp.path().join("beta-wt").join("feat-b").exists());
+
+    registry.shutdown_all();
+}
+
+#[tokio::test]
 async fn split_spawns_an_attachable_shell_in_the_same_worktree() {
-    let (mut client, _tmp) = setup().await;
-    let agent = create_agent(&mut client, "feat/split").await;
+    let (mut client, repo, _tmp) = setup().await;
+    let agent = create_agent(&mut client, repo, "feat/split").await;
 
     // Split: spawn a shell terminal (client-generated id) beside the primary.
     let shell = TerminalId::new();
@@ -201,9 +242,9 @@ async fn split_spawns_an_attachable_shell_in_the_same_worktree() {
 
 #[tokio::test]
 async fn two_terminals_stream_simultaneously() {
-    let (mut client, _tmp) = setup().await;
-    let a = create_agent(&mut client, "a").await;
-    let b = create_agent(&mut client, "b").await;
+    let (mut client, repo, _tmp) = setup().await;
+    let a = create_agent(&mut client, repo, "a").await;
+    let b = create_agent(&mut client, repo, "b").await;
     let (ta, tb) = (a.primary_terminal, b.primary_terminal);
 
     client
@@ -264,8 +305,8 @@ async fn two_terminals_stream_simultaneously() {
 
 #[tokio::test]
 async fn dirty_worktree_requires_delete_confirmation() {
-    let (mut client, tmp) = setup().await;
-    let agent = create_agent(&mut client, "feat/dirty").await;
+    let (mut client, repo, tmp) = setup().await;
+    let agent = create_agent(&mut client, repo, "feat/dirty").await;
 
     let worktree = tmp.path().join("wt").join("feat-dirty");
     std::fs::write(worktree.join("scratch.txt"), "uncommitted").unwrap();

@@ -1,8 +1,11 @@
-//! Wire message types, v4 — agents own terminals. The sidebar lists **agents** (workspaces);
-//! panes stream **terminals** (PTYs). An agent has a primary terminal (its CLI) plus any shell
-//! terminals split off in the same worktree. See `docs/DESIGN.md` §6 and `docs/SPLITS.md`.
+//! Wire message types, v5 — multi-repo, agents own terminals. The daemon manages many **repos**;
+//! the sidebar groups **agents** (workspaces) under them; panes stream **terminals** (PTYs). An
+//! agent has a primary terminal (its CLI) plus any shell terminals split off in the same
+//! worktree. See `docs/DESIGN.md` §6 and `docs/SPLITS.md`.
 
-use amux_core::agent::{AgentId, AgentState, TerminalId};
+use std::path::PathBuf;
+
+use amux_core::agent::{AgentId, AgentState, RepoId, TerminalId};
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
@@ -13,10 +16,22 @@ pub struct Size {
     pub rows: u16,
 }
 
+/// A repository the daemon manages — the sidebar groups agents under these.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RepoInfo {
+    pub id: RepoId,
+    /// Display name (the repo directory's basename).
+    pub name: String,
+    /// The repo's canonical working-directory path.
+    pub path: PathBuf,
+}
+
 /// The sidebar's view of one agent (workspace).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AgentInfo {
     pub id: AgentId,
+    /// The repository this agent belongs to.
+    pub repo: RepoId,
     pub name: String,
     pub branch: String,
     pub state: AgentState,
@@ -32,8 +47,14 @@ pub enum ClientMsg {
     Hello { proto_version: u32 },
     /// Request the current agent roster.
     ListAgents,
-    /// Create a new agent on `branch` (worktree + a primary terminal).
-    CreateAgent { branch: String },
+    /// Register a repository by path (idempotent). The daemon replies with `RepoAdded`. The
+    /// client sends this for its own working directory on connect.
+    AddRepo { path: PathBuf },
+    /// Create a new agent on `branch` in an already-registered repo (worktree + primary terminal).
+    CreateAgent { repo: RepoId, branch: String },
+    /// Register the repo at `path` (idempotent) and create an agent on `branch` in it — the
+    /// two-field "new agent in a new repo" flow.
+    CreateAgentAt { path: PathBuf, branch: String },
     /// Delete an agent — kills all its terminals and removes its worktree. Only destructive op.
     DeleteAgent { id: AgentId, force: bool },
     /// Resume a suspended agent's primary terminal in its existing worktree.
@@ -63,7 +84,11 @@ pub enum ClientMsg {
 pub enum DaemonMsg {
     /// Reply to `Hello`: the daemon's protocol version.
     Hello { proto_version: u32 },
-    /// The full roster (on connect and in reply to `ListAgents`).
+    /// The full repository roster (on connect and after a repo is added).
+    Repos(Vec<RepoInfo>),
+    /// A repository was registered (or already present — sent so the client learns its id).
+    RepoAdded(RepoInfo),
+    /// The full agent roster (on connect and in reply to `ListAgents`).
     Agents(Vec<AgentInfo>),
     /// A new agent appeared.
     AgentAdded(AgentInfo),

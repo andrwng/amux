@@ -250,6 +250,13 @@ first client (tmux-server model): the client connects to the control socket; if 
 `fork`+`setsid`+`exec`s `amux daemon` (fully detached so it outlives the launching terminal),
 waits for the socket, then connects. You may also run `amux daemon` explicitly.
 
+**Multi-repo.** One global daemon manages agents across many repositories — it does not assume
+the launching repo. A repo is **registered** (idempotent, keyed by its canonical path → a stable
+`RepoId`) either at daemon start (the launch repo) or by any client on connect (`AddRepo` for its
+cwd). The sidebar groups agents under repo headers; `CreateAgent { repo, .. }` targets a known
+repo, and `CreateAgentAt { path, .. }` registers-then-creates for a repo given by path. Each repo
+owns its own `WorktreeService` (worktree base `~/.amux/worktrees/<repo>-<hash>/`).
+
 ### 5.1 Sockets (unix domain, `0600`, in `$XDG_RUNTIME_DIR/amux/` or `~/.amux/run/`)
 
 - **Control socket** — clients connect here. Speaks `amux-proto`.

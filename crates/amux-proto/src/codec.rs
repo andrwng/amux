@@ -105,10 +105,11 @@ pub type ServerCodec = WireCodec<DaemonMsg, ClientMsg>;
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{AgentInfo, Size};
-    use amux_core::agent::{AgentId, AgentState, TerminalId};
+    use crate::{AgentInfo, RepoInfo, Size};
+    use amux_core::agent::{AgentId, AgentState, RepoId, TerminalId};
     use chrono::Utc;
     use proptest::prelude::*;
+    use std::path::PathBuf;
 
     fn roundtrip<T>(msg: T)
     where
@@ -122,9 +123,18 @@ mod tests {
         assert!(buf.is_empty(), "buffer not fully consumed");
     }
 
+    fn sample_repo() -> RepoInfo {
+        RepoInfo {
+            id: RepoId::from_canonical_path(&PathBuf::from("/repos/amux")),
+            name: "amux".into(),
+            path: PathBuf::from("/repos/amux"),
+        }
+    }
+
     fn sample_info() -> AgentInfo {
         AgentInfo {
             id: AgentId::new(),
+            repo: RepoId::from_canonical_path(&PathBuf::from("/repos/amux")),
             name: "auth".into(),
             branch: "feat/auth".into(),
             state: AgentState::Working,
@@ -141,8 +151,16 @@ mod tests {
             proto_version: PROTO_VERSION,
         });
         roundtrip(ClientMsg::ListAgents);
+        roundtrip(ClientMsg::AddRepo {
+            path: "/repos/amux".into(),
+        });
         roundtrip(ClientMsg::CreateAgent {
+            repo: RepoId::from_canonical_path(&PathBuf::from("/repos/amux")),
             branch: "feat/x".into(),
+        });
+        roundtrip(ClientMsg::CreateAgentAt {
+            path: "/repos/other".into(),
+            branch: "feat/y".into(),
         });
         roundtrip(ClientMsg::DeleteAgent { id, force: true });
         roundtrip(ClientMsg::ResumeAgent { id });
@@ -176,6 +194,8 @@ mod tests {
         roundtrip(DaemonMsg::Hello {
             proto_version: PROTO_VERSION,
         });
+        roundtrip(DaemonMsg::Repos(vec![sample_repo()]));
+        roundtrip(DaemonMsg::RepoAdded(sample_repo()));
         roundtrip(DaemonMsg::Agents(vec![sample_info(), sample_info()]));
         roundtrip(DaemonMsg::AgentAdded(sample_info()));
         roundtrip(DaemonMsg::AgentRemoved { id });
@@ -232,14 +252,24 @@ mod tests {
         let mut codec = WireCodec::<ClientMsg, ClientMsg>::new();
         let mut buf = BytesMut::new();
         codec.encode(ClientMsg::ListAgents, &mut buf).unwrap();
+        let repo = RepoId::from_canonical_path(&PathBuf::from("/repos/amux"));
         codec
-            .encode(ClientMsg::CreateAgent { branch: "x".into() }, &mut buf)
+            .encode(
+                ClientMsg::CreateAgent {
+                    repo,
+                    branch: "x".into(),
+                },
+                &mut buf,
+            )
             .unwrap();
 
         assert_eq!(codec.decode(&mut buf).unwrap(), Some(ClientMsg::ListAgents));
         assert_eq!(
             codec.decode(&mut buf).unwrap(),
-            Some(ClientMsg::CreateAgent { branch: "x".into() })
+            Some(ClientMsg::CreateAgent {
+                repo,
+                branch: "x".into()
+            })
         );
         assert_eq!(codec.decode(&mut buf).unwrap(), None);
     }

@@ -77,6 +77,7 @@ async fn handle_client(stream: UnixStream, registry: Arc<Registry>) -> Result<()
             proto_version: PROTO_VERSION,
         })
         .await?;
+    framed.send(DaemonMsg::Repos(registry.repos())).await?;
     framed.send(DaemonMsg::Agents(registry.infos())).await?;
 
     let (mut sink, mut stream) = framed.split();
@@ -129,7 +130,15 @@ fn handle_command(
         ClientMsg::ListAgents => {
             let _ = out_tx.send(DaemonMsg::Agents(registry.infos()));
         }
-        ClientMsg::CreateAgent { branch } => report_err(registry.create(&branch).map(|_| ())),
+        ClientMsg::AddRepo { path } => {
+            report_err(register_repo(registry, &path));
+        }
+        ClientMsg::CreateAgent { repo, branch } => {
+            report_err(registry.create(repo, &branch).map(|_| ()))
+        }
+        ClientMsg::CreateAgentAt { path, branch } => {
+            report_err(registry.create_at(&path, &branch).map(|_| ()))
+        }
         ClientMsg::DeleteAgent { id, force } => match registry.delete(id, force) {
             Ok(DeleteOutcome::Deleted) => {}
             Ok(DeleteOutcome::NeedsConfirm(message)) => {
@@ -162,6 +171,13 @@ fn handle_command(
             }
         }
     }
+}
+
+/// Register a repo by path (idempotent). `register_path` broadcasts `RepoAdded` if it is new.
+fn register_repo(registry: &Arc<Registry>, path: &Path) -> Result<()> {
+    registry
+        .register_path(path, amux_core::worktree::WorktreeLocation::Global)
+        .map(|_| ())
 }
 
 fn attach(

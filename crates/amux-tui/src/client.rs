@@ -3,7 +3,7 @@
 //! protocol version — clear the socket and auto-spawn a fresh `amux daemon --repo <root>`, so a
 //! leftover daemon from an older build never wedges the client.
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use anyhow::{bail, Context, Result};
@@ -15,15 +15,17 @@ use amux_proto::{check_version, ClientCodec, ClientMsg, DaemonMsg, PROTO_VERSION
 
 type Connection = Framed<UnixStream, ClientCodec>;
 
-/// Connect to the daemon for the current repository (auto-spawning/recovering it) and handshake.
-pub async fn connect() -> Result<Connection> {
+/// Connect to the (global) daemon, auto-spawning/recovering it, and handshake. Returns the
+/// connection and the repository discovered from the cwd, so the caller can register it — the
+/// daemon serves many repos, and this client's repo may not be the one the daemon launched in.
+pub async fn connect() -> Result<(Connection, PathBuf)> {
     let cwd = std::env::current_dir().context("get current directory")?;
     let repo = amux_core::worktree::discover_repo(&cwd)?;
     let socket = amux_core::paths::RuntimePaths::resolve()?.socket();
 
     // Reuse a running, compatible daemon if there is one.
     if let Ok(connection) = try_handshake(&socket).await {
-        return Ok(connection);
+        return Ok((connection, repo));
     }
 
     // Otherwise the daemon is absent, stale, or speaks a different protocol version. Clear the
@@ -33,7 +35,7 @@ pub async fn connect() -> Result<Connection> {
     for _ in 0..100 {
         tokio::time::sleep(Duration::from_millis(20)).await;
         if let Ok(connection) = try_handshake(&socket).await {
-            return Ok(connection);
+            return Ok((connection, repo));
         }
     }
     bail!("amux daemon did not come up at {}", socket.display());

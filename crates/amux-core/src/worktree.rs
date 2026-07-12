@@ -17,7 +17,9 @@ pub enum WorktreeLocation {
     InRepo,
 }
 
-/// Creates, removes, and lists git worktrees for a single repository.
+/// Creates, removes, and lists git worktrees for a single repository. Cheap to clone (two
+/// paths) so the daemon can hold one per registered repo and hand out copies without a lock.
+#[derive(Debug, Clone)]
 pub struct WorktreeService {
     repo: PathBuf,
     base: PathBuf,
@@ -44,6 +46,11 @@ impl WorktreeService {
 
     pub fn base(&self) -> &Path {
         &self.base
+    }
+
+    /// The canonical path of the repository this service manages.
+    pub fn repo(&self) -> &Path {
+        &self.repo
     }
 
     /// The path a branch's worktree would occupy (whether or not it exists).

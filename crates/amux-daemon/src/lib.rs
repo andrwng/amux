@@ -2,8 +2,9 @@
 //! registry (durable agents over generic sessions), and the client loop. All process/socket
 //! I/O lives here. See `docs/DESIGN.md` §5.
 //!
-//! Phase 1: multi-agent. The daemon manages one repository's agents; a session exiting suspends
-//! its agent (resumable), and only an explicit delete removes a worktree.
+//! Phase 1: multi-agent, multi-repo. One global daemon manages agents across many registered
+//! repositories (clients register their cwd on connect); a session exiting suspends its agent
+//! (resumable), and only an explicit delete removes a worktree.
 
 mod daemonize;
 mod pty;
@@ -23,7 +24,7 @@ use nix::unistd::Pid;
 use tokio::signal::unix::{signal, SignalKind};
 
 use amux_core::adapter::ClaudeAdapter;
-use amux_core::worktree::{WorktreeLocation, WorktreeService};
+use amux_core::worktree::WorktreeLocation;
 
 /// Max unix-socket path length, comfortably under the `sun_path` limit (§11 gotcha 4).
 const MAX_SOCKET_PATH: usize = 100;
@@ -56,7 +57,6 @@ pub fn run_blocking(repo: PathBuf) -> Result<()> {
     // Phase 1 runs a shell per worktree (exercises worktree isolation + the sidebar without
     // depending on `claude` being spawnable); Phase 2 switches to `claude` + hook status.
     let shell = std::env::var("SHELL").unwrap_or_else(|_| "/bin/sh".to_string());
-    let worktrees = WorktreeService::new(&repo, WorktreeLocation::Global)?;
     let adapter = Box::new(ClaudeAdapter::with_command(vec![shell]));
 
     let runtime = tokio::runtime::Runtime::new().context("build tokio runtime")?;
@@ -71,7 +71,12 @@ pub fn run_blocking(repo: PathBuf) -> Result<()> {
             std::process::id()
         );
 
-        let registry = Registry::new(worktrees, adapter);
+        let registry = Registry::new(adapter);
+        // Pre-register the launching repo so `amux` in a repo dir works out of the box; clients
+        // also register their own cwd on connect, so the daemon serves many repos over time.
+        if let Err(e) = registry.register_path(&repo, WorktreeLocation::Global) {
+            tracing::warn!("could not register launch repo {}: {e:#}", repo.display());
+        }
         let mut sigterm = signal(SignalKind::terminate()).context("install SIGTERM handler")?;
         let mut sigint = signal(SignalKind::interrupt()).context("install SIGINT handler")?;
 

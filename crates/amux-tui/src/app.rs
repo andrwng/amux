@@ -1,9 +1,11 @@
-//! The TUI: an agent sidebar beside a tmux-style tiled pane area. Panes stream **terminals**;
-//! the sidebar lists **agents** (workspaces). Splitting a pane spawns a `$SHELL` in the same
-//! worktree. Focus is spatial — `Ctrl+hjkl` moves between panes and into/out of the sidebar;
-//! `Ctrl+B` is a prefix (`%`/`"` split, `x` close, `r` resize). `Ctrl+Q` quits. See `SPLITS.md`.
+//! The TUI: a repo-grouped agent sidebar beside a tmux-style tiled pane area. Panes stream
+//! **terminals**; the sidebar lists **agents** (workspaces) grouped by **repo**. Splitting a pane
+//! spawns a `$SHELL` in the same worktree. Focus is spatial — `Ctrl+hjkl` moves between panes and
+//! into/out of the sidebar; `Ctrl+B` is a prefix (`%`/`"` split, `x` close, `r` resize). `n`
+//! creates an agent in the selected repo, `N` in a repo given by path. `Ctrl+Q` quits.
 
 use std::collections::HashMap;
+use std::path::PathBuf;
 
 use anyhow::Result;
 use chrono::Utc;
@@ -19,8 +21,8 @@ use tokio::net::UnixStream;
 use tokio_util::codec::Framed;
 use tui_term::widget::PseudoTerminal;
 
-use amux_core::agent::{sort_for_sidebar, AgentId, AgentState, RosterItem, TerminalId};
-use amux_proto::{AgentInfo, ClientCodec, ClientMsg, DaemonMsg, Size};
+use amux_core::agent::{sort_for_sidebar, AgentId, AgentState, RepoId, RosterItem, TerminalId};
+use amux_proto::{AgentInfo, ClientCodec, ClientMsg, DaemonMsg, RepoInfo, Size};
 
 use crate::input::key_to_bytes;
 use crate::pane::{Axis, Dir, Nav, PaneTree};
@@ -30,16 +32,33 @@ const RESIZE_STEP: f32 = 0.05;
 
 type Sink = SplitSink<Framed<UnixStream, ClientCodec>, ClientMsg>;
 
+/// One selectable line in the sidebar: a repo header or an agent under it.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Row {
+    Repo(RepoId),
+    Agent(AgentId),
+}
+
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Focus {
     Sidebar,
     Panes,
 }
 
+/// Which field the two-field "new agent in a repo by path" prompt is editing.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Field {
+    Dir,
+    Branch,
+}
+
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum InputMode {
     Normal,
+    /// `n` — branch-only, into the repo under the cursor (`create_repo`).
     Creating,
+    /// `N` — two fields (directory + branch); registers the repo by path.
+    CreatingRepo,
     Confirming,
 }
 
@@ -49,9 +68,9 @@ enum Flow {
 }
 
 pub async fn run() -> Result<()> {
-    let framed = crate::client::connect().await?;
+    let (framed, repo) = crate::client::connect().await?;
     let mut terminal = ratatui::init();
-    let result = event_loop(&mut terminal, framed).await;
+    let result = event_loop(&mut terminal, framed, repo).await;
     ratatui::restore();
     result
 }
@@ -59,11 +78,15 @@ pub async fn run() -> Result<()> {
 async fn event_loop(
     terminal: &mut DefaultTerminal,
     framed: Framed<UnixStream, ClientCodec>,
+    repo: PathBuf,
 ) -> Result<()> {
     let (cols, rows) = crossterm::terminal::size().unwrap_or((80, 24));
     let mut app = App::new(cols, rows);
     let (mut sink, mut stream) = framed.split();
     let mut events = EventStream::new();
+
+    // Register this client's repo with the (possibly shared) daemon so its agents show up here.
+    sink.send(ClientMsg::AddRepo { path: repo }).await?;
 
     draw(terminal, &app)?;
     loop {
@@ -105,8 +128,9 @@ fn pane_size(rect: Rect) -> Size {
 }
 
 struct App {
+    repos: Vec<RepoInfo>,
     agents: Vec<AgentInfo>,
-    sidebar_sel: Option<AgentId>,
+    sidebar_sel: Option<Row>,
     tree: PaneTree<TerminalId>,
     terminals: HashMap<TerminalId, AgentId>,
     parsers: HashMap<TerminalId, vt100::Parser>,
@@ -115,7 +139,12 @@ struct App {
     input: InputMode,
     prefix: bool,
     resize_mode: bool,
+    /// Branch buffer (both `n` and `N`); repo-path buffer + focused field (`N` only).
     create_buf: String,
+    dir_buf: String,
+    create_field: Field,
+    /// Target repo for the `n` flow (resolved from the cursor at prompt time).
+    create_repo: Option<RepoId>,
     confirm_id: Option<AgentId>,
     confirm_msg: String,
     status: String,
@@ -125,6 +154,7 @@ struct App {
 impl App {
     fn new(cols: u16, rows: u16) -> Self {
         Self {
+            repos: Vec::new(),
             agents: Vec::new(),
             sidebar_sel: None,
             tree: PaneTree::new(),
@@ -136,6 +166,9 @@ impl App {
             prefix: false,
             resize_mode: false,
             create_buf: String::new(),
+            dir_buf: String::new(),
+            create_field: Field::Dir,
+            create_repo: None,
             confirm_id: None,
             confirm_msg: String::new(),
             status: String::new(),
@@ -151,12 +184,25 @@ impl App {
 
     async fn on_daemon(&mut self, msg: DaemonMsg, sink: &mut Sink) -> Result<()> {
         match msg {
+            DaemonMsg::Repos(list) => {
+                self.repos = list;
+                self.ensure_sidebar_sel();
+            }
+            DaemonMsg::RepoAdded(info) => {
+                if !self.repos.iter().any(|r| r.id == info.id) {
+                    self.repos.push(info);
+                }
+                self.ensure_sidebar_sel();
+            }
             DaemonMsg::Agents(list) => {
                 self.agents = list;
                 self.ensure_sidebar_sel();
             }
             DaemonMsg::AgentAdded(info) => {
+                // Select the freshly-created agent so the next Enter opens it.
+                let id = info.id;
                 self.agents.push(info);
+                self.sidebar_sel = Some(Row::Agent(id));
                 self.ensure_sidebar_sel();
             }
             DaemonMsg::AgentRemoved { id } => {
@@ -173,7 +219,7 @@ impl App {
                     self.terminals.remove(&t);
                 }
                 self.agents.retain(|a| a.id != id);
-                if self.sidebar_sel == Some(id) {
+                if self.sidebar_sel == Some(Row::Agent(id)) {
                     self.sidebar_sel = None;
                 }
                 if self.tree.is_empty() {
@@ -229,6 +275,7 @@ impl App {
         }
         match self.input {
             InputMode::Creating => return self.key_creating(key, sink).await,
+            InputMode::CreatingRepo => return self.key_creating_repo(key, sink).await,
             InputMode::Confirming => return self.key_confirm(key, sink).await,
             InputMode::Normal => {}
         }
@@ -274,18 +321,29 @@ impl App {
             KeyCode::Char('q') => return Ok(Flow::Quit),
             KeyCode::Char('j') | KeyCode::Down => self.move_sidebar_sel(1),
             KeyCode::Char('k') | KeyCode::Up => self.move_sidebar_sel(-1),
+            // `n`: new agent in the repo under the cursor (branch-only prompt).
             KeyCode::Char('n') => {
-                self.input = InputMode::Creating;
+                if let Some(repo) = self.selected_repo() {
+                    self.create_repo = Some(repo);
+                    self.create_buf.clear();
+                    self.input = InputMode::Creating;
+                }
+            }
+            // `N`: new agent in a repo given by path (directory + branch).
+            KeyCode::Char('N') => {
                 self.create_buf.clear();
+                self.dir_buf.clear();
+                self.create_field = Field::Dir;
+                self.input = InputMode::CreatingRepo;
             }
             KeyCode::Char('d') => {
-                if let Some(id) = self.sidebar_sel {
+                if let Some(id) = self.selected_agent() {
                     sink.send(ClientMsg::DeleteAgent { id, force: false })
                         .await?;
                 }
             }
             KeyCode::Char('r') => {
-                if let Some(id) = self.sidebar_sel {
+                if let Some(id) = self.selected_agent() {
                     sink.send(ClientMsg::ResumeAgent { id }).await?;
                 }
             }
@@ -297,7 +355,7 @@ impl App {
 
     /// Open the selected agent's primary terminal into the focused pane.
     async fn open_selected(&mut self, sink: &mut Sink) -> Result<()> {
-        let Some(id) = self.sidebar_sel else {
+        let Some(id) = self.selected_agent() else {
             return Ok(());
         };
         let Some(terminal) = self
@@ -398,9 +456,11 @@ impl App {
         match key.code {
             KeyCode::Enter => {
                 let branch = std::mem::take(&mut self.create_buf);
+                let repo = self.create_repo.take();
                 self.input = InputMode::Normal;
-                if !branch.trim().is_empty() {
+                if let (Some(repo), false) = (repo, branch.trim().is_empty()) {
                     sink.send(ClientMsg::CreateAgent {
+                        repo,
                         branch: branch.trim().to_string(),
                     })
                     .await?;
@@ -414,6 +474,49 @@ impl App {
             _ => {}
         }
         Ok(Flow::Continue)
+    }
+
+    /// The two-field `N` prompt: Tab switches fields, Enter registers the repo + creates.
+    async fn key_creating_repo(&mut self, key: KeyEvent, sink: &mut Sink) -> Result<Flow> {
+        match key.code {
+            KeyCode::Enter => {
+                let dir = self.dir_buf.trim().to_string();
+                let branch = self.create_buf.trim().to_string();
+                // Enter on the first field just advances; require both to submit.
+                if self.create_field == Field::Dir && !dir.is_empty() {
+                    self.create_field = Field::Branch;
+                } else if !dir.is_empty() && !branch.is_empty() {
+                    self.dir_buf.clear();
+                    self.create_buf.clear();
+                    self.input = InputMode::Normal;
+                    sink.send(ClientMsg::CreateAgentAt {
+                        path: expand_path(&dir),
+                        branch,
+                    })
+                    .await?;
+                }
+            }
+            KeyCode::Tab | KeyCode::Down | KeyCode::Up => {
+                self.create_field = match self.create_field {
+                    Field::Dir => Field::Branch,
+                    Field::Branch => Field::Dir,
+                };
+            }
+            KeyCode::Esc => self.input = InputMode::Normal,
+            KeyCode::Backspace => {
+                self.active_buf().pop();
+            }
+            KeyCode::Char(c) => self.active_buf().push(c),
+            _ => {}
+        }
+        Ok(Flow::Continue)
+    }
+
+    fn active_buf(&mut self) -> &mut String {
+        match self.create_field {
+            Field::Dir => &mut self.dir_buf,
+            Field::Branch => &mut self.create_buf,
+        }
     }
 
     async fn key_confirm(&mut self, key: KeyEvent, sink: &mut Sink) -> Result<Flow> {
@@ -480,10 +583,12 @@ impl App {
 
     // --- sidebar selection ---
 
-    fn sorted_ids(&self) -> Vec<AgentId> {
+    /// Agent ids for one repo, ordered needs-attention-first then by recency.
+    fn agent_ids_for(&self, repo: RepoId) -> Vec<AgentId> {
         let mut items: Vec<RosterItem> = self
             .agents
             .iter()
+            .filter(|a| a.repo == repo)
             .map(|a| RosterItem {
                 id: a.id,
                 state: a.state.clone(),
@@ -494,26 +599,67 @@ impl App {
         items.into_iter().map(|i| i.id).collect()
     }
 
+    /// The flat, ordered list of selectable rows: each repo header followed by its agents.
+    /// Repos are sorted by name so the layout is stable.
+    fn sidebar_rows(&self) -> Vec<Row> {
+        let mut repos: Vec<&RepoInfo> = self.repos.iter().collect();
+        repos.sort_by(|a, b| a.name.cmp(&b.name).then(a.id.cmp(&b.id)));
+        let mut rows = Vec::new();
+        for repo in repos {
+            rows.push(Row::Repo(repo.id));
+            for id in self.agent_ids_for(repo.id) {
+                rows.push(Row::Agent(id));
+            }
+        }
+        rows
+    }
+
+    /// The repo the cursor is in: the selected repo header, or the selected agent's repo.
+    fn selected_repo(&self) -> Option<RepoId> {
+        match self.sidebar_sel? {
+            Row::Repo(id) => Some(id),
+            Row::Agent(id) => self.agents.iter().find(|a| a.id == id).map(|a| a.repo),
+        }
+    }
+
+    /// The selected agent, if the cursor is on an agent row (not a repo header).
+    fn selected_agent(&self) -> Option<AgentId> {
+        match self.sidebar_sel? {
+            Row::Agent(id) => Some(id),
+            Row::Repo(_) => None,
+        }
+    }
+
     fn move_sidebar_sel(&mut self, delta: i32) {
-        let ids = self.sorted_ids();
-        if ids.is_empty() {
+        let rows = self.sidebar_rows();
+        if rows.is_empty() {
             self.sidebar_sel = None;
             return;
         }
         let current = self
             .sidebar_sel
-            .and_then(|s| ids.iter().position(|&i| i == s))
+            .and_then(|s| rows.iter().position(|&r| r == s))
             .unwrap_or(0) as i32;
-        let next = (current + delta).clamp(0, ids.len() as i32 - 1) as usize;
-        self.sidebar_sel = Some(ids[next]);
+        let next = (current + delta).clamp(0, rows.len() as i32 - 1) as usize;
+        self.sidebar_sel = Some(rows[next]);
     }
 
     fn ensure_sidebar_sel(&mut self) {
-        let ids = self.sorted_ids();
-        if !self.sidebar_sel.is_some_and(|s| ids.contains(&s)) {
-            self.sidebar_sel = ids.first().copied();
+        let rows = self.sidebar_rows();
+        if !self.sidebar_sel.is_some_and(|s| rows.contains(&s)) {
+            self.sidebar_sel = rows.first().copied();
         }
     }
+}
+
+/// Expand a leading `~` to the home directory; otherwise return the path unchanged.
+fn expand_path(input: &str) -> PathBuf {
+    if let Some(rest) = input.strip_prefix("~/") {
+        if let Some(dirs) = directories::BaseDirs::new() {
+            return dirs.home_dir().join(rest);
+        }
+    }
+    PathBuf::from(input)
 }
 
 // --- key helpers ---
@@ -601,49 +747,79 @@ fn render_sidebar(frame: &mut Frame, area: Rect, app: &App) {
     frame.render_widget(block, area);
 
     let by_id: HashMap<_, _> = app.agents.iter().map(|a| (a.id, a)).collect();
+    let repo_names: HashMap<_, _> = app.repos.iter().map(|r| (r.id, r.name.as_str())).collect();
     let open: Vec<AgentId> = app.terminals.values().copied().collect();
     let mut lines = Vec::new();
-    if app.agents.is_empty() {
+    if app.repos.is_empty() {
         lines.push(Line::from(Span::styled(
-            " no agents — press n",
+            " no repos yet…",
             Style::default().fg(Color::DarkGray),
         )));
     }
-    for id in app.sorted_ids() {
-        let Some(agent) = by_id.get(&id) else {
-            continue;
-        };
-        let selected = app.sidebar_sel == Some(id);
-        let is_open = open.contains(&id);
+
+    for row in app.sidebar_rows() {
+        let selected = app.sidebar_sel == Some(row);
         let marker = if selected { "\u{25b8}" } else { " " };
-        let name_style = if selected {
-            Style::default().add_modifier(Modifier::BOLD)
-        } else {
-            Style::default()
-        };
-        let name = if is_open {
-            format!("{:<12.12}*", agent.name)
-        } else {
-            format!("{:<13.13}", agent.name)
-        };
-        lines.push(Line::from(vec![
-            Span::styled(format!("{marker} "), Style::default().fg(Color::Cyan)),
-            Span::styled(
-                format!("{} ", agent.state.glyph()),
-                Style::default().fg(color_for(&agent.state)),
-            ),
-            Span::styled(name, name_style),
-        ]));
-        if let AgentState::NeedsAttention {
-            message: Some(msg), ..
-        } = &agent.state
-        {
-            lines.push(Line::from(Span::styled(
-                format!("     {msg}"),
-                Style::default()
-                    .fg(Color::Yellow)
-                    .add_modifier(Modifier::DIM),
-            )));
+        match row {
+            Row::Repo(id) => {
+                let name = repo_names.get(&id).copied().unwrap_or("repo");
+                let count = app.agents.iter().filter(|a| a.repo == id).count();
+                let mut style = Style::default()
+                    .fg(Color::Cyan)
+                    .add_modifier(Modifier::BOLD);
+                if selected {
+                    style = style.add_modifier(Modifier::REVERSED);
+                }
+                lines.push(Line::from(vec![
+                    Span::styled(
+                        format!("{marker} \u{25be} "),
+                        Style::default().fg(Color::Cyan),
+                    ),
+                    Span::styled(format!("{name} "), style),
+                    Span::styled(format!("({count})"), Style::default().fg(Color::DarkGray)),
+                ]));
+                if count == 0 {
+                    lines.push(Line::from(Span::styled(
+                        "      no agents — press n",
+                        Style::default().fg(Color::DarkGray),
+                    )));
+                }
+            }
+            Row::Agent(id) => {
+                let Some(agent) = by_id.get(&id) else {
+                    continue;
+                };
+                let is_open = open.contains(&id);
+                let name_style = if selected {
+                    Style::default().add_modifier(Modifier::BOLD)
+                } else {
+                    Style::default()
+                };
+                let name = if is_open {
+                    format!("{:<10.10}*", agent.name)
+                } else {
+                    format!("{:<11.11}", agent.name)
+                };
+                lines.push(Line::from(vec![
+                    Span::styled(format!("{marker}   "), Style::default().fg(Color::Cyan)),
+                    Span::styled(
+                        format!("{} ", agent.state.glyph()),
+                        Style::default().fg(color_for(&agent.state)),
+                    ),
+                    Span::styled(name, name_style),
+                ]));
+                if let AgentState::NeedsAttention {
+                    message: Some(msg), ..
+                } = &agent.state
+                {
+                    lines.push(Line::from(Span::styled(
+                        format!("       {msg}"),
+                        Style::default()
+                            .fg(Color::Yellow)
+                            .add_modifier(Modifier::DIM),
+                    )));
+                }
+            }
         }
     }
     frame.render_widget(Paragraph::new(lines), inner);
@@ -710,8 +886,31 @@ fn render_panes(frame: &mut Frame, area: Rect, app: &App) {
 
 fn render_status(frame: &mut Frame, area: Rect, app: &App) {
     let (text, style) = if app.input == InputMode::Creating {
+        let repo = app
+            .create_repo
+            .and_then(|id| app.repos.iter().find(|r| r.id == id))
+            .map(|r| r.name.as_str())
+            .unwrap_or("?");
         (
-            format!(" new branch: {}\u{2588}", app.create_buf),
+            format!(" new agent in {repo} — branch: {}\u{2588}", app.create_buf),
+            Style::default().fg(Color::Black).bg(Color::Cyan),
+        )
+    } else if app.input == InputMode::CreatingRepo {
+        let cursor = |f: Field| {
+            if app.create_field == f {
+                "\u{2588}"
+            } else {
+                ""
+            }
+        };
+        (
+            format!(
+                " new agent — dir: {}{}  branch: {}{}  (tab switch \u{b7} enter next/create)",
+                app.dir_buf,
+                cursor(Field::Dir),
+                app.create_buf,
+                cursor(Field::Branch),
+            ),
             Style::default().fg(Color::Black).bg(Color::Cyan),
         )
     } else if app.input == InputMode::Confirming {
@@ -734,7 +933,7 @@ fn render_status(frame: &mut Frame, area: Rect, app: &App) {
     } else {
         let hint = match app.focus {
             Focus::Sidebar => {
-                " n new \u{b7} j/k select \u{b7} enter open \u{b7} d del \u{b7} r resume \u{b7} ctrl+hjkl move \u{b7} ctrl+q quit"
+                " n new \u{b7} N new+repo \u{b7} j/k select \u{b7} enter open \u{b7} d del \u{b7} r resume \u{b7} ctrl+hjkl \u{b7} ctrl+q quit"
             }
             Focus::Panes => {
                 " ctrl+hjkl move \u{b7} ctrl+b %/\"/x/r \u{b7} type to talk \u{b7} ctrl+q quit"

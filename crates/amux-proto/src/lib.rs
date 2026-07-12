@@ -6,8 +6,9 @@ mod codec;
 mod message;
 
 pub use codec::{check_version, ClientCodec, ProtoError, ServerCodec, WireCodec, MAX_FRAME_BYTES};
-pub use message::{AgentInfo, ClientMsg, DaemonMsg, Size};
+pub use message::{AgentInfo, ClientMsg, DaemonMsg, RepoInfo, Size};
 
 /// Protocol version. The client and daemon refuse to talk across a mismatch (the client
-/// auto-recovers). v1 multi-agent; v2 dirty-delete; v3 multi-attach; v4 agents-own-terminals.
-pub const PROTO_VERSION: u32 = 4;
+/// auto-recovers). v1 multi-agent; v2 dirty-delete; v3 multi-attach; v4 agents-own-terminals;
+/// v5 multi-repo.
+pub const PROTO_VERSION: u32 = 5;
