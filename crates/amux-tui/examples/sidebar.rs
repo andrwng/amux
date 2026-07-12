@@ -1,13 +1,16 @@
 //! Phase 1 DESIGN PREVIEW — throwaway, fake data. Not wired to the daemon.
 //!
-//! A live look at the sidebar-and-main layout so we can tune glyphs/colors/spacing before
-//! building the real multi-agent backend (1.4–1.6). Run in a real terminal:
+//! A live look at the sidebar-and-main layout so we can tune glyphs/colors/spacing/**ordering**
+//! before building the real multi-agent backend (1.4–1.6). The roster is ordered by the real
+//! `amux_core::agent::sort_for_sidebar` (needs-attention first, then most-recent activity), and
+//! each row shows an age so the recency ordering is visible. Run in a real terminal:
 //!
 //!     cargo run -p amux-tui --example sidebar
 //!
 //! `j`/`k` (or arrows) move the selection; `q`/`Esc` quits.
 
-use amux_core::agent::{AgentState, AttentionKind};
+use amux_core::agent::{sort_for_sidebar, AgentId, AgentState, AttentionKind, RosterItem};
+use chrono::{DateTime, Duration, Utc};
 use ratatui::crossterm::event::{self, Event, KeyCode};
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
@@ -16,18 +19,23 @@ use ratatui::widgets::{Block, Borders, Paragraph};
 use ratatui::{DefaultTerminal, Frame};
 
 struct Agent {
+    id: AgentId,
     name: &'static str,
     branch: &'static str,
     state: AgentState,
+    last_activity: DateTime<Utc>,
     body: &'static [&'static str],
 }
 
 fn fake_agents() -> Vec<Agent> {
+    let ago = |mins: i64| Utc::now() - Duration::minutes(mins);
     vec![
         Agent {
+            id: AgentId::new(),
             name: "auth",
             branch: "feat/auth",
             state: AgentState::Working,
+            last_activity: ago(2),
             body: &[
                 "\u{23fa} Edit src/login.rs",
                 "\u{23fa} Bash cargo build",
@@ -35,12 +43,14 @@ fn fake_agents() -> Vec<Agent> {
             ],
         },
         Agent {
+            id: AgentId::new(),
             name: "api",
             branch: "feat/api-refactor",
             state: AgentState::NeedsAttention {
                 kind: AttentionKind::Permission,
                 message: Some("Run `cargo test --all`?".to_string()),
             },
+            last_activity: ago(5),
             body: &[
                 "I'd like to run the full test suite to confirm the refactor.",
                 "",
@@ -48,18 +58,22 @@ fn fake_agents() -> Vec<Agent> {
             ],
         },
         Agent {
+            id: AgentId::new(),
             name: "docs",
             branch: "docs/readme",
             state: AgentState::Idle,
+            last_activity: ago(12),
             body: &["Done. Updated the README install section.", ""],
         },
         Agent {
+            id: AgentId::new(),
             name: "infra",
             branch: "feat/infra",
             state: AgentState::NeedsAttention {
                 kind: AttentionKind::Question,
                 message: Some("Which region should I deploy to first?".to_string()),
             },
+            last_activity: ago(1),
             body: &[
                 "A few clarifying questions before I proceed:",
                 "",
@@ -67,15 +81,19 @@ fn fake_agents() -> Vec<Agent> {
             ],
         },
         Agent {
+            id: AgentId::new(),
             name: "search",
             branch: "feat/search",
             state: AgentState::Starting,
+            last_activity: Utc::now(),
             body: &["starting claude\u{2026}"],
         },
         Agent {
+            id: AgentId::new(),
             name: "payments",
             branch: "fix/payments",
             state: AgentState::Exited { code: Some(0) },
+            last_activity: ago(30),
             body: &["session exited (0)"],
         },
     ]
@@ -107,18 +125,45 @@ fn label_for(state: &AgentState) -> String {
     }
 }
 
+fn age(ts: DateTime<Utc>) -> String {
+    let secs = (Utc::now() - ts).num_seconds().max(0);
+    if secs < 60 {
+        format!("{secs}s")
+    } else if secs < 3600 {
+        format!("{}m", secs / 60)
+    } else {
+        format!("{}h", secs / 3600)
+    }
+}
+
 fn main() -> std::io::Result<()> {
     let agents = fake_agents();
+
+    // Order the roster with the real policy from amux-core.
+    let mut roster: Vec<RosterItem> = agents
+        .iter()
+        .map(|a| RosterItem {
+            id: a.id,
+            state: a.state.clone(),
+            last_activity: a.last_activity,
+        })
+        .collect();
+    sort_for_sidebar(&mut roster);
+    let ordered: Vec<&Agent> = roster
+        .iter()
+        .map(|r| agents.iter().find(|a| a.id == r.id).unwrap())
+        .collect();
+
     let mut selected = 0usize;
     let mut terminal = ratatui::init();
-    let result = run(&mut terminal, &agents, &mut selected);
+    let result = run(&mut terminal, &ordered, &mut selected);
     ratatui::restore();
     result
 }
 
 fn run(
     terminal: &mut DefaultTerminal,
-    agents: &[Agent],
+    agents: &[&Agent],
     selected: &mut usize,
 ) -> std::io::Result<()> {
     loop {
@@ -137,16 +182,16 @@ fn run(
     Ok(())
 }
 
-fn draw(frame: &mut Frame, agents: &[Agent], selected: usize) {
+fn draw(frame: &mut Frame, agents: &[&Agent], selected: usize) {
     let cols = Layout::default()
         .direction(Direction::Horizontal)
         .constraints([Constraint::Length(32), Constraint::Min(0)])
         .split(frame.area());
     render_sidebar(frame, cols[0], agents, selected);
-    render_main(frame, cols[1], &agents[selected]);
+    render_main(frame, cols[1], agents[selected]);
 }
 
-fn render_sidebar(frame: &mut Frame, area: Rect, agents: &[Agent], selected: usize) {
+fn render_sidebar(frame: &mut Frame, area: Rect, agents: &[&Agent], selected: usize) {
     let block = Block::default().borders(Borders::ALL).title(" agents ");
     let inner = block.inner(area);
     frame.render_widget(block, area);
@@ -156,6 +201,9 @@ fn render_sidebar(frame: &mut Frame, area: Rect, agents: &[Agent], selected: usi
         .constraints([Constraint::Min(1), Constraint::Length(2)])
         .split(inner);
 
+    let dim = Style::default()
+        .fg(Color::DarkGray)
+        .add_modifier(Modifier::DIM);
     let mut lines = Vec::new();
     for (i, agent) in agents.iter().enumerate() {
         let selected_row = i == selected;
@@ -171,8 +219,9 @@ fn render_sidebar(frame: &mut Frame, area: Rect, agents: &[Agent], selected: usi
                 format!("{} ", agent.state.glyph()),
                 Style::default().fg(color_for(&agent.state)),
             ),
-            Span::styled(format!("{:<9}", agent.name), name_style),
-            Span::styled(agent.branch, Style::default().fg(Color::DarkGray)),
+            Span::styled(format!("{:<8.8} ", agent.name), name_style),
+            Span::styled(format!("{:<12.12} ", agent.branch), dim),
+            Span::styled(format!("{:>3}", age(agent.last_activity)), dim),
         ]));
         if let AgentState::NeedsAttention {
             message: Some(msg), ..

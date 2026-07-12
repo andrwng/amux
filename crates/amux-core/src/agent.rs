@@ -4,6 +4,7 @@
 
 use std::fmt;
 
+use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
@@ -79,6 +80,16 @@ impl AgentState {
     pub fn is_terminal(&self) -> bool {
         matches!(self, AgentState::Exited { .. } | AgentState::Error { .. })
     }
+
+    /// Sidebar sort bucket — lower sorts higher: attention first, terminal last.
+    pub fn priority(&self) -> u8 {
+        match self {
+            AgentState::NeedsAttention { .. } => 0,
+            AgentState::Working | AgentState::Starting => 1,
+            AgentState::Idle => 2,
+            AgentState::Exited { .. } | AgentState::Error { .. } => 3,
+        }
+    }
 }
 
 /// Inputs that drive [`next_state`]. Phase 1 emits the coarse ones; `NeedsUser` arrives in
@@ -119,6 +130,30 @@ pub fn next_state(current: &AgentState, event: &AgentEvent) -> AgentState {
             _ => AgentState::Idle,
         },
     }
+}
+
+/// The facet of an agent the sidebar sorts on — kept separate from the full agent record so
+/// the ordering policy stays pure and testable. The whole "how is the inbox ordered" question
+/// lives in [`sort_for_sidebar`]: one place to change.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RosterItem {
+    pub id: AgentId,
+    pub state: AgentState,
+    pub last_activity: DateTime<Utc>,
+}
+
+/// Order agents for the sidebar: those needing attention first, then everything else by
+/// most-recent activity, terminal (exited/error) states last. Stable.
+///
+/// This is the tweak point. To instead float the **longest-waiting** attention item to the
+/// very top, reverse the recency comparison for the `priority() == 0` bucket.
+pub fn sort_for_sidebar(items: &mut [RosterItem]) {
+    items.sort_by(|a, b| {
+        a.state
+            .priority()
+            .cmp(&b.state.priority())
+            .then_with(|| b.last_activity.cmp(&a.last_activity))
+    });
 }
 
 #[cfg(test)]
@@ -214,5 +249,36 @@ mod tests {
         .map(AgentState::glyph)
         .collect();
         assert_eq!(glyphs.len(), 6);
+    }
+
+    #[test]
+    fn sidebar_order_is_attention_first_then_recent() {
+        let base = DateTime::parse_from_rfc3339("2026-01-01T00:00:00Z")
+            .unwrap()
+            .with_timezone(&Utc);
+        let at = |secs: i64| base + chrono::Duration::seconds(secs);
+        let item = |state, secs| RosterItem {
+            id: AgentId::new(),
+            state,
+            last_activity: at(secs),
+        };
+        let mut items = vec![
+            item(AgentState::Idle, 100),
+            item(needs_attention(), 10),
+            item(AgentState::Working, 50),
+            item(
+                AgentState::NeedsAttention {
+                    kind: AttentionKind::Question,
+                    message: None,
+                },
+                30,
+            ),
+            item(AgentState::Exited { code: Some(0) }, 200),
+        ];
+        sort_for_sidebar(&mut items);
+
+        let buckets: Vec<u8> = items.iter().map(|i| i.state.priority()).collect();
+        assert_eq!(buckets, vec![0, 0, 1, 2, 3]); // attention, attention, working, idle, exited
+        assert!(items[0].last_activity >= items[1].last_activity); // recent-first within a bucket
     }
 }

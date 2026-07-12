@@ -82,6 +82,7 @@ dependencies = [
  "amux-daemon",
  "amux-proto",
  "anyhow",
+ "chrono",
  "crossterm",
  "futures",
  "ratatui",
