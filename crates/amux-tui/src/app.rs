@@ -481,8 +481,20 @@ impl App {
             // Enter scroll (copy) mode on the focused pane — tmux `Ctrl+B [`.
             KeyCode::Char('[') if self.focus == Focus::Panes => {
                 if let Some(t) = self.tree.focused_payload() {
-                    self.scroll_mode = Some(t);
-                    self.apply_scroll(t, 0);
+                    // A full-screen app (vim, less, and possibly the agent itself) runs on the
+                    // alternate screen, which has no scrollback — there's nothing to scroll here,
+                    // so say so rather than entering a mode where the keys do nothing.
+                    let alt = self
+                        .parsers
+                        .get(&t)
+                        .is_some_and(|p| p.screen().alternate_screen());
+                    if alt {
+                        self.info =
+                            "no scrollback here — this pane runs a full-screen app".to_string();
+                    } else {
+                        self.scroll_mode = Some(t);
+                        self.apply_scroll(t, 0);
+                    }
                 }
             }
             // Direct resize (tmux muscle memory): `Ctrl+B` then capital H/J/K/L resizes the
@@ -542,17 +554,19 @@ impl App {
             .max(1);
         let half = (page / 2).max(1);
         let offset = self.scroll_offset;
+        let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
         let requested = match key.code {
+            // Line: k/j, arrows, and less/vim's Ctrl-y / Ctrl-e.
             KeyCode::Char('k') | KeyCode::Up => offset.saturating_add(1),
             KeyCode::Char('j') | KeyCode::Down => offset.saturating_sub(1),
+            KeyCode::Char('y') if ctrl => offset.saturating_add(1),
+            KeyCode::Char('e') if ctrl => offset.saturating_sub(1),
+            // Page.
             KeyCode::PageUp => offset.saturating_add(page),
             KeyCode::PageDown => offset.saturating_sub(page),
-            KeyCode::Char('u') if key.modifiers.contains(KeyModifiers::CONTROL) => {
-                offset.saturating_add(half)
-            }
-            KeyCode::Char('d') if key.modifiers.contains(KeyModifiers::CONTROL) => {
-                offset.saturating_sub(half)
-            }
+            // Half page: Ctrl-u/Ctrl-d (tmux vi) and plain u/d (less).
+            KeyCode::Char('u') => offset.saturating_add(half),
+            KeyCode::Char('d') => offset.saturating_sub(half),
             KeyCode::Char('g') => usize::MAX, // clamped to the buffer length below
             KeyCode::Char('G') => 0,
             KeyCode::Char('q') | KeyCode::Esc | KeyCode::Enter => {
