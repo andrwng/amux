@@ -581,22 +581,6 @@ impl App {
             }
             // Jump to the next unread agent (inbox navigation).
             KeyCode::Tab => self.jump_next_unread(sink).await?,
-            // Diagnostic: report the focused pane's terminal state (alt screen? mouse tracking?
-            // how much scrollback amux captured) — to see how an app like Claude renders/scrolls.
-            KeyCode::Char('?') => {
-                if let Some(t) = self.tree.focused_payload() {
-                    if let Some(parser) = self.parsers.get_mut(&t) {
-                        let alt = parser.screen().alternate_screen();
-                        let mouse = format!("{:?}", parser.screen().mouse_protocol_mode());
-                        parser.screen_mut().set_scrollback(usize::MAX);
-                        let scrollback = parser.screen().scrollback();
-                        parser.screen_mut().set_scrollback(0);
-                        self.info = format!(
-                            "alt-screen={alt} · mouse={mouse} · scrollback={scrollback} lines"
-                        );
-                    }
-                }
-            }
             KeyCode::Char(c) if key.modifiers.contains(KeyModifiers::CONTROL) => {
                 if let (Some(terminal), Some(byte)) = (self.tree.focused_payload(), ctrl_byte(c)) {
                     sink.send(ClientMsg::Input {
@@ -833,9 +817,6 @@ impl App {
                 // the wheel; otherwise scroll amux's own scrollback (plain shells).
                 if self.app_wants_mouse(terminal) {
                     if let Some(bytes) = self.encode_wheel(terminal, up, me.column, me.row, inner) {
-                        // Temporary trace: show the exact sequence we forward, to compare with what
-                        // a bare terminal / tmux sends to Claude if the wheel still doesn't scroll.
-                        self.info = format!("wheel→pane: {}", debug_seq(&bytes));
                         sink.send(ClientMsg::Input { terminal, bytes }).await?;
                     }
                 } else {
@@ -1184,18 +1165,6 @@ fn ctrl_dir(key: KeyEvent) -> Option<Dir> {
 }
 
 /// Map a resize key to a direction — accepts hjkl, HJKL, and the arrow keys.
-/// Render a byte sequence readably for the status banner (ESC shown as `ESC`).
-fn debug_seq(bytes: &[u8]) -> String {
-    bytes
-        .iter()
-        .map(|&b| match b {
-            0x1b => "ESC".to_string(),
-            0x20..=0x7e => (b as char).to_string(),
-            other => format!("\\x{other:02x}"),
-        })
-        .collect()
-}
-
 /// Clamp a screen point into a rect's cell range.
 fn clamp_to(inner: Rect, col: u16, row: u16) -> (u16, u16) {
     let x = col.clamp(inner.x, inner.x + inner.width.saturating_sub(1));
