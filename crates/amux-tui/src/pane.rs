@@ -283,13 +283,16 @@ fn split_leaf<P>(node: Node<P>, target: PaneId, axis: Axis, new_id: PaneId) -> N
             }),
         },
         Node::Leaf { .. } => node,
+        // Recurse into the existing split, preserving *its* axis (`node_axis`) while still passing
+        // the caller's requested `axis` down — shadowing here was the bug that made every split
+        // inherit the first one's orientation.
         Node::Split {
-            axis,
+            axis: node_axis,
             ratio,
             first,
             second,
         } => Node::Split {
-            axis,
+            axis: node_axis,
             ratio,
             first: Box::new(split_leaf(*first, target, axis, new_id)),
             second: Box::new(split_leaf(*second, target, axis, new_id)),
@@ -492,6 +495,39 @@ mod tests {
         t.open(b);
         assert_eq!(t.focused_payload(), Some(b));
         assert_eq!(t.payloads().len(), 2);
+    }
+
+    #[test]
+    fn each_split_uses_its_requested_axis() {
+        // Regression: splitting a pane that lives inside an existing split must honor the axis
+        // asked for, not inherit the parent split's axis.
+        let mut t = PaneTree::new();
+        let a = TerminalId::new();
+        t.open(a);
+        t.split(Axis::LeftRight); // a | (new)
+        let b = TerminalId::new();
+        t.open(b); // b is the focused right pane
+        t.split(Axis::TopBottom); // split b top/bottom
+        let c = TerminalId::new();
+        t.open(c);
+
+        let places = t.layout(area());
+        let rect = |p: TerminalId| {
+            places
+                .iter()
+                .find(|pl| pl.payload == Some(p))
+                .expect("pane present")
+                .rect
+        };
+        let (ra, rb, rc) = (rect(a), rect(b), rect(c));
+        // Left/right split: `a` is the left column, full height.
+        assert_eq!(ra.x, 0);
+        assert_eq!(ra.height, area().height, "a spans full height");
+        assert!(rb.x > ra.x, "b/c are the right column");
+        // Top/bottom split of the right column: b and c share x/width but stack vertically.
+        assert_eq!(rb.x, rc.x);
+        assert_eq!(rb.width, rc.width);
+        assert_ne!(rb.y, rc.y, "b and c are stacked, not side by side");
     }
 
     #[test]
