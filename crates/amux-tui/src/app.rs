@@ -1608,12 +1608,14 @@ fn render_minis(frame: &mut Frame, area: Rect, app: &App) {
         let bottom = area.y + area.height; // one row below the band content (reserved margin)
         let shadow = Style::default().bg(Color::Black);
         let buf = frame.buffer_mut();
-        for y in (area.y + 1)..=bottom {
+        // Right column: flush with the group's right edge, full height down to the bottom corner.
+        for y in area.y..=bottom {
             if let Some(cell) = buf.cell_mut((right, y)) {
                 cell.set_symbol(" ").set_style(shadow);
             }
         }
-        for x in (left + 1)..=right {
+        // Bottom row: flush with the group's bottom edge, full width across to the corner.
+        for x in left..=right {
             if let Some(cell) = buf.cell_mut((x, bottom)) {
                 cell.set_symbol(" ").set_style(shadow);
             }
@@ -1687,7 +1689,13 @@ fn render_sidebar(frame: &mut Frame, area: Rect, app: &App) {
 
     let by_id: HashMap<_, _> = app.agents.iter().map(|a| (a.id, a)).collect();
     let repo_names: HashMap<_, _> = app.repos.iter().map(|r| (r.id, r.name.as_str())).collect();
-    let open: Vec<AgentId> = app.terminals.values().copied().collect();
+    // "Open" means visible right now: the active agent in the main area plus every mini. An agent
+    // that was displaced from the main area keeps its saved layout but is sidebar-only — not open.
+    let open: HashSet<AgentId> = app
+        .active_agent
+        .into_iter()
+        .chain(app.minis.iter().copied())
+        .collect();
     let mut lines = Vec::new();
     if app.repos.is_empty() {
         lines.push(Line::from(Span::styled(
