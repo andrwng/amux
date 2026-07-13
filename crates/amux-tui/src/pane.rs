@@ -161,6 +161,18 @@ impl<P: Copy + PartialEq> PaneTree<P> {
         }
     }
 
+    /// Focus the pane holding `payload` (e.g. a mouse click landed on it). Returns whether it was
+    /// found.
+    pub fn focus_payload(&mut self, payload: P) -> bool {
+        if let Some(node) = &self.root {
+            if let Some(id) = leaf_with_payload(node, payload) {
+                self.focus = id;
+                return true;
+            }
+        }
+        false
+    }
+
     /// Move focus in `dir` within `area`; reports whether it moved, stayed, or hit the left edge.
     pub fn navigate(&mut self, dir: Dir, area: Rect) -> Nav {
         let places = self.layout(area);
@@ -341,6 +353,20 @@ fn first_leaf<P>(node: &Node<P>) -> PaneId {
     match node {
         Node::Leaf { id, .. } => *id,
         Node::Split { first, .. } => first_leaf(first),
+    }
+}
+
+/// The id of the leaf whose payload equals `payload`, if any.
+fn leaf_with_payload<P: Copy + PartialEq>(node: &Node<P>, payload: P) -> Option<PaneId> {
+    match node {
+        Node::Leaf {
+            id,
+            payload: Some(p),
+        } if *p == payload => Some(*id),
+        Node::Leaf { .. } => None,
+        Node::Split { first, second, .. } => {
+            leaf_with_payload(first, payload).or_else(|| leaf_with_payload(second, payload))
+        }
     }
 }
 

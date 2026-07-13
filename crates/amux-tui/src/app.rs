@@ -9,7 +9,10 @@ use std::path::PathBuf;
 
 use anyhow::Result;
 use chrono::Utc;
-use crossterm::event::{Event, EventStream, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
+use crossterm::event::{
+    Event, EventStream, KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseButton, MouseEvent,
+    MouseEventKind,
+};
 use futures::stream::SplitSink;
 use futures::{SinkExt, StreamExt};
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
@@ -68,9 +71,14 @@ enum Flow {
 }
 
 pub async fn run() -> Result<()> {
+    use crossterm::event::{DisableMouseCapture, EnableMouseCapture};
     let (framed, repo) = crate::client::connect().await?;
     let mut terminal = ratatui::init();
+    // Capture the mouse so the wheel reaches panes (forwarded to apps that want it, else scrolls
+    // amux's own scrollback). Hold Shift to bypass for native terminal selection.
+    let _ = crossterm::execute!(std::io::stdout(), EnableMouseCapture);
     let result = event_loop(&mut terminal, framed, repo).await;
+    let _ = crossterm::execute!(std::io::stdout(), DisableMouseCapture);
     ratatui::restore();
     result
 }
@@ -102,6 +110,7 @@ async fn event_loop(
                     }
                 }
                 Some(Ok(Event::Resize(c, r))) => app.on_resize(c, r, &mut sink).await?,
+                Some(Ok(Event::Mouse(me))) => app.on_mouse(me, &mut sink).await?,
                 Some(Ok(_)) => {}
                 _ => break,
             },
@@ -690,6 +699,114 @@ impl App {
         self.reconcile(sink).await
     }
 
+    // --- mouse handling ---
+
+    /// Route a mouse event to the pane under the cursor: left-click focuses it; the wheel is
+    /// forwarded to an app that wants the mouse (Claude/vim/less), else it scrolls amux's own
+    /// scrollback for that pane. Events over the sidebar are ignored.
+    async fn on_mouse(&mut self, me: MouseEvent, sink: &mut Sink) -> Result<()> {
+        let Some((terminal, inner)) = self.pane_at(me.column, me.row) else {
+            return Ok(());
+        };
+        match me.kind {
+            MouseEventKind::Down(MouseButton::Left) if self.tree.focus_payload(terminal) => {
+                self.focus = Focus::Panes;
+            }
+            MouseEventKind::ScrollUp | MouseEventKind::ScrollDown => {
+                let up = matches!(me.kind, MouseEventKind::ScrollUp);
+                if self.app_wants_mouse(terminal) {
+                    if let Some(bytes) = self.encode_wheel(terminal, up, me.column, me.row, inner) {
+                        sink.send(ClientMsg::Input { terminal, bytes }).await?;
+                    }
+                } else {
+                    self.wheel_scroll(terminal, up);
+                }
+            }
+            _ => {}
+        }
+        Ok(())
+    }
+
+    /// The terminal (and its inner content area) under screen point `(col, row)`, if any pane is.
+    fn pane_at(&self, col: u16, row: u16) -> Option<(TerminalId, Rect)> {
+        for place in self.tree.layout(self.area) {
+            let r = place.rect;
+            let hit = col >= r.x && col < r.x + r.width && row >= r.y && row < r.y + r.height;
+            if let (true, Some(t)) = (hit, place.payload) {
+                let inner = Rect {
+                    x: r.x + 1,
+                    y: r.y + 1,
+                    width: r.width.saturating_sub(2),
+                    height: r.height.saturating_sub(2),
+                };
+                return Some((t, inner));
+            }
+        }
+        None
+    }
+
+    /// Whether the app in `terminal` has enabled mouse tracking (so it owns the wheel/clicks).
+    fn app_wants_mouse(&self, terminal: TerminalId) -> bool {
+        self.parsers
+            .get(&terminal)
+            .is_some_and(|p| p.screen().mouse_protocol_mode() != vt100::MouseProtocolMode::None)
+    }
+
+    /// Encode a wheel tick as a mouse report in the app's requested encoding, with coordinates
+    /// relative to the pane's inner area.
+    fn encode_wheel(
+        &self,
+        terminal: TerminalId,
+        up: bool,
+        col: u16,
+        row: u16,
+        inner: Rect,
+    ) -> Option<Vec<u8>> {
+        let enc = self
+            .parsers
+            .get(&terminal)?
+            .screen()
+            .mouse_protocol_encoding();
+        let cx = (col.saturating_sub(inner.x) + 1).clamp(1, inner.width.max(1));
+        let cy = (row.saturating_sub(inner.y) + 1).clamp(1, inner.height.max(1));
+        let button: u16 = if up { 64 } else { 65 }; // wheel up / down
+        Some(match enc {
+            vt100::MouseProtocolEncoding::Sgr => format!("\x1b[<{button};{cx};{cy}M").into_bytes(),
+            // X10 / UTF-8 default: ESC [ M, then button/col/row each offset by 32 (one byte).
+            _ => vec![
+                0x1b,
+                b'[',
+                b'M',
+                (32 + button).min(255) as u8,
+                (32 + cx).min(255) as u8,
+                (32 + cy).min(255) as u8,
+            ],
+        })
+    }
+
+    /// Wheel-scroll amux's own scrollback for a pane whose app doesn't take the mouse — reusing
+    /// scroll mode. Wheeling back to the bottom exits it (returns to live).
+    fn wheel_scroll(&mut self, terminal: TerminalId, up: bool) {
+        const STEP: usize = 3;
+        if self.scroll_mode != Some(terminal) {
+            self.scroll_mode = Some(terminal);
+            self.scroll_offset = self
+                .parsers
+                .get(&terminal)
+                .map(|p| p.screen().scrollback())
+                .unwrap_or(0);
+        }
+        let requested = if up {
+            self.scroll_offset.saturating_add(STEP)
+        } else {
+            self.scroll_offset.saturating_sub(STEP)
+        };
+        self.apply_scroll(terminal, requested);
+        if !up && self.scroll_offset == 0 {
+            self.scroll_mode = None; // back to live
+        }
+    }
+
     /// Attach/detach/resize terminals to match what the panes now show. A pane that leaves the
     /// layout is detached (primary — agent keeps running) or closed (shell — killed).
     async fn reconcile(&mut self, sink: &mut Sink) -> Result<()> {
@@ -1244,6 +1361,47 @@ mod tests {
         assert_eq!(app.scroll_offset, 0);
         app.key_scroll(key(KeyCode::Char('q')), t);
         assert!(app.scroll_mode.is_none());
+    }
+
+    #[test]
+    fn mouse_wheel_forwards_to_apps_and_scrolls_others() {
+        let mut app = App::new(100, 40);
+        let t = TerminalId::new();
+        app.tree.open(t);
+        app.terminals.insert(t, AgentId::new());
+        let mut parser = vt100::Parser::new(4, 20, 100);
+        for i in 0..30 {
+            parser.process(format!("line {i}\r\n").as_bytes());
+        }
+        app.parsers.insert(t, parser);
+        app.attached.insert(t, Size { cols: 20, rows: 4 });
+
+        // Hit-testing finds the pane covering the main area.
+        let (hit, _inner) = app.pane_at(40, 10).expect("mouse is over the pane");
+        assert_eq!(hit, t);
+
+        // No mouse mode → the wheel scrolls amux's own scrollback; wheeling back exits.
+        assert!(!app.app_wants_mouse(t));
+        app.wheel_scroll(t, true);
+        assert!(app.scroll_offset >= 3 && app.scroll_mode == Some(t));
+        app.wheel_scroll(t, false);
+        assert_eq!(app.scroll_offset, 0);
+        assert!(app.scroll_mode.is_none());
+
+        // The app enables SGR mouse mode → the wheel is forwarded as an SGR report instead.
+        app.parsers
+            .get_mut(&t)
+            .unwrap()
+            .process(b"\x1b[?1000h\x1b[?1006h");
+        assert!(app.app_wants_mouse(t));
+        let bytes = app
+            .encode_wheel(t, true, 35, 5, Rect::new(31, 1, 18, 2))
+            .unwrap();
+        let s = String::from_utf8(bytes).unwrap();
+        assert!(
+            s.starts_with("\u{1b}[<64;") && s.ends_with('M'),
+            "SGR wheel-up report: {s:?}"
+        );
     }
 
     #[test]
