@@ -33,6 +33,8 @@ use crate::pane::{Axis, Dir, Nav, PaneTree};
 
 const SIDEBAR_W: u16 = 30;
 const RESIZE_STEP: f32 = 0.05;
+/// Max height of the minis row (capped to half the main area).
+const MINI_ROWS: u16 = 14;
 
 type Sink = SplitSink<Framed<UnixStream, ClientCodec>, ClientMsg>;
 
@@ -43,10 +45,12 @@ enum Row {
     Agent(AgentId),
 }
 
-#[derive(Clone, Copy, PartialEq, Eq)]
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum Focus {
     Sidebar,
     Panes,
+    /// The i-th mini (a floating row below the main panes) is focused.
+    Mini(usize),
 }
 
 /// A mouse text selection isolated to one pane: anchor + head in screen (col,row) coords, clamped
@@ -170,6 +174,11 @@ struct App {
     /// instead of navigating. Announced by the daemon via `TerminalApp`.
     passthrough: HashMap<TerminalId, bool>,
     focus: Focus,
+    /// Agents shown as **minis** — a spatial row of small live terminals below the main panes,
+    /// left-to-right. Each shows that agent's primary terminal.
+    minis: Vec<AgentId>,
+    /// Where focus was before it entered the minis row, so closing a mini can return there.
+    focus_return: Focus,
     /// The agent last reported to the daemon as "being viewed" (drives read/unread).
     focus_agent: Option<AgentId>,
     input: InputMode,
@@ -211,6 +220,8 @@ impl App {
             attached: HashMap::new(),
             passthrough: HashMap::new(),
             focus: Focus::Sidebar,
+            minis: Vec::new(),
+            focus_return: Focus::Sidebar,
             focus_agent: None,
             input: InputMode::Normal,
             prefix: false,
@@ -232,6 +243,49 @@ impl App {
 
     fn is_primary(&self, terminal: TerminalId) -> bool {
         self.agents.iter().any(|a| a.primary_terminal == terminal)
+    }
+
+    /// Split the main area into the pane region (top) and, when minis are open, the minis row
+    /// (a band at the bottom). With no minis, panes get the whole area.
+    fn regions(&self) -> (Rect, Option<Rect>) {
+        if self.minis.is_empty() {
+            return (self.area, None);
+        }
+        let mini_h = (self.area.height / 2).clamp(3, MINI_ROWS);
+        let pane_h = self.area.height.saturating_sub(mini_h).max(1);
+        let panes = Rect::new(self.area.x, self.area.y, self.area.width, pane_h);
+        let minis = Rect::new(self.area.x, self.area.y + pane_h, self.area.width, mini_h);
+        (panes, Some(minis))
+    }
+
+    /// The rectangle for each mini, dividing `area` into equal-width cells left-to-right.
+    fn mini_rects(&self, area: Rect) -> Vec<Rect> {
+        let n = self.minis.len() as u16;
+        if n == 0 {
+            return Vec::new();
+        }
+        let w = (area.width / n).max(1);
+        (0..n)
+            .map(|i| {
+                let x = area.x + i * w;
+                // The last cell absorbs any remainder so the row fills the width exactly.
+                let width = if i == n - 1 {
+                    area.width.saturating_sub(i * w)
+                } else {
+                    w
+                };
+                Rect::new(x, area.y, width, area.height)
+            })
+            .collect()
+    }
+
+    /// The primary terminal of the i-th mini, if it maps to a known agent.
+    fn mini_terminal(&self, i: usize) -> Option<TerminalId> {
+        let agent = self.minis.get(i)?;
+        self.agents
+            .iter()
+            .find(|a| a.id == *agent)
+            .map(|a| a.primary_terminal)
     }
 
     // --- daemon events ---
@@ -272,10 +326,17 @@ impl App {
                 for t in terms {
                     self.forget_terminal(t);
                 }
-                // Drop the agent's saved workspace; if it was active, go back to nothing.
+                // Drop the agent's saved workspace + any mini; if it was active, go back to nothing.
                 self.trees.remove(&id);
+                self.minis.retain(|a| *a != id);
                 if self.active_agent == Some(id) {
                     self.active_agent = None;
+                }
+                // A removed mini may have shifted indices out from under the focus.
+                if let Focus::Mini(i) = self.focus {
+                    if i >= self.minis.len() {
+                        self.focus = self.focus_return;
+                    }
                 }
                 self.agents.retain(|a| a.id != id);
                 if self.sidebar_sel == Some(Row::Agent(id)) {
@@ -398,7 +459,23 @@ impl App {
         match self.focus {
             Focus::Sidebar => self.key_sidebar(key, sink).await,
             Focus::Panes => self.key_pane(key, sink).await,
+            Focus::Mini(i) => self.key_mini(key, i, sink).await,
         }
+    }
+
+    /// Keystrokes for a focused mini go to that agent's primary terminal.
+    async fn key_mini(&mut self, key: KeyEvent, i: usize, sink: &mut Sink) -> Result<Flow> {
+        if let Some(terminal) = self.mini_terminal(i) {
+            let app_cursor = self
+                .parsers
+                .get(&terminal)
+                .map(|p| p.screen().application_cursor())
+                .unwrap_or(false);
+            if let Some(bytes) = key_to_bytes(key, app_cursor) {
+                sink.send(ClientMsg::Input { terminal, bytes }).await?;
+            }
+        }
+        Ok(Flow::Continue)
     }
 
     /// Whether the focused pane's terminal has announced it wants `Ctrl+hjkl` (a vim-like app).
@@ -409,19 +486,42 @@ impl App {
     }
 
     fn navigate(&mut self, dir: Dir) {
+        let (pane_area, _) = self.regions();
         match self.focus {
             Focus::Sidebar => {
-                if dir == Dir::Right && !self.tree.is_empty() {
-                    self.tree.focus_first();
-                    self.focus = Focus::Panes;
+                if dir == Dir::Right {
+                    if !self.tree.is_empty() {
+                        self.tree.focus_first();
+                        self.focus = Focus::Panes;
+                    } else if !self.minis.is_empty() {
+                        self.enter_mini(0);
+                    }
                 }
             }
-            Focus::Panes => {
-                if let Nav::ExitLeft = self.tree.navigate(dir, self.area) {
-                    self.focus = Focus::Sidebar;
-                }
-            }
+            Focus::Panes => match self.tree.navigate(dir, pane_area) {
+                Nav::ExitLeft => self.focus = Focus::Sidebar,
+                // Off the bottom of the panes drops into the minis row.
+                Nav::Stay if dir == Dir::Down && !self.minis.is_empty() => self.enter_mini(0),
+                _ => {}
+            },
+            Focus::Mini(i) => match dir {
+                Dir::Left if i > 0 => self.focus = Focus::Mini(i - 1),
+                Dir::Left => self.focus = Focus::Sidebar,
+                Dir::Right if i + 1 < self.minis.len() => self.focus = Focus::Mini(i + 1),
+                // Climb back into the main layout.
+                Dir::Up if !self.tree.is_empty() => self.focus = Focus::Panes,
+                Dir::Up => self.focus = Focus::Sidebar,
+                _ => {}
+            },
         }
+    }
+
+    /// Move focus into the i-th mini, remembering where we came from so closing it can return.
+    fn enter_mini(&mut self, i: usize) {
+        if !matches!(self.focus, Focus::Mini(_)) {
+            self.focus_return = self.focus;
+        }
+        self.focus = Focus::Mini(i);
     }
 
     async fn key_sidebar(&mut self, key: KeyEvent, sink: &mut Sink) -> Result<Flow> {
@@ -462,9 +562,44 @@ impl App {
                 }
             }
             KeyCode::Enter | KeyCode::Char('l') => self.open_selected(sink).await?,
+            // `m`: open the selected agent as a mini (a small live window below the main panes).
+            KeyCode::Char('m') => {
+                if let Some(id) = self.selected_agent() {
+                    self.open_mini(id, sink).await?;
+                }
+            }
             _ => {}
         }
         Ok(Flow::Continue)
+    }
+
+    /// Open `agent` as a mini and focus it (returning to the sidebar when closed). No-op for the
+    /// agent already in the main area; focuses it if it's already a mini.
+    async fn open_mini(&mut self, agent: AgentId, sink: &mut Sink) -> Result<()> {
+        if self.active_agent == Some(agent) {
+            return Ok(());
+        }
+        if let Some(i) = self.minis.iter().position(|a| *a == agent) {
+            self.enter_mini(i);
+            return Ok(());
+        }
+        self.minis.push(agent);
+        self.enter_mini(self.minis.len() - 1);
+        self.reconcile(sink).await
+    }
+
+    /// Close the i-th mini; focus returns to another mini, or to where it started.
+    async fn close_mini(&mut self, i: usize, sink: &mut Sink) -> Result<()> {
+        if i >= self.minis.len() {
+            return Ok(());
+        }
+        self.minis.remove(i);
+        self.focus = if self.minis.is_empty() {
+            self.focus_return
+        } else {
+            Focus::Mini(i.min(self.minis.len() - 1))
+        };
+        self.reconcile(sink).await
     }
 
     /// Open the selected agent — switch the main area to its workspace.
@@ -498,6 +633,8 @@ impl App {
     /// The pure state change behind [`activate`]: save the current agent's layout, restore (or
     /// create) `id`'s, and ensure its primary terminal is shown.
     fn swap_to_agent(&mut self, id: AgentId) {
+        // An agent shown in the main area isn't also a mini (its terminal can't be two sizes).
+        self.minis.retain(|a| *a != id);
         if self.active_agent != Some(id) {
             if let Some(prev) = self.active_agent {
                 self.trees.insert(prev, std::mem::take(&mut self.tree));
@@ -551,6 +688,11 @@ impl App {
         match key.code {
             KeyCode::Char('%') => self.split(Axis::LeftRight, sink).await?,
             KeyCode::Char('"') => self.split(Axis::TopBottom, sink).await?,
+            KeyCode::Char('x') if matches!(self.focus, Focus::Mini(_)) => {
+                if let Focus::Mini(i) = self.focus {
+                    self.close_mini(i, sink).await?;
+                }
+            }
             KeyCode::Char('x') => {
                 let closed = self.tree.focused_payload();
                 self.tree.close();
@@ -884,7 +1026,8 @@ impl App {
 
     /// The terminal (and its inner content area) under screen point `(col, row)`, if any pane is.
     fn pane_at(&self, col: u16, row: u16) -> Option<(TerminalId, Rect)> {
-        for place in self.tree.layout(self.area) {
+        let (pane_area, _) = self.regions();
+        for place in self.tree.layout(pane_area) {
             let r = place.rect;
             let hit = col >= r.x && col < r.x + r.width && row >= r.y && row < r.y + r.height;
             if let (true, Some(t)) = (hit, place.payload) {
@@ -975,10 +1118,32 @@ impl App {
     /// not closed — they keep running headless in the daemon and restore when you switch back.
     /// Explicit closes (a shell pane via `Ctrl+B x`, a delete, an exit) kill terminals elsewhere.
     async fn reconcile(&mut self, sink: &mut Sink) -> Result<()> {
+        let (pane_area, minis_area) = self.regions();
         let mut desired: HashMap<TerminalId, Size> = HashMap::new();
-        for place in self.tree.layout(self.area) {
+        for place in self.tree.layout(pane_area) {
             if let Some(t) = place.payload {
                 desired.insert(t, pane_size(place.rect));
+            }
+        }
+        // The minis row streams each agent's primary terminal, sized to its cell.
+        if let Some(ma) = minis_area {
+            let rects = self.mini_rects(ma);
+            let mini_terms: Vec<(TerminalId, AgentId, Size)> = self
+                .minis
+                .iter()
+                .enumerate()
+                .filter_map(|(i, agent)| {
+                    let t = self
+                        .agents
+                        .iter()
+                        .find(|a| a.id == *agent)?
+                        .primary_terminal;
+                    Some((t, *agent, pane_size(*rects.get(i)?)))
+                })
+                .collect();
+            for (t, agent, size) in mini_terms {
+                self.terminals.insert(t, agent);
+                desired.insert(t, size);
             }
         }
 
@@ -1074,11 +1239,14 @@ impl App {
     /// The agent the user is currently viewing: the one owning the focused terminal (when focus
     /// is in the panes), else `None`. This is what "seen" is anchored to.
     fn current_focus_agent(&self) -> Option<AgentId> {
-        if self.focus != Focus::Panes {
-            return None;
+        match self.focus {
+            Focus::Panes => {
+                let terminal = self.tree.focused_payload()?;
+                self.terminals.get(&terminal).copied()
+            }
+            Focus::Mini(i) => self.minis.get(i).copied(),
+            Focus::Sidebar => None,
         }
-        let terminal = self.tree.focused_payload()?;
-        self.terminals.get(&terminal).copied()
     }
 
     /// Tell the daemon which agent is being viewed, when it changes — so it can clear/keep unread.
@@ -1310,8 +1478,48 @@ fn render(frame: &mut Frame, app: &App) {
         .split(rows[0]);
 
     render_sidebar(frame, cols[0], app);
-    render_panes(frame, cols[1], app);
+    // Split the main area into the pane region and (when open) the minis row at the bottom.
+    let (pane_area, minis_area) = app.regions();
+    render_panes(frame, pane_area, app);
+    if let Some(ma) = minis_area {
+        render_minis(frame, ma, app);
+    }
     render_status(frame, rows[1], app);
+}
+
+fn render_minis(frame: &mut Frame, area: Rect, app: &App) {
+    let by_id: HashMap<_, _> = app.agents.iter().map(|a| (a.id, a)).collect();
+    for (i, rect) in app.mini_rects(area).iter().enumerate() {
+        let Some(agent_id) = app.minis.get(i) else {
+            continue;
+        };
+        let focused = app.focus == Focus::Mini(i);
+        let (glyph, color, branch) = by_id
+            .get(agent_id)
+            .map(|a| (a.state.glyph(), color_for(&a.state), a.branch.as_str()))
+            .unwrap_or(('?', Color::DarkGray, "?"));
+        let title = format!(" {glyph} {branch} ");
+        let border = if focused {
+            Style::default()
+                .fg(Color::Cyan)
+                .add_modifier(Modifier::BOLD)
+        } else {
+            Style::default().fg(color)
+        };
+        let block = Block::default()
+            .borders(Borders::ALL)
+            .border_style(border)
+            .title(title);
+        let inner = block.inner(*rect);
+        frame.render_widget(block, *rect);
+        match app.mini_terminal(i).and_then(|t| app.parsers.get(&t)) {
+            Some(parser) => frame.render_widget(PseudoTerminal::new(parser.screen()), inner),
+            None => frame.render_widget(
+                Paragraph::new("  \u{2026}").style(Style::default().fg(Color::DarkGray)),
+                inner,
+            ),
+        }
+    }
 }
 
 fn render_sidebar(frame: &mut Frame, area: Rect, app: &App) {
@@ -1549,10 +1757,13 @@ fn render_status(frame: &mut Frame, area: Rect, app: &App) {
     } else {
         let hint = match app.focus {
             Focus::Sidebar => {
-                " n new \u{b7} N new+repo \u{b7} j/k select \u{b7} enter open \u{b7} d del \u{b7} r resume \u{b7} P prune \u{b7} ctrl+q quit"
+                " n new \u{b7} enter open \u{b7} m mini \u{b7} d del \u{b7} r resume \u{b7} P prune \u{b7} ctrl+hjkl \u{b7} ctrl+q quit"
             }
             Focus::Panes => {
                 " ctrl+hjkl move \u{b7} ctrl+b %/\"/x/r \u{b7} type to talk \u{b7} ctrl+q quit"
+            }
+            Focus::Mini(_) => {
+                " mini \u{b7} ctrl+hjkl move \u{b7} ctrl+b x close \u{b7} type to talk \u{b7} ctrl+q quit"
             }
         };
         (hint.to_string(), Style::default().fg(Color::DarkGray))
@@ -1647,6 +1858,36 @@ mod tests {
         let payloads = app.tree.payloads();
         assert_eq!(payloads.len(), 2);
         assert!(payloads.contains(&pa) && payloads.contains(&sh));
+    }
+
+    #[test]
+    fn minis_form_a_navigable_bottom_row() {
+        let mut app = App::new(100, 40);
+        let t = TerminalId::new();
+        app.tree.open(t);
+        app.active_agent = Some(AgentId::new());
+        app.focus = Focus::Panes;
+        app.minis = vec![AgentId::new(), AgentId::new()];
+
+        // Off the bottom of the panes drops into the first mini; right steps across the row.
+        app.navigate(Dir::Down);
+        assert_eq!(app.focus, Focus::Mini(0));
+        app.navigate(Dir::Right);
+        assert_eq!(app.focus, Focus::Mini(1));
+        // Up climbs back into the main layout.
+        app.navigate(Dir::Up);
+        assert_eq!(app.focus, Focus::Panes);
+        // Left off the leftmost mini lands in the sidebar.
+        app.focus = Focus::Mini(0);
+        app.navigate(Dir::Left);
+        assert_eq!(app.focus, Focus::Sidebar);
+
+        // Two minis tile the row side by side, filling its width.
+        let (_, minis_area) = app.regions();
+        let rects = app.mini_rects(minis_area.unwrap());
+        assert_eq!(rects.len(), 2);
+        assert_eq!(rects[0].x + rects[0].width, rects[1].x);
+        assert_eq!(rects[1].x + rects[1].width, app.area.x + app.area.width);
     }
 
     #[test]
