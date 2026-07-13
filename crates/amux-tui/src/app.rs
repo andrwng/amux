@@ -532,6 +532,22 @@ impl App {
             }
             // Jump to the next unread agent (inbox navigation).
             KeyCode::Tab => self.jump_next_unread(sink).await?,
+            // Diagnostic: report the focused pane's terminal state (alt screen? mouse tracking?
+            // how much scrollback amux captured) — to see how an app like Claude renders/scrolls.
+            KeyCode::Char('?') => {
+                if let Some(t) = self.tree.focused_payload() {
+                    if let Some(parser) = self.parsers.get_mut(&t) {
+                        let alt = parser.screen().alternate_screen();
+                        let mouse = format!("{:?}", parser.screen().mouse_protocol_mode());
+                        parser.screen_mut().set_scrollback(usize::MAX);
+                        let scrollback = parser.screen().scrollback();
+                        parser.screen_mut().set_scrollback(0);
+                        self.info = format!(
+                            "alt-screen={alt} · mouse={mouse} · scrollback={scrollback} lines"
+                        );
+                    }
+                }
+            }
             KeyCode::Char(c) if key.modifiers.contains(KeyModifiers::CONTROL) => {
                 if let (Some(terminal), Some(byte)) = (self.tree.focused_payload(), ctrl_byte(c)) {
                     sink.send(ClientMsg::Input {
@@ -719,7 +735,7 @@ impl App {
     /// Route a mouse event to the pane under the cursor: left-click focuses it; the wheel is
     /// forwarded to an app that wants the mouse (Claude/vim/less), else it scrolls amux's own
     /// scrollback for that pane. Events over the sidebar are ignored.
-    async fn on_mouse(&mut self, me: MouseEvent, _sink: &mut Sink) -> Result<()> {
+    async fn on_mouse(&mut self, me: MouseEvent, sink: &mut Sink) -> Result<()> {
         // Drag/release drive the active selection, using its own pane — independent of what's now
         // under the cursor (so dragging past the pane edge still works).
         match me.kind {
@@ -764,12 +780,11 @@ impl App {
             }
             MouseEventKind::ScrollUp | MouseEventKind::ScrollDown => {
                 let up = matches!(me.kind, MouseEventKind::ScrollUp);
-                // Real-terminal rule: a full-screen app on the alternate screen (vim/less/htop)
-                // owns the wheel; the normal buffer (a shell, or inline Claude whose transcript
-                // lives in scrollback) scrolls amux's own history.
-                if self.on_alternate_screen(terminal) && self.app_wants_mouse(terminal) {
+                // An app that enabled mouse tracking (vim/less/htop, and Claude if it does) owns
+                // the wheel; otherwise scroll amux's own scrollback (plain shells).
+                if self.app_wants_mouse(terminal) {
                     if let Some(bytes) = self.encode_wheel(terminal, up, me.column, me.row, inner) {
-                        _sink.send(ClientMsg::Input { terminal, bytes }).await?;
+                        sink.send(ClientMsg::Input { terminal, bytes }).await?;
                     }
                 } else {
                     self.wheel_scroll(terminal, up);
