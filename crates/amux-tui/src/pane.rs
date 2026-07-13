@@ -448,7 +448,12 @@ fn resize_toward<P>(
             let in_sub = in_first || in_second;
             let handled = handled_first || handled_second;
             if in_sub && !handled && *node_axis == axis {
-                let delta = if grow == in_first { step } else { -step };
+                // Move the shared boundary in the key's screen direction (Down/Right grow the first
+                // child, Up/Left the second) — so resize reads from the focused pane's perspective:
+                // on the top pane J extends it down; on the bottom pane K extends it up. The sign
+                // is independent of which side the focus is on (a `== in_first` here inverts the
+                // bottom/right pane and makes K shrink instead of grow).
+                let delta = if grow { step } else { -step };
                 *ratio = (*ratio + delta).clamp(0.1, 0.9);
                 return (true, true);
             }
@@ -672,29 +677,35 @@ mod tests {
     }
 
     #[test]
-    fn resize_changes_pane_widths() {
+    fn resize_reads_from_the_focused_panes_perspective() {
+        // Split left/right; focus lands on the new (right) pane, whose shared boundary is on its
+        // left. So Left grows it (extends toward the boundary) and Right shrinks it — the sign
+        // must not depend on which side the focus is on.
         let mut t = PaneTree::new();
         t.open(TerminalId::new());
         t.split(Axis::LeftRight);
         let a = area();
-        let before = t
-            .layout(a)
-            .into_iter()
-            .find(|p| p.focused)
-            .unwrap()
-            .rect
-            .width;
-        t.resize(Dir::Right, 0.1);
-        let after = t
-            .layout(a)
-            .into_iter()
-            .find(|p| p.focused)
-            .unwrap()
-            .rect
-            .width;
+        let focused_width = |t: &PaneTree<TerminalId>| {
+            t.layout(a)
+                .into_iter()
+                .find(|p| p.focused)
+                .unwrap()
+                .rect
+                .width
+        };
+
+        let before = focused_width(&t);
+        t.resize(Dir::Left, 0.1);
+        let grown = focused_width(&t);
         assert!(
-            after > before,
-            "focused pane should widen ({before} → {after})"
+            grown > before,
+            "Left should grow the right pane toward its boundary ({before} → {grown})"
+        );
+        t.resize(Dir::Right, 0.1);
+        let shrunk = focused_width(&t);
+        assert!(
+            shrunk < grown,
+            "Right should shrink the right pane ({grown} → {shrunk})"
         );
     }
 }

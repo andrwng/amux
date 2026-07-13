@@ -547,9 +547,12 @@ impl App {
             },
             Focus::Mini(i) => match dir {
                 Dir::Left if i > 0 => self.focus = Focus::Mini(i - 1),
+                // The minis also sit to the *right* of the main pane, so left off the leftmost
+                // enters the panes (falling through to the sidebar only when there are none).
+                Dir::Left if !self.tree.is_empty() => self.focus = Focus::Panes,
                 Dir::Left => self.focus = Focus::Sidebar,
                 Dir::Right if i + 1 < self.minis.len() => self.focus = Focus::Mini(i + 1),
-                // Climb back into the main layout.
+                // Climb back into the main layout (minis sit below it too).
                 Dir::Up if !self.tree.is_empty() => self.focus = Focus::Panes,
                 Dir::Up => self.focus = Focus::Sidebar,
                 _ => {}
