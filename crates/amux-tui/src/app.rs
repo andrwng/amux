@@ -286,6 +286,13 @@ impl App {
             DaemonMsg::Output { terminal, bytes } => {
                 if let Some(parser) = self.parsers.get_mut(&terminal) {
                     parser.process(&bytes);
+                    // vt100 bumps its scrollback offset to keep the scrolled view anchored on the
+                    // same lines as new output arrives; mirror that into our cached offset so the
+                    // ↑N indicator and the next scroll keypress stay in sync (the view doesn't
+                    // drift out from under you).
+                    if self.scroll_mode == Some(terminal) {
+                        self.scroll_offset = parser.screen().scrollback();
+                    }
                 }
             }
             DaemonMsg::TerminalExited { terminal, .. } => {
@@ -1223,5 +1230,42 @@ mod tests {
         assert_eq!(app.scroll_offset, 0);
         app.key_scroll(key(KeyCode::Char('q')), t);
         assert!(app.scroll_mode.is_none());
+    }
+
+    #[test]
+    fn scroll_view_stays_anchored_as_output_arrives() {
+        let mut app = App::new(100, 40);
+        let t = TerminalId::new();
+        let mut parser = vt100::Parser::new(4, 20, 100);
+        for i in 0..30 {
+            parser.process(format!("line {i}\r\n").as_bytes());
+        }
+        app.parsers.insert(t, parser);
+        app.attached.insert(t, Size { cols: 20, rows: 4 });
+        app.scroll_mode = Some(t);
+        app.apply_scroll(t, 10); // scroll 10 rows back
+
+        let before = app.parsers[&t].screen().contents();
+        let offset_before = app.scroll_offset;
+
+        // New output arrives — mirror the Output handler: process, then resync the cached offset.
+        {
+            let p = app.parsers.get_mut(&t).unwrap();
+            for i in 30..35 {
+                p.process(format!("line {i}\r\n").as_bytes());
+            }
+        }
+        app.scroll_offset = app.parsers[&t].screen().scrollback();
+
+        assert_eq!(
+            before,
+            app.parsers[&t].screen().contents(),
+            "the scrolled view stays on the same lines as output arrives"
+        );
+        assert_eq!(
+            app.scroll_offset,
+            offset_before + 5,
+            "the cached offset tracks the anchor (5 new lines)"
+        );
     }
 }
