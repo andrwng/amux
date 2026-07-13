@@ -1665,12 +1665,17 @@ fn render_minis(frame: &mut Frame, area: Rect, app: &App) {
         // Minimized minis show only their status (the terminal is detached to save bandwidth).
         if app.minimized.contains(agent_id) {
             let unread = by_id.get(agent_id).is_some_and(|a| a.unread);
-            let dot = if unread { "\u{2022} " } else { "" };
+            let bar = if unread { "\u{258c}" } else { " " };
             frame.render_widget(
-                Paragraph::new(Line::from(Span::styled(
-                    format!(" {dot}{glyph}"),
-                    Style::default().fg(color),
-                ))),
+                Paragraph::new(Line::from(vec![
+                    Span::styled(
+                        bar,
+                        Style::default()
+                            .fg(Color::Cyan)
+                            .add_modifier(Modifier::BOLD),
+                    ),
+                    Span::styled(format!(" {glyph}"), Style::default().fg(color)),
+                ])),
                 inner,
             );
             continue;
