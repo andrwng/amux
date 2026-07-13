@@ -81,6 +81,15 @@ mode so you can keep nudging without re-prefixing — matching tmux's `bind -r H
 arrows) resize by adjusting the nearest ancestor split's ratio (clamped 0.1–0.9); `Esc`/`Enter`
 exits.
 
+### Per-agent workspaces
+Each **agent owns its own tiled layout** — the main area shows exactly one agent's workspace at a
+time. Opening an agent from the sidebar **swaps** the whole main area to that agent's tree
+(created with its primary terminal the first time, restored thereafter); splitting adds a sibling
+shell **to that agent's** workspace. Switching agents **detaches** the previous agent's terminals
+(they keep running headless in the daemon and restore on return) — it never mixes two agents in
+one layout. The only place different agents appear at once is the floating **minis** (Phase 3),
+each showing just that agent's primary (Claude) terminal.
+
 ### Sidebar cell (when focused)
 `j`/`k` select · `n` new · `d` delete · `r` resume · `Enter`/`l` open the selected agent into the
 most-recently-focused pane (or the first pane if the layout is empty). Opening an agent attaches

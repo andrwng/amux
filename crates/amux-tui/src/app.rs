@@ -153,7 +153,13 @@ struct App {
     repos: Vec<RepoInfo>,
     agents: Vec<AgentInfo>,
     sidebar_sel: Option<Row>,
+    /// The **active** agent's live pane layout (what the main area shows). Each agent owns its own
+    /// workspace: opening an agent swaps this out, and splits belong to that agent.
     tree: PaneTree<TerminalId>,
+    /// Saved layouts for the non-active agents, restored when you switch back to them.
+    trees: HashMap<AgentId, PaneTree<TerminalId>>,
+    /// The agent whose workspace is currently on screen (`None` = nothing opened yet).
+    active_agent: Option<AgentId>,
     terminals: HashMap<TerminalId, AgentId>,
     parsers: HashMap<TerminalId, vt100::Parser>,
     attached: HashMap<TerminalId, Size>,
@@ -194,6 +200,8 @@ impl App {
             agents: Vec::new(),
             sidebar_sel: None,
             tree: PaneTree::new(),
+            trees: HashMap::new(),
+            active_agent: None,
             terminals: HashMap::new(),
             parsers: HashMap::new(),
             attached: HashMap::new(),
@@ -255,12 +263,12 @@ impl App {
                     .map(|(t, _)| *t)
                     .collect();
                 for t in terms {
-                    self.tree.close_payload(t);
-                    self.parsers.remove(&t);
-                    self.attached.remove(&t);
-                    self.terminals.remove(&t);
-
-                    self.passthrough.remove(&t);
+                    self.forget_terminal(t);
+                }
+                // Drop the agent's saved workspace; if it was active, go back to nothing.
+                self.trees.remove(&id);
+                if self.active_agent == Some(id) {
+                    self.active_agent = None;
                 }
                 self.agents.retain(|a| a.id != id);
                 if self.sidebar_sel == Some(Row::Agent(id)) {
@@ -319,12 +327,7 @@ impl App {
                 }
             }
             DaemonMsg::TerminalExited { terminal, .. } => {
-                self.tree.close_payload(terminal);
-                self.parsers.remove(&terminal);
-                self.attached.remove(&terminal);
-                self.terminals.remove(&terminal);
-
-                self.passthrough.remove(&terminal);
+                self.forget_terminal(terminal);
                 if self.tree.is_empty() {
                     self.focus = Focus::Sidebar;
                 }
@@ -457,23 +460,57 @@ impl App {
         Ok(Flow::Continue)
     }
 
-    /// Open the selected agent's primary terminal into the focused pane.
+    /// Open the selected agent — switch the main area to its workspace.
     async fn open_selected(&mut self, sink: &mut Sink) -> Result<()> {
         let Some(id) = self.selected_agent() else {
             return Ok(());
         };
-        let Some(terminal) = self
-            .agents
-            .iter()
-            .find(|a| a.id == id)
-            .map(|a| a.primary_terminal)
-        else {
-            return Ok(());
-        };
-        self.terminals.insert(terminal, id);
-        self.tree.open(terminal);
-        self.focus = Focus::Panes;
+        self.activate(id, sink).await
+    }
+
+    /// Fully drop a terminal that's gone for good (killed / exited / its agent deleted): remove it
+    /// from the active layout *and* every saved layout, and from all per-terminal maps.
+    fn forget_terminal(&mut self, terminal: TerminalId) {
+        self.tree.close_payload(terminal);
+        for tree in self.trees.values_mut() {
+            tree.close_payload(terminal);
+        }
+        self.parsers.remove(&terminal);
+        self.attached.remove(&terminal);
+        self.terminals.remove(&terminal);
+        self.passthrough.remove(&terminal);
+    }
+
+    /// Make `id` the active agent: save the current agent's layout, restore (or create) `id`'s.
+    /// Each agent's workspace is its own tiled tree — switching swaps the whole main area.
+    async fn activate(&mut self, id: AgentId, sink: &mut Sink) -> Result<()> {
+        self.swap_to_agent(id);
         self.reconcile(sink).await
+    }
+
+    /// The pure state change behind [`activate`]: save the current agent's layout, restore (or
+    /// create) `id`'s, and ensure its primary terminal is shown.
+    fn swap_to_agent(&mut self, id: AgentId) {
+        if self.active_agent != Some(id) {
+            if let Some(prev) = self.active_agent {
+                self.trees.insert(prev, std::mem::take(&mut self.tree));
+            }
+            self.tree = self.trees.remove(&id).unwrap_or_default();
+            self.active_agent = Some(id);
+        }
+        // First time (or after its panes were all closed): show the agent's primary terminal.
+        if self.tree.is_empty() {
+            if let Some(primary) = self
+                .agents
+                .iter()
+                .find(|a| a.id == id)
+                .map(|a| a.primary_terminal)
+            {
+                self.terminals.insert(primary, id);
+                self.tree.open(primary);
+            }
+        }
+        self.focus = Focus::Panes;
     }
 
     async fn key_pane(&mut self, key: KeyEvent, sink: &mut Sink) -> Result<Flow> {
@@ -495,7 +532,19 @@ impl App {
             KeyCode::Char('%') => self.split(Axis::LeftRight, sink).await?,
             KeyCode::Char('"') => self.split(Axis::TopBottom, sink).await?,
             KeyCode::Char('x') => {
+                let closed = self.tree.focused_payload();
                 self.tree.close();
+                // Closing a shell pane kills that shell; closing the primary just stops viewing
+                // it (the agent keeps running and reopens later). Reconcile only detaches.
+                if let Some(t) = closed {
+                    if !self.is_primary(t) {
+                        sink.send(ClientMsg::CloseTerminal { terminal: t }).await?;
+                        self.terminals.remove(&t);
+                        self.parsers.remove(&t);
+                        self.attached.remove(&t);
+                        self.passthrough.remove(&t);
+                    }
+                }
                 if self.tree.is_empty() {
                     self.focus = Focus::Sidebar;
                 }
@@ -920,8 +969,10 @@ impl App {
         }
     }
 
-    /// Attach/detach/resize terminals to match what the panes now show. A pane that leaves the
-    /// layout is detached (primary — agent keeps running) or closed (shell — killed).
+    /// Attach/detach/resize terminals to match the **active** agent's layout. Terminals that
+    /// aren't currently shown (another agent's workspace, or a just-hidden pane) are **detached**,
+    /// not closed — they keep running headless in the daemon and restore when you switch back.
+    /// Explicit closes (a shell pane via `Ctrl+B x`, a delete, an exit) kill terminals elsewhere.
     async fn reconcile(&mut self, sink: &mut Sink) -> Result<()> {
         let mut desired: HashMap<TerminalId, Size> = HashMap::new();
         for place in self.tree.layout(self.area) {
@@ -951,16 +1002,11 @@ impl App {
             .copied()
             .collect();
         for terminal in gone {
-            if self.is_primary(terminal) {
-                sink.send(ClientMsg::Detach { terminal }).await?;
-            } else {
-                sink.send(ClientMsg::CloseTerminal { terminal }).await?;
-            }
+            // Just stop streaming — the terminal belongs to a saved layout (or was explicitly
+            // closed/killed already). Keep the terminal→agent mapping + passthrough for restore.
+            sink.send(ClientMsg::Detach { terminal }).await?;
             self.attached.remove(&terminal);
             self.parsers.remove(&terminal);
-            self.terminals.remove(&terminal);
-
-            self.passthrough.remove(&terminal);
         }
         Ok(())
     }
@@ -1560,6 +1606,49 @@ mod tests {
         assert_eq!(app.scroll_offset, 0);
         app.key_scroll(key(KeyCode::Char('q')), t);
         assert!(app.scroll_mode.is_none());
+    }
+
+    fn agent_info(primary: TerminalId) -> AgentInfo {
+        AgentInfo {
+            id: AgentId::new(),
+            repo: amux_core::agent::RepoId::from_canonical_path(std::path::Path::new("/r")),
+            name: "a".into(),
+            branch: "b".into(),
+            state: AgentState::Working,
+            last_activity: Utc::now(),
+            unread: false,
+            primary_terminal: primary,
+        }
+    }
+
+    #[test]
+    fn each_agent_keeps_its_own_workspace() {
+        let mut app = App::new(100, 40);
+        let (pa, pb) = (TerminalId::new(), TerminalId::new());
+        let a = agent_info(pa);
+        let b = agent_info(pb);
+        let (ida, idb) = (a.id, b.id);
+        app.agents = vec![a, b];
+
+        // Open A → its primary shows; split off a shell in A's workspace.
+        app.swap_to_agent(ida);
+        assert_eq!(app.tree.payloads(), vec![pa]);
+        let sh = TerminalId::new();
+        app.terminals.insert(sh, ida);
+        app.tree.split(Axis::LeftRight);
+        app.tree.open(sh);
+        assert_eq!(app.tree.payloads().len(), 2);
+
+        // Switch to B → the main area is B's primary only; A's terminals are not present.
+        app.swap_to_agent(idb);
+        assert_eq!(app.tree.payloads(), vec![pb]);
+        assert!(!app.tree.payloads().contains(&pa));
+
+        // Switch back to A → its two-pane split (primary + shell) is restored.
+        app.swap_to_agent(ida);
+        let payloads = app.tree.payloads();
+        assert_eq!(payloads.len(), 2);
+        assert!(payloads.contains(&pa) && payloads.contains(&sh));
     }
 
     #[test]
