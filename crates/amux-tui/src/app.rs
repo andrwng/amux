@@ -251,48 +251,47 @@ impl App {
         self.agents.iter().any(|a| a.primary_terminal == terminal)
     }
 
-    /// Split the main area into the pane region (top) and, when minis are open, the minis row
-    /// (a band at the bottom). With no minis, panes get the whole area.
+    /// The pane region (always the **full** main area — panes keep their whole rectangle) and, when
+    /// minis are open, the band they **float over** at the bottom. Navigation treats the minis as
+    /// the row below the panes even though visually they overlay, not displace, them.
     fn regions(&self) -> (Rect, Option<Rect>) {
         if self.minis.is_empty() || self.minis_hidden {
             return (self.area, None);
         }
         let mini_h = (self.area.height / 2).clamp(3, MINI_ROWS);
-        let pane_h = self.area.height.saturating_sub(mini_h).max(1);
-        let panes = Rect::new(self.area.x, self.area.y, self.area.width, pane_h);
-        let minis = Rect::new(self.area.x, self.area.y + pane_h, self.area.width, mini_h);
-        (panes, Some(minis))
+        let minis = Rect::new(
+            self.area.x,
+            self.area.y + self.area.height.saturating_sub(mini_h),
+            self.area.width,
+            mini_h,
+        );
+        (self.area, Some(minis))
     }
 
-    /// The rectangle for each mini, left-to-right. Minimized minis get a narrow status strip; the
-    /// rest share the remaining width; the last cell absorbs the remainder to fill the row.
+    /// The rectangle for each mini: discrete fixed-width windows floating in the **bottom-right**
+    /// of `area`, laid out left-to-right (newest in the corner). Minimized minis get a narrow
+    /// status strip. The group is right-anchored; if it would overrun the left edge it's clamped.
     fn mini_rects(&self, area: Rect) -> Vec<Rect> {
-        let n = self.minis.len();
-        if n == 0 {
-            return Vec::new();
-        }
+        const MINI_W: u16 = 44;
         const MIN_W: u16 = 12;
-        let mins = self
+        let widths: Vec<u16> = self
             .minis
             .iter()
-            .filter(|a| self.minimized.contains(a))
-            .count() as u16;
-        let expanded = n as u16 - mins;
-        let remaining = area.width.saturating_sub(mins * MIN_W);
-        let exp_w = remaining.checked_div(expanded).unwrap_or(0).max(1);
-        let mut x = area.x;
-        let right = area.x + area.width;
-        self.minis
-            .iter()
-            .enumerate()
-            .map(|(i, agent)| {
-                let w = if i == n - 1 {
-                    right.saturating_sub(x) // last fills the row exactly
-                } else if self.minimized.contains(agent) {
+            .map(|a| {
+                if self.minimized.contains(a) {
                     MIN_W
                 } else {
-                    exp_w
-                };
+                    MINI_W
+                }
+            })
+            .collect();
+        let total: u16 = widths.iter().sum();
+        let right = area.x + area.width;
+        let mut x = right.saturating_sub(total).max(area.x);
+        widths
+            .iter()
+            .map(|&w| {
+                let w = w.min(right.saturating_sub(x)); // clip against the right edge
                 let rect = Rect::new(x, area.y, w, area.height);
                 x += w;
                 rect
