@@ -15,6 +15,7 @@ use crossterm::event::{
 };
 use futures::stream::SplitSink;
 use futures::{SinkExt, StreamExt};
+use ratatui::buffer::Buffer;
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
@@ -46,6 +47,16 @@ enum Row {
 enum Focus {
     Sidebar,
     Panes,
+}
+
+/// A mouse text selection isolated to one pane: anchor + head in screen (col,row) coords, clamped
+/// to the pane's inner area. amux draws and copies this itself, so it never spills across panes.
+#[derive(Clone, Copy)]
+struct Selection {
+    terminal: TerminalId,
+    inner: Rect,
+    anchor: (u16, u16),
+    head: (u16, u16),
 }
 
 /// Which field the two-field "new agent in a repo by path" prompt is editing.
@@ -159,6 +170,8 @@ struct App {
     /// scrollback the view is. `None` = live at the bottom.
     scroll_mode: Option<TerminalId>,
     scroll_offset: usize,
+    /// The active mouse selection (drag in progress or last completed), if any.
+    selection: Option<Selection>,
     /// Branch buffer (both `n` and `N`); repo-path buffer + focused field (`N` only).
     create_buf: String,
     dir_buf: String,
@@ -192,6 +205,7 @@ impl App {
             resize_mode: false,
             scroll_mode: None,
             scroll_offset: 0,
+            selection: None,
             create_buf: String::new(),
             dir_buf: String::new(),
             create_field: Field::Dir,
@@ -333,10 +347,11 @@ impl App {
         if is_ctrl(key, 'q') {
             return Ok(Flow::Quit);
         }
-        // Any keystroke dismisses a lingering banner (it still performs its action).
+        // Any keystroke dismisses a lingering banner + selection highlight (still acts).
         if self.input == InputMode::Normal {
             self.status.clear();
             self.info.clear();
+            self.selection = None;
         }
         match self.input {
             InputMode::Creating => return self.key_creating(key, sink).await,
@@ -704,19 +719,57 @@ impl App {
     /// Route a mouse event to the pane under the cursor: left-click focuses it; the wheel is
     /// forwarded to an app that wants the mouse (Claude/vim/less), else it scrolls amux's own
     /// scrollback for that pane. Events over the sidebar are ignored.
-    async fn on_mouse(&mut self, me: MouseEvent, sink: &mut Sink) -> Result<()> {
+    async fn on_mouse(&mut self, me: MouseEvent, _sink: &mut Sink) -> Result<()> {
+        // Drag/release drive the active selection, using its own pane — independent of what's now
+        // under the cursor (so dragging past the pane edge still works).
+        match me.kind {
+            MouseEventKind::Drag(MouseButton::Left) => {
+                if let Some(sel) = &mut self.selection {
+                    sel.head = clamp_to(sel.inner, me.column, me.row);
+                }
+                return Ok(());
+            }
+            MouseEventKind::Up(MouseButton::Left) => {
+                if let Some(text) = self.selection_text() {
+                    if !text.trim().is_empty() {
+                        copy_to_clipboard(&text);
+                        self.info = format!("copied {} chars to clipboard", text.chars().count());
+                    }
+                }
+                return Ok(());
+            }
+            _ => {}
+        }
+
         let Some((terminal, inner)) = self.pane_at(me.column, me.row) else {
             return Ok(());
         };
         match me.kind {
-            MouseEventKind::Down(MouseButton::Left) if self.tree.focus_payload(terminal) => {
-                self.focus = Focus::Panes;
+            MouseEventKind::Down(MouseButton::Left) => {
+                if self.tree.focus_payload(terminal) {
+                    self.focus = Focus::Panes;
+                }
+                // Start a pane-isolated selection — unless a full-screen mouse app owns the mouse.
+                if self.on_alternate_screen(terminal) && self.app_wants_mouse(terminal) {
+                    self.selection = None;
+                } else {
+                    let p = clamp_to(inner, me.column, me.row);
+                    self.selection = Some(Selection {
+                        terminal,
+                        inner,
+                        anchor: p,
+                        head: p,
+                    });
+                }
             }
             MouseEventKind::ScrollUp | MouseEventKind::ScrollDown => {
                 let up = matches!(me.kind, MouseEventKind::ScrollUp);
-                if self.app_wants_mouse(terminal) {
+                // Real-terminal rule: a full-screen app on the alternate screen (vim/less/htop)
+                // owns the wheel; the normal buffer (a shell, or inline Claude whose transcript
+                // lives in scrollback) scrolls amux's own history.
+                if self.on_alternate_screen(terminal) && self.app_wants_mouse(terminal) {
                     if let Some(bytes) = self.encode_wheel(terminal, up, me.column, me.row, inner) {
-                        sink.send(ClientMsg::Input { terminal, bytes }).await?;
+                        _sink.send(ClientMsg::Input { terminal, bytes }).await?;
                     }
                 } else {
                     self.wheel_scroll(terminal, up);
@@ -725,6 +778,40 @@ impl App {
             _ => {}
         }
         Ok(())
+    }
+
+    /// The selected text, read from the pane's visible screen (reading order, trailing space
+    /// trimmed, newline between rows). `None` if there's no selection.
+    fn selection_text(&self) -> Option<String> {
+        let sel = self.selection?;
+        let screen = self.parsers.get(&sel.terminal)?.screen();
+        let (start, end) = ordered(sel.anchor, sel.head);
+        let right = sel.inner.x + sel.inner.width.saturating_sub(1);
+        let mut out = String::new();
+        for y in start.1..=end.1 {
+            let c0 = if y == start.1 { start.0 } else { sel.inner.x };
+            let c1 = if y == end.1 { end.0 } else { right };
+            let mut line = String::new();
+            for x in c0..=c1 {
+                let contents = screen
+                    .cell(y - sel.inner.y, x - sel.inner.x)
+                    .map(|c| c.contents())
+                    .unwrap_or_default();
+                if contents.is_empty() {
+                    line.push(' ');
+                } else {
+                    line.push_str(contents);
+                }
+            }
+            while line.ends_with(' ') {
+                line.pop();
+            }
+            out.push_str(&line);
+            if y != end.1 {
+                out.push('\n');
+            }
+        }
+        Some(out)
     }
 
     /// The terminal (and its inner content area) under screen point `(col, row)`, if any pane is.
@@ -750,6 +837,14 @@ impl App {
         self.parsers
             .get(&terminal)
             .is_some_and(|p| p.screen().mouse_protocol_mode() != vt100::MouseProtocolMode::None)
+    }
+
+    /// Whether the app in `terminal` is drawing on the alternate screen (a full-screen TUI with no
+    /// scrollback of its own).
+    fn on_alternate_screen(&self, terminal: TerminalId) -> bool {
+        self.parsers
+            .get(&terminal)
+            .is_some_and(|p| p.screen().alternate_screen())
     }
 
     /// Encode a wheel tick as a mouse report in the app's requested encoding, with coordinates
@@ -1025,6 +1120,74 @@ fn ctrl_dir(key: KeyEvent) -> Option<Dir> {
 }
 
 /// Map a resize key to a direction — accepts hjkl, HJKL, and the arrow keys.
+/// Clamp a screen point into a rect's cell range.
+fn clamp_to(inner: Rect, col: u16, row: u16) -> (u16, u16) {
+    let x = col.clamp(inner.x, inner.x + inner.width.saturating_sub(1));
+    let y = row.clamp(inner.y, inner.y + inner.height.saturating_sub(1));
+    (x, y)
+}
+
+/// Order two points in reading order (top-to-bottom, then left-to-right).
+fn ordered(a: (u16, u16), b: (u16, u16)) -> ((u16, u16), (u16, u16)) {
+    if (a.1, a.0) <= (b.1, b.0) {
+        (a, b)
+    } else {
+        (b, a)
+    }
+}
+
+/// Reverse-video the selected cells of `sel` in the frame buffer (drawn over the pane's content).
+fn highlight_selection(buf: &mut Buffer, sel: Selection) {
+    let (start, end) = ordered(sel.anchor, sel.head);
+    let right = sel.inner.x + sel.inner.width.saturating_sub(1);
+    for y in start.1..=end.1 {
+        let c0 = if y == start.1 { start.0 } else { sel.inner.x };
+        let c1 = if y == end.1 { end.0 } else { right };
+        for x in c0..=c1 {
+            if let Some(cell) = buf.cell_mut((x, y)) {
+                cell.set_style(Style::default().add_modifier(Modifier::REVERSED));
+            }
+        }
+    }
+}
+
+/// Copy `text` to the system clipboard via the OSC 52 terminal escape (dependency-free, works over
+/// SSH; needs a terminal that honors OSC 52 — iTerm2, kitty, wezterm, tmux with `set-clipboard`).
+fn copy_to_clipboard(text: &str) {
+    use std::io::Write;
+    let seq = format!("\x1b]52;c;{}\x07", base64_encode(text.as_bytes()));
+    let mut out = std::io::stdout();
+    let _ = out.write_all(seq.as_bytes());
+    let _ = out.flush();
+}
+
+/// Minimal standard-alphabet base64 (no padding omitted) — avoids a dependency for OSC 52.
+fn base64_encode(input: &[u8]) -> String {
+    const ALPHABET: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let mut out = String::with_capacity(input.len().div_ceil(3) * 4);
+    for chunk in input.chunks(3) {
+        let b = [
+            chunk[0],
+            chunk.get(1).copied().unwrap_or(0),
+            chunk.get(2).copied().unwrap_or(0),
+        ];
+        let n = (u32::from(b[0]) << 16) | (u32::from(b[1]) << 8) | u32::from(b[2]);
+        out.push(ALPHABET[(n >> 18) as usize & 63] as char);
+        out.push(ALPHABET[(n >> 12) as usize & 63] as char);
+        out.push(if chunk.len() > 1 {
+            ALPHABET[(n >> 6) as usize & 63] as char
+        } else {
+            '='
+        });
+        out.push(if chunk.len() > 2 {
+            ALPHABET[n as usize & 63] as char
+        } else {
+            '='
+        });
+    }
+    out
+}
+
 fn resize_dir(code: KeyCode) -> Option<Dir> {
     match code {
         KeyCode::Char('h' | 'H') | KeyCode::Left => Some(Dir::Left),
@@ -1237,6 +1400,12 @@ fn render_panes(frame: &mut Frame, area: Rect, app: &App) {
                 inner,
             ),
         }
+        // Draw the selection highlight on top of this pane's content.
+        if let Some(sel) = app.selection {
+            if Some(sel.terminal) == place.payload {
+                highlight_selection(frame.buffer_mut(), sel);
+            }
+        }
     }
 }
 
@@ -1361,6 +1530,34 @@ mod tests {
         assert_eq!(app.scroll_offset, 0);
         app.key_scroll(key(KeyCode::Char('q')), t);
         assert!(app.scroll_mode.is_none());
+    }
+
+    #[test]
+    fn base64_matches_known_vectors() {
+        assert_eq!(base64_encode(b""), "");
+        assert_eq!(base64_encode(b"f"), "Zg==");
+        assert_eq!(base64_encode(b"fo"), "Zm8=");
+        assert_eq!(base64_encode(b"foo"), "Zm9v");
+        assert_eq!(base64_encode(b"hello"), "aGVsbG8=");
+    }
+
+    #[test]
+    fn selection_extracts_pane_text() {
+        let mut app = App::new(100, 40);
+        let t = TerminalId::new();
+        app.tree.open(t);
+        let mut parser = vt100::Parser::new(6, 20, 100);
+        parser.process(b"alpha\r\nbravo\r\ncharlie\r\n");
+        app.parsers.insert(t, parser);
+        // Pane inner area starting at (1,1): select rows 0..1, from col 0 across the words.
+        let inner = Rect::new(1, 1, 18, 6);
+        app.selection = Some(Selection {
+            terminal: t,
+            inner,
+            anchor: (1, 1), // 'a' of alpha (screen col 1 = pane col 0, row 1 = pane row 0)
+            head: (1 + 4, 1 + 1), // 'o' of bravo (pane row 1, col 4)
+        });
+        assert_eq!(app.selection_text().unwrap(), "alpha\nbravo");
     }
 
     #[test]
