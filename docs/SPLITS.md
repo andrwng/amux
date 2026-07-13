@@ -118,6 +118,12 @@ open of an agent, the client rebuilds its tree from the saved layout and re-atta
 (which kept running headless in the daemon). This covers **client** restarts. `Axis`/`Dir` are
 shared via `amux_core::nav`.
 
+Alongside the layouts, the daemon also persists **which agent is in the main area** (`SetActive`/
+`Active`, proto v12) and the **minis** (`SetMinis`/`Minis`), so a re-attaching client restores its
+whole workspace — the main pane *and* the minis — not just the minis. `Active` is distinct from
+`Focus` (a transient viewed-cell signal cleared on disconnect); it's the durable "what's open in
+the main workspace", replayed on connect after `Layouts` so the client can rebuild the tree.
+
 ## S.5 — Daemon-restart persistence (DONE, `~/.amux/state.json`)
 
 The daemon writes its **durable** state — repos (as repo+base paths), agents (id, repo, branch,

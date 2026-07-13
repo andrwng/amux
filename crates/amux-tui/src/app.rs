@@ -339,6 +339,16 @@ impl App {
                     .collect();
                 self.reconcile(sink).await?;
             }
+            DaemonMsg::Active(active) => {
+                // Restore the main pane: reopen the agent that was active. Layouts arrived first,
+                // so swap_to_agent can rebuild its tree from a saved layout.
+                if let Some(id) = active {
+                    if self.active_agent != Some(id) && self.agents.iter().any(|a| a.id == id) {
+                        self.swap_to_agent(id);
+                        self.reconcile(sink).await?;
+                    }
+                }
+            }
             DaemonMsg::AgentAdded(info) => {
                 // Select the freshly-created agent so the next Enter opens it.
                 let id = info.id;
@@ -1291,6 +1301,7 @@ impl App {
             .await?;
         }
         sink.send(ClientMsg::SetMinis(self.minis.clone())).await?;
+        sink.send(ClientMsg::SetActive(self.active_agent)).await?;
         Ok(())
     }
 

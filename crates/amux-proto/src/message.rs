@@ -100,6 +100,10 @@ pub enum ClientMsg {
     },
     /// Persist which agents are open as minis (left-to-right), so they survive closing the TUI.
     SetMinis(Vec<AgentId>),
+    /// Persist which agent occupies the **main area** (`None` = empty), so a re-attaching client
+    /// restores its main pane — not just its minis. Distinct from `Focus` (a transient viewed-cell
+    /// signal cleared on disconnect); this is the durable "what's open in the main workspace".
+    SetActive(Option<AgentId>),
     /// Start streaming a terminal into a pane (snapshot then live output).
     Attach { terminal: TerminalId, size: Size },
     /// Stop streaming a terminal (its pane closed / was replaced).
@@ -128,6 +132,8 @@ pub enum DaemonMsg {
     Layouts(Vec<(AgentId, Layout)>),
     /// The persisted minis list (on connect) so a re-attaching client restores its minis.
     Minis(Vec<AgentId>),
+    /// The persisted active agent (on connect) so a re-attaching client restores its main pane.
+    Active(Option<AgentId>),
     /// A new agent appeared.
     AgentAdded(AgentInfo),
     /// An agent was deleted.

@@ -86,6 +86,10 @@ async fn handshake(socket: &Path) -> Client {
         Some(Ok(DaemonMsg::Minis(_))) => {}
         other => panic!("expected Minis, got {other:?}"),
     }
+    match client.next().await {
+        Some(Ok(DaemonMsg::Active(_))) => {}
+        other => panic!("expected Active, got {other:?}"),
+    }
     client
 }
 
@@ -871,7 +875,9 @@ async fn durable_state_survives_a_daemon_restart() {
         let registry = Registry::with_state(adapter, state_path.clone());
         let repo_id = registry.register(worktrees).id;
         let info = registry.create(repo_id, "feature").unwrap();
-        registry.set_minis(vec![info.id]);
+        let mini = registry.create(repo_id, "mini").unwrap();
+        registry.set_minis(vec![mini.id]);
+        registry.set_active(Some(info.id));
         info
     };
     assert!(state_path.exists(), "state.json is written");
@@ -882,9 +888,11 @@ async fn durable_state_survives_a_daemon_restart() {
     registry.load_state();
 
     let infos = registry.infos();
-    assert_eq!(infos.len(), 1, "the agent reloaded");
-    let loaded = &infos[0];
-    assert_eq!(loaded.id, info.id);
+    assert_eq!(infos.len(), 2, "both agents reloaded");
+    let loaded = infos
+        .iter()
+        .find(|a| a.id == info.id)
+        .expect("feature agent");
     assert_eq!(loaded.branch, "feature");
     assert_eq!(
         loaded.primary_terminal, info.primary_terminal,
@@ -895,7 +903,13 @@ async fn durable_state_survives_a_daemon_restart() {
         "reloaded agents are suspended until opened, got {:?}",
         loaded.state
     );
-    assert_eq!(registry.minis(), vec![info.id], "the mini reloaded");
+    assert_eq!(
+        registry.active(),
+        Some(info.id),
+        "the active agent reloaded"
+    );
+    assert_eq!(registry.minis().len(), 1, "the mini reloaded");
+    assert_ne!(registry.minis()[0], info.id, "the mini is the other agent");
 
     // The primary is dormant until attached; resuming revives its session in place, reusing the id.
     assert!(registry.session(info.primary_terminal).is_none());

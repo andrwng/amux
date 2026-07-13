@@ -105,6 +105,9 @@ struct State {
     layouts: HashMap<AgentId, amux_proto::Layout>,
     /// Which agents are open as minis (left-to-right) — replayed to a re-attaching client.
     minis: Vec<AgentId>,
+    /// Which agent occupies the main area — replayed so a re-attaching client restores its main
+    /// pane. Durable (unlike `focused`, which is the transient viewed-cell for unread).
+    active: Option<AgentId>,
 }
 
 /// The durable slice of the daemon's state, written to `state.json` so agents/repos/minis survive
@@ -116,6 +119,9 @@ struct PersistedState {
     agents: Vec<PersistedAgent>,
     /// Which agents were open as minis, in order.
     minis: Vec<AgentId>,
+    /// Which agent occupied the main area (restored into the client's main pane on reconnect).
+    #[serde(default)]
+    active: Option<AgentId>,
 }
 
 /// A repo as `repo` + `base` paths, enough to rebuild its [`WorktreeService`] verbatim.
@@ -282,14 +288,40 @@ impl Registry {
             .collect()
     }
 
-    /// Persist which agents are open as minis (replayed to a re-attaching client).
+    /// Persist which agents are open as minis (replayed to a re-attaching client). Saves only on a
+    /// real change, so the client re-sending it on every reconcile doesn't churn the disk.
     pub fn set_minis(&self, minis: Vec<AgentId>) {
-        self.state.lock().unwrap().minis = minis;
-        self.save();
+        let changed = {
+            let mut state = self.state.lock().unwrap();
+            let changed = state.minis != minis;
+            state.minis = minis;
+            changed
+        };
+        if changed {
+            self.save();
+        }
     }
 
     pub fn minis(&self) -> Vec<AgentId> {
         self.state.lock().unwrap().minis.clone()
+    }
+
+    /// Persist which agent is in the main area (replayed to a re-attaching client so it restores
+    /// its main pane). Saves only on a real change (same anti-churn reasoning as `set_minis`).
+    pub fn set_active(&self, active: Option<AgentId>) {
+        let changed = {
+            let mut state = self.state.lock().unwrap();
+            let changed = state.active != active;
+            state.active = active;
+            changed
+        };
+        if changed {
+            self.save();
+        }
+    }
+
+    pub fn active(&self) -> Option<AgentId> {
+        self.state.lock().unwrap().active
     }
 
     /// Serialize durable state (repos/agents/minis) to `state.json` via an atomic temp+rename.
@@ -326,6 +358,7 @@ impl Registry {
                     })
                     .collect(),
                 minis: state.minis.clone(),
+                active: state.active,
             }
         };
         if let Err(e) = write_atomic(path, &snapshot) {
@@ -417,6 +450,10 @@ impl Registry {
             .into_iter()
             .filter(|id| state.agents.contains_key(id))
             .collect();
+        // Restore the active agent only if it survived (and isn't also a mini).
+        state.active = persisted
+            .active
+            .filter(|id| state.agents.contains_key(id) && !state.minis.contains(id));
     }
 
     /// Ensure `terminal`'s agent is live, resuming a suspended primary if needed. Called when a
@@ -779,6 +816,9 @@ impl Registry {
             state.agents.remove(&id);
             state.layouts.remove(&id);
             state.minis.retain(|a| *a != id);
+            if state.active == Some(id) {
+                state.active = None;
+            }
             let terminal_ids: Vec<TerminalId> = state
                 .terminals
                 .iter()
