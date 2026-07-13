@@ -4,7 +4,7 @@
 //! into/out of the sidebar; `Ctrl+B` is a prefix (`%`/`"` split, `x` close, `r` resize). `n`
 //! creates an agent in the selected repo, `N` in a repo given by path. `Ctrl+Q` quits.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 
 use anyhow::Result;
@@ -177,6 +177,10 @@ struct App {
     /// Agents shown as **minis** — a spatial row of small live terminals below the main panes,
     /// left-to-right. Each shows that agent's primary terminal.
     minis: Vec<AgentId>,
+    /// Minimized minis: collapsed to a status-only strip (terminal detached), still in the row.
+    minimized: HashSet<AgentId>,
+    /// Peek: temporarily hide the whole minis row to see the full main area.
+    minis_hidden: bool,
     /// Where focus was before it entered the minis row, so closing a mini can return there.
     focus_return: Focus,
     /// The agent last reported to the daemon as "being viewed" (drives read/unread).
@@ -221,6 +225,8 @@ impl App {
             passthrough: HashMap::new(),
             focus: Focus::Sidebar,
             minis: Vec::new(),
+            minimized: HashSet::new(),
+            minis_hidden: false,
             focus_return: Focus::Sidebar,
             focus_agent: None,
             input: InputMode::Normal,
@@ -248,7 +254,7 @@ impl App {
     /// Split the main area into the pane region (top) and, when minis are open, the minis row
     /// (a band at the bottom). With no minis, panes get the whole area.
     fn regions(&self) -> (Rect, Option<Rect>) {
-        if self.minis.is_empty() {
+        if self.minis.is_empty() || self.minis_hidden {
             return (self.area, None);
         }
         let mini_h = (self.area.height / 2).clamp(3, MINI_ROWS);
@@ -258,23 +264,38 @@ impl App {
         (panes, Some(minis))
     }
 
-    /// The rectangle for each mini, dividing `area` into equal-width cells left-to-right.
+    /// The rectangle for each mini, left-to-right. Minimized minis get a narrow status strip; the
+    /// rest share the remaining width; the last cell absorbs the remainder to fill the row.
     fn mini_rects(&self, area: Rect) -> Vec<Rect> {
-        let n = self.minis.len() as u16;
+        let n = self.minis.len();
         if n == 0 {
             return Vec::new();
         }
-        let w = (area.width / n).max(1);
-        (0..n)
-            .map(|i| {
-                let x = area.x + i * w;
-                // The last cell absorbs any remainder so the row fills the width exactly.
-                let width = if i == n - 1 {
-                    area.width.saturating_sub(i * w)
+        const MIN_W: u16 = 12;
+        let mins = self
+            .minis
+            .iter()
+            .filter(|a| self.minimized.contains(a))
+            .count() as u16;
+        let expanded = n as u16 - mins;
+        let remaining = area.width.saturating_sub(mins * MIN_W);
+        let exp_w = remaining.checked_div(expanded).unwrap_or(0).max(1);
+        let mut x = area.x;
+        let right = area.x + area.width;
+        self.minis
+            .iter()
+            .enumerate()
+            .map(|(i, agent)| {
+                let w = if i == n - 1 {
+                    right.saturating_sub(x) // last fills the row exactly
+                } else if self.minimized.contains(agent) {
+                    MIN_W
                 } else {
-                    w
+                    exp_w
                 };
-                Rect::new(x, area.y, width, area.height)
+                let rect = Rect::new(x, area.y, w, area.height);
+                x += w;
+                rect
             })
             .collect()
     }
@@ -329,6 +350,7 @@ impl App {
                 // Drop the agent's saved workspace + any mini; if it was active, go back to nothing.
                 self.trees.remove(&id);
                 self.minis.retain(|a| *a != id);
+                self.minimized.remove(&id);
                 if self.active_agent == Some(id) {
                     self.active_agent = None;
                 }
@@ -593,7 +615,8 @@ impl App {
         if i >= self.minis.len() {
             return Ok(());
         }
-        self.minis.remove(i);
+        let agent = self.minis.remove(i);
+        self.minimized.remove(&agent);
         self.focus = if self.minis.is_empty() {
             self.focus_return
         } else {
@@ -635,6 +658,7 @@ impl App {
     fn swap_to_agent(&mut self, id: AgentId) {
         // An agent shown in the main area isn't also a mini (its terminal can't be two sizes).
         self.minis.retain(|a| *a != id);
+        self.minimized.remove(&id);
         if self.active_agent != Some(id) {
             if let Some(prev) = self.active_agent {
                 self.trees.insert(prev, std::mem::take(&mut self.tree));
@@ -691,6 +715,33 @@ impl App {
             KeyCode::Char('x') if matches!(self.focus, Focus::Mini(_)) => {
                 if let Focus::Mini(i) = self.focus {
                     self.close_mini(i, sink).await?;
+                }
+            }
+            // `Ctrl+B z`: peek — hide/show the whole minis row to see the full main area.
+            KeyCode::Char('z') if !self.minis.is_empty() => {
+                self.minis_hidden = !self.minis_hidden;
+                if self.minis_hidden && matches!(self.focus, Focus::Mini(_)) {
+                    self.focus = self.focus_return;
+                }
+                self.reconcile(sink).await?;
+            }
+            // `Ctrl+B -`: minimize/restore the focused mini (keeps it visible with status only).
+            KeyCode::Char('-') if matches!(self.focus, Focus::Mini(_)) => {
+                if let Focus::Mini(i) = self.focus {
+                    if let Some(agent) = self.minis.get(i).copied() {
+                        if !self.minimized.remove(&agent) {
+                            self.minimized.insert(agent);
+                        }
+                        self.reconcile(sink).await?;
+                    }
+                }
+            }
+            // `Ctrl+B Enter`: promote the focused mini into the main area.
+            KeyCode::Enter if matches!(self.focus, Focus::Mini(_)) => {
+                if let Focus::Mini(i) = self.focus {
+                    if let Some(agent) = self.minis.get(i).copied() {
+                        self.activate(agent, sink).await?;
+                    }
                 }
             }
             KeyCode::Char('x') => {
@@ -1132,6 +1183,7 @@ impl App {
                 .minis
                 .iter()
                 .enumerate()
+                .filter(|(_, agent)| !self.minimized.contains(agent)) // minimized = status only
                 .filter_map(|(i, agent)| {
                     let t = self
                         .agents
@@ -1512,6 +1564,19 @@ fn render_minis(frame: &mut Frame, area: Rect, app: &App) {
             .title(title);
         let inner = block.inner(*rect);
         frame.render_widget(block, *rect);
+        // Minimized minis show only their status (the terminal is detached to save bandwidth).
+        if app.minimized.contains(agent_id) {
+            let unread = by_id.get(agent_id).is_some_and(|a| a.unread);
+            let dot = if unread { "\u{2022} " } else { "" };
+            frame.render_widget(
+                Paragraph::new(Line::from(Span::styled(
+                    format!(" {dot}{glyph}"),
+                    Style::default().fg(color),
+                ))),
+                inner,
+            );
+            continue;
+        }
         match app.mini_terminal(i).and_then(|t| app.parsers.get(&t)) {
             Some(parser) => frame.render_widget(PseudoTerminal::new(parser.screen()), inner),
             None => frame.render_widget(
@@ -1763,7 +1828,7 @@ fn render_status(frame: &mut Frame, area: Rect, app: &App) {
                 " ctrl+hjkl move \u{b7} ctrl+b %/\"/x/r \u{b7} type to talk \u{b7} ctrl+q quit"
             }
             Focus::Mini(_) => {
-                " mini \u{b7} ctrl+hjkl move \u{b7} ctrl+b x close \u{b7} type to talk \u{b7} ctrl+q quit"
+                " mini \u{b7} ctrl+hjkl \u{b7} ctrl+b: enter promote \u{b7} - min \u{b7} z peek \u{b7} x close"
             }
         };
         (hint.to_string(), Style::default().fg(Color::DarkGray))
