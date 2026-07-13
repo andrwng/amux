@@ -245,18 +245,21 @@ fn dirty_at(path: &Path) -> Result<usize> {
 /// The hook settings file amux writes into each worktree (relative to its root).
 const AMUX_SETTINGS_PATH: &str = ".claude/settings.local.json";
 
-/// `~/.amux/worktrees/<basename>-<hash>` — stable per repo, disambiguated by path hash.
+/// `<amux_home>/worktrees/<basename>-<hash>` — stable per repo, disambiguated by path hash.
+/// The amux home defaults to `~/.amux` but may be relocated via `config.toml` (see
+/// `crate::paths::amux_home`).
 fn global_base(repo: &Path) -> Result<PathBuf> {
-    let home = directories::BaseDirs::new()
-        .context("cannot determine home directory")?
-        .home_dir()
-        .to_path_buf();
+    Ok(worktrees_base(&crate::paths::amux_home()?, repo))
+}
+
+/// Pure: a repo's worktree base under a given amux home — `<amux_home>/worktrees/<basename>-<hash>`.
+fn worktrees_base(amux_home: &Path, repo: &Path) -> PathBuf {
     let name = repo
         .file_name()
         .map(|n| n.to_string_lossy().to_string())
         .unwrap_or_else(|| "repo".to_string());
     let key = format!("{name}-{}", fnv1a(&repo.to_string_lossy()));
-    Ok(home.join(".amux").join("worktrees").join(key))
+    amux_home.join("worktrees").join(key)
 }
 
 /// FNV-1a 32-bit — a tiny, version-stable hash (unlike `DefaultHasher`) for directory naming.
@@ -393,12 +396,21 @@ mod tests {
     }
 
     #[test]
-    fn global_base_is_stable_and_repo_specific() {
-        let a1 = global_base(Path::new("/home/u/proj")).unwrap();
-        let a2 = global_base(Path::new("/home/u/proj")).unwrap();
-        let b = global_base(Path::new("/home/u/other")).unwrap();
+    fn worktrees_base_is_stable_and_repo_specific() {
+        let home = Path::new("/home/u/.amux");
+        let a1 = worktrees_base(home, Path::new("/home/u/proj"));
+        let a2 = worktrees_base(home, Path::new("/home/u/proj"));
+        let b = worktrees_base(home, Path::new("/home/u/other"));
         assert_eq!(a1, a2, "same repo path → same base");
         assert_ne!(a1, b, "different repo path → different base");
-        assert!(a1.to_string_lossy().contains(".amux/worktrees/proj-"));
+        assert!(a1.starts_with("/home/u/.amux/worktrees"));
+        assert!(a1.to_string_lossy().contains("/worktrees/proj-"));
+    }
+
+    #[test]
+    fn worktrees_base_follows_the_configured_home() {
+        // A relocated amux home places worktrees under it, not under ~/.amux.
+        let base = worktrees_base(Path::new("/home/u/xfs2/.amux"), Path::new("/home/u/proj"));
+        assert!(base.starts_with("/home/u/xfs2/.amux/worktrees"));
     }
 }

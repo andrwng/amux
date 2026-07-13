@@ -9,6 +9,7 @@ description = "Pure domain logic for amux: agent state machine, adapters, worktr
 anyhow = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
+toml = { workspace = true }
 uuid = { workspace = true }
 chrono = { workspace = true }
 directories = { workspace = true }

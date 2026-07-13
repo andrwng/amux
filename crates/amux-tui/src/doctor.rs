@@ -9,6 +9,20 @@ use amux_core::agent::RepoId;
 use amux_proto::{ClientMsg, DaemonMsg};
 
 pub async fn run() -> Result<()> {
+    // Show where amux thinks its home is, so a relocated `root` (config.toml) is easy to verify.
+    // A malformed config surfaces here as an error before we try to reach the daemon.
+    let home = amux_core::paths::amux_home()?;
+    println!("amux home: {}", home.display());
+    if let Some(cfg) = amux_core::config::config_path() {
+        let status = if cfg.exists() {
+            "loaded"
+        } else {
+            "not present, using defaults"
+        };
+        println!("config:    {} ({status})", cfg.display());
+    }
+    println!();
+
     let (mut framed, repo) = crate::client::connect().await?;
     // The daemon derives a repo's id from its canonical path; match that so our report lands.
     let canonical = std::fs::canonicalize(&repo).unwrap_or_else(|_| repo.clone());
