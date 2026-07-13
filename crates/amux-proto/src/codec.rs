@@ -210,6 +210,14 @@ mod tests {
             state: AgentState::Exited { code: Some(0) },
         });
         roundtrip(DaemonMsg::UnreadChanged { id, unread: true });
+        roundtrip(DaemonMsg::TerminalApp {
+            terminal: t,
+            passthrough: true,
+        });
+        roundtrip(DaemonMsg::Navigate {
+            terminal: t,
+            dir: amux_core::nav::Dir::Left,
+        });
         roundtrip(DaemonMsg::DeleteNeedsConfirm {
             id,
             message: "2 uncommitted changes".into(),

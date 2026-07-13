@@ -9,7 +9,22 @@
 
 use serde::{Deserialize, Serialize};
 
-use crate::agent::{AgentEvent, AttentionKind};
+use crate::agent::{AgentEvent, AttentionKind, TerminalId};
+use crate::nav::Dir;
+
+/// A message from inside a pane to the daemon over the mailbox socket — the channel `amux hook`,
+/// `amux nav`, and `amux passthrough` all use. One-shot and fire-and-forget: an in-pane program
+/// (a Claude hook, or the vim navigator plugin) sends one frame and exits, never blocking.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum PaneMessage {
+    /// A Claude Code hook event (status).
+    Hook(HookReport),
+    /// A vim-like program is (or is no longer) the foreground app in `terminal`, so `Ctrl+hjkl`
+    /// should be passed through to it rather than navigating amux panes.
+    Passthrough { terminal: TerminalId, on: bool },
+    /// The in-pane program hit its own edge and is handing navigation back to amux.
+    Nav { terminal: TerminalId, dir: Dir },
+}
 
 /// A Claude Code hook payload, as delivered to the hook command on stdin. Only the fields we act
 /// on are modelled; everything else in the JSON is ignored.

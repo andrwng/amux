@@ -56,6 +56,14 @@ determined by *where focus is* (sidebar = commands; pane = agent input) plus a f
 - **Collision (accepted):** intercepting `Ctrl+hjkl` means the focused agent doesn't receive
   those control codes (`Ctrl+L` clear, `Ctrl+K` kill-line, `Ctrl+J` LF, `Ctrl+H` backspace-ish).
   Right default for a multi-agent tool; escape hatch below. Nav keys are keymap-configurable.
+- **vim-aware passthrough (proto v9):** when the focused pane runs a vim-like app, `Ctrl+hjkl` is
+  passed *through* to it so it can move its own splits, then handed back at the edge — full
+  vim-tmux-navigator parity. The `contrib/amux.vim` plugin is the single integration point: on
+  enter/leave it runs `amux passthrough on/off` (daemon → `TerminalApp`, client caches it and
+  routes `Ctrl+hjkl` to the program); at vim's edge it runs `amux nav <dir>` (daemon relays
+  `Navigate` → client moves focus). Layout/focus stay entirely client-side; the daemon only
+  reports the app kind and relays the nav intent. `AMUX_TERMINAL_ID` + the mailbox socket are
+  injected into every terminal so the plugin can identify its pane.
 
 ### Structure — the `Ctrl+B` prefix (less-frequent commands)
 - `Ctrl+B %` split focused pane left/right · `Ctrl+B "` split top/bottom. **A split opens a new
@@ -66,11 +74,12 @@ determined by *where focus is* (sidebar = commands; pane = agent input) plus a f
 - `Ctrl+B <any Ctrl-key>` → send that literal control key to the focused terminal (the escape
   hatch, e.g. `Ctrl+B Ctrl+L` clears its screen; `Ctrl+B Ctrl+B` sends a literal `Ctrl+B`)
 
-### Resize — a small `hjkl` submode
-`Ctrl+B r` enters resize mode (status bar: `RESIZE — hjkl grow/shrink · esc done`). Then, on the
-focused pane, `l`/`h` widen/narrow and `j`/`k` grow/shrink height, each press one step (~5%),
-by adjusting the ratio of the nearest ancestor split of the matching axis (clamped 0.1–0.9).
-`Esc`/`Enter` exits. Repeatable in-mode so you can nudge quickly — the `hjkl` you like.
+### Resize — `Ctrl+B H/J/K/L` (tmux muscle memory) + a submode
+`Ctrl+B` then **capital `H/J/K/L`** resizes the focused pane one step (~5%) and stays in resize
+mode so you can keep nudging without re-prefixing — matching tmux's `bind -r H/J/K/L resize-pane`.
+`Ctrl+B r` enters the same mode without an initial move. In-mode, both `hjkl` and `HJKL` (and
+arrows) resize by adjusting the nearest ancestor split's ratio (clamped 0.1–0.9); `Esc`/`Enter`
+exits.
 
 ### Sidebar cell (when focused)
 `j`/`k` select · `n` new · `d` delete · `r` resume · `Enter`/`l` open the selected agent into the

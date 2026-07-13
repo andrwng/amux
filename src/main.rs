@@ -35,6 +35,13 @@ enum Command {
     Doctor,
     /// Bridge a Claude Code hook event to the daemon mailbox (invoked by Claude's hooks).
     Hook,
+    /// (internal) Hand pane navigation back to amux from an in-pane program at its edge —
+    /// invoked by the amux-navigator vim plugin. DIRECTION is h/j/k/l.
+    Nav { direction: String },
+    /// (internal) Announce that a vim-like app is (`on`) or is no longer (`off`) the foreground
+    /// program in this pane, so amux knows whether to pass `Ctrl+hjkl` through — invoked by the
+    /// vim plugin on enter/leave.
+    Passthrough { state: String },
 }
 
 fn main() -> anyhow::Result<()> {
@@ -61,6 +68,10 @@ fn main() -> anyhow::Result<()> {
         }
         Some(Command::Doctor) => amux_tui::doctor()?,
         Some(Command::Hook) => amux_daemon::run_hook()?,
+        Some(Command::Nav { direction }) => amux_daemon::run_nav(&direction)?,
+        Some(Command::Passthrough { state }) => {
+            amux_daemon::run_passthrough(state.eq_ignore_ascii_case("on"))?
+        }
     }
     Ok(())
 }

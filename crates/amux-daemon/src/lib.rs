@@ -13,7 +13,7 @@ mod registry;
 mod server;
 
 pub use daemonize::daemonize;
-pub use mailbox::{bind_mailbox, run_hook, serve_mailbox};
+pub use mailbox::{bind_mailbox, run_hook, run_nav, run_passthrough, serve_mailbox};
 pub use registry::Registry;
 pub use server::{bind_or_detect, serve};
 

@@ -6,6 +6,7 @@
 use std::path::PathBuf;
 
 use amux_core::agent::{AgentId, AgentState, RepoId, TerminalId};
+use amux_core::nav::Dir;
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
@@ -107,6 +108,16 @@ pub enum DaemonMsg {
     StateChanged { id: AgentId, state: AgentState },
     /// An agent's inbox unread bit changed (set by a notable event, cleared when you view it).
     UnreadChanged { id: AgentId, unread: bool },
+    /// A terminal's foreground app changed its `Ctrl+hjkl` passthrough state: when `true`, a
+    /// vim-like program is running there and should receive `Ctrl+hjkl` instead of amux
+    /// navigating. Announced by the in-pane navigator plugin via `amux passthrough`.
+    TerminalApp {
+        terminal: TerminalId,
+        passthrough: bool,
+    },
+    /// An in-pane program (at its own edge) is handing navigation back to amux — move focus from
+    /// `terminal` in `dir`. Relayed from `amux nav`.
+    Navigate { terminal: TerminalId, dir: Dir },
     /// Delete was refused because the worktree has uncommitted changes — confirm to force it.
     DeleteNeedsConfirm { id: AgentId, message: String },
     /// Full screen of a terminal as a `contents_formatted()` dump, sent on attach.

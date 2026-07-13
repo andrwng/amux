@@ -60,6 +60,16 @@ impl TerminalId {
     pub fn as_uuid(self) -> Uuid {
         self.0
     }
+
+    /// The full, round-trippable form (hyphenated uuid) — for the `AMUX_TERMINAL_ID` env var.
+    pub fn to_full_string(self) -> String {
+        self.0.to_string()
+    }
+
+    /// Parse the full form produced by [`TerminalId::to_full_string`].
+    pub fn parse(s: &str) -> Option<Self> {
+        Uuid::parse_str(s).ok().map(Self)
+    }
 }
 
 impl Default for TerminalId {

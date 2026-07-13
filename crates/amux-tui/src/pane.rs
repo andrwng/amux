@@ -4,6 +4,10 @@
 
 use ratatui::layout::Rect;
 
+/// The one movement/resize direction, shared with the wire and the mailbox so `amux nav` and a
+/// `Ctrl+h` keypress mean the same thing.
+pub use amux_core::nav::Dir;
+
 pub type PaneId = u64;
 
 /// How a split divides its space.
@@ -13,15 +17,6 @@ pub enum Axis {
     LeftRight,
     /// Children stacked (a horizontal divider) — tmux `"`.
     TopBottom,
-}
-
-/// A movement / resize direction.
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
-pub enum Dir {
-    Left,
-    Right,
-    Up,
-    Down,
 }
 
 enum Node<P> {

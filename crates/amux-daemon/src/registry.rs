@@ -81,6 +81,9 @@ struct Terminal {
     worktree: PathBuf,
     primary: bool,
     session: Option<Arc<Session>>,
+    /// A vim-like app is foreground here, so `Ctrl+hjkl` passes through to it (set via the nav
+    /// plugin's `amux passthrough`).
+    passthrough: bool,
 }
 
 /// A registered repository and its (cheaply cloneable) worktree service.
@@ -264,8 +267,10 @@ impl Registry {
             }
         }
         let worktree = worktrees.create(branch).context("create worktree")?;
-        // The agent id is exported to the CLI's hooks, so it must exist before we launch.
+        // The agent + terminal ids are exported to in-pane tools (hooks, the nav plugin), so they
+        // must exist before we launch.
         let agent_id = AgentId::new();
+        let terminal_id = TerminalId::new();
         let agent_full = agent_id.to_full_string();
         let ctx = LaunchContext {
             worktree: &worktree,
@@ -275,10 +280,11 @@ impl Registry {
             hooks: self.hook_setup(),
         };
         self.adapter.prepare_worktree(&ctx)?;
-        let spec = self.adapter.spawn_spec(&ctx);
+        let mut spec = self.adapter.spawn_spec(&ctx);
+        spec.env
+            .push(("AMUX_TERMINAL_ID".to_string(), terminal_id.to_full_string()));
         let session = Session::spawn(&spec.command, &spec.cwd, &spec.env, DEFAULT_SIZE)?;
 
-        let terminal_id = TerminalId::new();
         let now = Utc::now();
         let info = {
             let mut state = self.state.lock().unwrap();
@@ -289,6 +295,7 @@ impl Registry {
                     worktree: worktree.clone(),
                     primary: true,
                     session: Some(Arc::clone(&session)),
+                    passthrough: false,
                 },
             );
             let agent = Agent {
@@ -321,7 +328,8 @@ impl Registry {
             (term.agent, term.worktree.clone())
         };
         let shell = std::env::var("SHELL").unwrap_or_else(|_| "/bin/sh".to_string());
-        let session = Session::spawn(&[shell], &worktree, &[], DEFAULT_SIZE)?;
+        let env = self.terminal_env(new);
+        let session = Session::spawn(&[shell], &worktree, &env, DEFAULT_SIZE)?;
         {
             let mut state = self.state.lock().unwrap();
             state.terminals.insert(
@@ -331,6 +339,7 @@ impl Registry {
                     worktree,
                     primary: false,
                     session: Some(Arc::clone(&session)),
+                    passthrough: false,
                 },
             );
         }
@@ -388,6 +397,47 @@ impl Registry {
         }
     }
 
+    /// Env exported into every terminal so in-pane tools can reach the mailbox and identify their
+    /// own pane: the mailbox socket + this terminal's id. Empty when hook integration is off.
+    fn terminal_env(&self, terminal: TerminalId) -> Vec<(String, String)> {
+        let mut env = Vec::new();
+        if let Some(h) = &self.hooks {
+            env.push((
+                "AMUX_HOOK_SOCK".to_string(),
+                h.socket.to_string_lossy().into_owned(),
+            ));
+        }
+        env.push(("AMUX_TERMINAL_ID".to_string(), terminal.to_full_string()));
+        env
+    }
+
+    /// Record that a terminal's foreground app does (or no longer does) want `Ctrl+hjkl`, and tell
+    /// clients so their keypress routing can adapt. Announced by the nav plugin.
+    pub fn set_passthrough(&self, terminal: TerminalId, on: bool) {
+        let changed = {
+            let mut state = self.state.lock().unwrap();
+            match state.terminals.get_mut(&terminal) {
+                Some(t) if t.passthrough != on => {
+                    t.passthrough = on;
+                    true
+                }
+                _ => false,
+            }
+        };
+        if changed {
+            let _ = self.events.send(DaemonMsg::TerminalApp {
+                terminal,
+                passthrough: on,
+            });
+        }
+    }
+
+    /// Relay an in-pane program's edge navigation to clients (which own the pane tree). The daemon
+    /// stays layout-agnostic — it just forwards the intent.
+    pub fn request_nav(&self, terminal: TerminalId, dir: amux_core::nav::Dir) {
+        let _ = self.events.send(DaemonMsg::Navigate { terminal, dir });
+    }
+
     fn broadcast_changes(&self, id: AgentId, state: Option<AgentState>, unread: Option<bool>) {
         if let Some(state) = state {
             let _ = self.events.send(DaemonMsg::StateChanged { id, state });
@@ -436,7 +486,9 @@ impl Registry {
             hooks: self.hook_setup(),
         };
         self.adapter.prepare_worktree(&ctx)?;
-        let spec = self.adapter.spawn_spec(&ctx);
+        let mut spec = self.adapter.spawn_spec(&ctx);
+        spec.env
+            .push(("AMUX_TERMINAL_ID".to_string(), primary.to_full_string()));
         let session = Session::spawn(&spec.command, &spec.cwd, &spec.env, DEFAULT_SIZE)?;
         let state_change = {
             let mut state = self.state.lock().unwrap();

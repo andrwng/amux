@@ -137,6 +137,9 @@ struct App {
     terminals: HashMap<TerminalId, AgentId>,
     parsers: HashMap<TerminalId, vt100::Parser>,
     attached: HashMap<TerminalId, Size>,
+    /// Terminals whose foreground app wants `Ctrl+hjkl` (vim-like), so we pass those keys through
+    /// instead of navigating. Announced by the daemon via `TerminalApp`.
+    passthrough: HashMap<TerminalId, bool>,
     focus: Focus,
     /// The agent last reported to the daemon as "being viewed" (drives read/unread).
     focus_agent: Option<AgentId>,
@@ -168,6 +171,7 @@ impl App {
             terminals: HashMap::new(),
             parsers: HashMap::new(),
             attached: HashMap::new(),
+            passthrough: HashMap::new(),
             focus: Focus::Sidebar,
             focus_agent: None,
             input: InputMode::Normal,
@@ -226,6 +230,8 @@ impl App {
                     self.parsers.remove(&t);
                     self.attached.remove(&t);
                     self.terminals.remove(&t);
+
+                    self.passthrough.remove(&t);
                 }
                 self.agents.retain(|a| a.id != id);
                 if self.sidebar_sel == Some(Row::Agent(id)) {
@@ -253,6 +259,17 @@ impl App {
                     agent.unread = unread;
                 }
             }
+            DaemonMsg::TerminalApp {
+                terminal,
+                passthrough,
+            } => {
+                self.passthrough.insert(terminal, passthrough);
+            }
+            DaemonMsg::Navigate { dir, .. } => {
+                // A vim-like app hit its edge and handed navigation back — move from its (focused)
+                // pane in that direction, exactly like a Ctrl+hjkl keypress would.
+                self.navigate(dir);
+            }
             DaemonMsg::OutputSnapshot { terminal, bytes } => {
                 if let Some(&size) = self.attached.get(&terminal) {
                     let mut parser = vt100::Parser::new(size.rows, size.cols, 2000);
@@ -270,6 +287,8 @@ impl App {
                 self.parsers.remove(&terminal);
                 self.attached.remove(&terminal);
                 self.terminals.remove(&terminal);
+
+                self.passthrough.remove(&terminal);
                 if self.tree.is_empty() {
                     self.focus = Focus::Sidebar;
                 }
@@ -315,6 +334,11 @@ impl App {
             return Ok(Flow::Continue);
         }
         if let Some(dir) = ctrl_dir(key) {
+            // If a vim-like app owns the focused pane, pass Ctrl+hjkl through to it (it moves its
+            // own splits, and hands back to amux at its edge via `amux nav`).
+            if self.focus == Focus::Panes && self.focused_is_passthrough() {
+                return self.key_pane(key, sink).await;
+            }
             self.navigate(dir);
             return Ok(Flow::Continue);
         }
@@ -322,6 +346,13 @@ impl App {
             Focus::Sidebar => self.key_sidebar(key, sink).await,
             Focus::Panes => self.key_pane(key, sink).await,
         }
+    }
+
+    /// Whether the focused pane's terminal has announced it wants `Ctrl+hjkl` (a vim-like app).
+    fn focused_is_passthrough(&self) -> bool {
+        self.tree
+            .focused_payload()
+            .is_some_and(|t| self.passthrough.get(&t).copied().unwrap_or(false))
     }
 
     fn navigate(&mut self, dir: Dir) {
@@ -612,6 +643,8 @@ impl App {
             self.attached.remove(&terminal);
             self.parsers.remove(&terminal);
             self.terminals.remove(&terminal);
+
+            self.passthrough.remove(&terminal);
         }
         Ok(())
     }

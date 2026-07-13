@@ -7,7 +7,8 @@ use std::time::Duration;
 
 use amux_core::adapter::ClaudeAdapter;
 use amux_core::agent::{AgentId, AgentState, RepoId, TerminalId};
-use amux_core::hook::{HookEvent, HookReport};
+use amux_core::hook::{HookEvent, HookReport, PaneMessage};
+use amux_core::nav::Dir;
 use amux_core::worktree::WorktreeService;
 use amux_daemon::{bind_mailbox, serve, serve_mailbox, Registry};
 use amux_proto::{AgentInfo, ClientCodec, ClientMsg, DaemonMsg, Size, PROTO_VERSION};
@@ -122,12 +123,17 @@ async fn wait_for_output(client: &mut Client, needle: &str) -> bool {
     .unwrap_or(false)
 }
 
-/// Deliver one hook report the way `amux hook` does: a single postcard frame, then EOF.
-async fn send_hook(mailbox: &Path, report: HookReport) {
+/// Deliver one pane message the way `amux hook`/`amux nav`/`amux passthrough` do: a single
+/// postcard frame, then EOF.
+async fn send_pane(mailbox: &Path, msg: PaneMessage) {
     let mut stream = UnixStream::connect(mailbox).await.expect("connect mailbox");
-    let bytes = postcard::to_stdvec(&report).unwrap();
+    let bytes = postcard::to_stdvec(&msg).unwrap();
     stream.write_all(&bytes).await.unwrap();
     stream.shutdown().await.unwrap();
+}
+
+async fn send_hook(mailbox: &Path, report: HookReport) {
+    send_pane(mailbox, PaneMessage::Hook(report)).await
 }
 
 fn hook(name: &str, notification_type: Option<&str>, message: Option<&str>) -> HookEvent {
@@ -300,6 +306,78 @@ async fn wait_for_unread(client: &mut Client, id: AgentId, want: bool) -> bool {
     })
     .await
     .unwrap_or(false)
+}
+
+#[tokio::test]
+async fn passthrough_and_nav_are_relayed_to_clients() {
+    // The vim navigator plugin's `amux passthrough`/`amux nav` arrive over the mailbox and the
+    // daemon relays them to clients as TerminalApp / Navigate (layout stays client-side).
+    let tmp = tempfile::tempdir().unwrap();
+    let repo = tmp.path().join("repo");
+    std::fs::create_dir(&repo).unwrap();
+    init_repo(&repo);
+    let worktrees = WorktreeService::with_base(&repo, tmp.path().join("wt")).unwrap();
+    let adapter = Box::new(ClaudeAdapter::with_command(vec!["cat".into()]));
+    let registry = Registry::new(adapter);
+    let repo_id = registry.register(worktrees).id;
+
+    let socket = tmp.path().join("amuxd.sock");
+    let listener = UnixListener::bind(&socket).unwrap();
+    tokio::spawn(serve(listener, registry.clone()));
+    let mailbox = tmp.path().join("hooks.sock");
+    let hook_listener = bind_mailbox(&mailbox).unwrap();
+    tokio::spawn(serve_mailbox(hook_listener, registry.clone()));
+
+    let mut client = handshake(&socket).await;
+    let agent = create_agent(&mut client, repo_id, "feat/vim").await;
+    let term = agent.primary_terminal;
+
+    send_pane(
+        &mailbox,
+        PaneMessage::Passthrough {
+            terminal: term,
+            on: true,
+        },
+    )
+    .await;
+    let got_app = tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            match client.next().await {
+                Some(Ok(DaemonMsg::TerminalApp {
+                    terminal,
+                    passthrough,
+                })) => return terminal == term && passthrough,
+                Some(Ok(_)) => {}
+                _ => return false,
+            }
+        }
+    })
+    .await
+    .unwrap_or(false);
+    assert!(got_app, "passthrough should be relayed as TerminalApp");
+
+    send_pane(
+        &mailbox,
+        PaneMessage::Nav {
+            terminal: term,
+            dir: Dir::Left,
+        },
+    )
+    .await;
+    let got_nav = tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            match client.next().await {
+                Some(Ok(DaemonMsg::Navigate { terminal, dir })) => {
+                    return terminal == term && dir == Dir::Left
+                }
+                Some(Ok(_)) => {}
+                _ => return false,
+            }
+        }
+    })
+    .await
+    .unwrap_or(false);
+    assert!(got_nav, "nav should be relayed as Navigate");
 }
 
 #[tokio::test]
