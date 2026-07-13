@@ -105,7 +105,7 @@ pub type ServerCodec = WireCodec<DaemonMsg, ClientMsg>;
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{AgentInfo, RepoInfo, Size};
+    use crate::{AgentInfo, Layout, RepoInfo, Size};
     use amux_core::agent::{AgentId, AgentState, RepoId, TerminalId};
     use chrono::Utc;
     use proptest::prelude::*;
@@ -121,6 +121,19 @@ mod tests {
         let got = codec.decode(&mut buf).unwrap().unwrap();
         assert_eq!(got, msg);
         assert!(buf.is_empty(), "buffer not fully consumed");
+    }
+
+    fn sample_layout() -> Layout {
+        Layout::Split {
+            axis: amux_core::nav::Axis::LeftRight,
+            ratio: 0.5,
+            first: Box::new(Layout::Leaf {
+                terminal: Some(TerminalId::new()),
+            }),
+            second: Box::new(Layout::Leaf {
+                terminal: Some(TerminalId::new()),
+            }),
+        }
     }
 
     fn sample_repo() -> RepoInfo {
@@ -175,6 +188,14 @@ mod tests {
         });
         roundtrip(ClientMsg::Focus { agent: Some(id) });
         roundtrip(ClientMsg::Focus { agent: None });
+        roundtrip(ClientMsg::SetLayout {
+            agent: id,
+            layout: Some(sample_layout()),
+        });
+        roundtrip(ClientMsg::SetLayout {
+            agent: id,
+            layout: None,
+        });
         roundtrip(ClientMsg::Attach {
             terminal: t,
             size: Size {
@@ -203,6 +224,7 @@ mod tests {
         roundtrip(DaemonMsg::Repos(vec![sample_repo()]));
         roundtrip(DaemonMsg::RepoAdded(sample_repo()));
         roundtrip(DaemonMsg::Agents(vec![sample_info(), sample_info()]));
+        roundtrip(DaemonMsg::Layouts(vec![(id, sample_layout())]));
         roundtrip(DaemonMsg::AgentAdded(sample_info()));
         roundtrip(DaemonMsg::AgentRemoved { id });
         roundtrip(DaemonMsg::StateChanged {

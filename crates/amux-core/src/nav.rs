@@ -13,6 +13,15 @@ pub enum Dir {
     Down,
 }
 
+/// How a split divides its space — shared by the pane tree and the persisted layout wire type.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum Axis {
+    /// Children side by side (a vertical divider) — tmux `%`.
+    LeftRight,
+    /// Children stacked (a horizontal divider) — tmux `"`.
+    TopBottom,
+}
+
 impl Dir {
     /// Parse the single-letter forms `amux nav` accepts (`h`/`j`/`k`/`l` or names).
     pub fn parse(s: &str) -> Option<Self> {

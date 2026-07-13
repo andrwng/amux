@@ -4,20 +4,11 @@
 
 use ratatui::layout::Rect;
 
-/// The one movement/resize direction, shared with the wire and the mailbox so `amux nav` and a
-/// `Ctrl+h` keypress mean the same thing.
-pub use amux_core::nav::Dir;
+/// Movement/resize direction and split axis, shared with the wire (and the mailbox) so `amux nav`,
+/// a `Ctrl+h` keypress, and a persisted layout all mean the same thing.
+pub use amux_core::nav::{Axis, Dir};
 
 pub type PaneId = u64;
-
-/// How a split divides its space.
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
-pub enum Axis {
-    /// Children side by side (a vertical divider) — tmux `%`.
-    LeftRight,
-    /// Children stacked (a horizontal divider) — tmux `"`.
-    TopBottom,
-}
 
 enum Node<P> {
     Leaf {
@@ -89,8 +80,7 @@ impl<P: Copy + PartialEq> PaneTree<P> {
             .flatten()
     }
 
-    /// Every payload currently shown in a pane. (Test helper — the app reconciles via `layout`.)
-    #[cfg(test)]
+    /// Every payload currently shown in a pane.
     pub fn payloads(&self) -> Vec<P> {
         let mut out = Vec::new();
         if let Some(n) = &self.root {
@@ -218,6 +208,71 @@ impl<P: Copy + PartialEq> PaneTree<P> {
     }
 }
 
+// --- layout (de)serialization for persistence ---
+
+use amux_core::agent::TerminalId;
+use amux_proto::Layout;
+
+impl PaneTree<TerminalId> {
+    /// The tree as a persistable [`Layout`] (`None` when empty).
+    pub fn to_layout(&self) -> Option<Layout> {
+        self.root.as_ref().map(node_to_layout)
+    }
+
+    /// Rebuild a tree from a saved [`Layout`]; focus lands on the first pane.
+    pub fn from_layout(layout: &Layout) -> Self {
+        let mut next_id = 1;
+        let root = layout_to_node(layout, &mut next_id);
+        let focus = first_leaf(&root);
+        Self {
+            root: Some(root),
+            focus,
+            next_id,
+        }
+    }
+}
+
+fn node_to_layout(node: &Node<TerminalId>) -> Layout {
+    match node {
+        Node::Leaf { payload, .. } => Layout::Leaf { terminal: *payload },
+        Node::Split {
+            axis,
+            ratio,
+            first,
+            second,
+        } => Layout::Split {
+            axis: *axis,
+            ratio: *ratio,
+            first: Box::new(node_to_layout(first)),
+            second: Box::new(node_to_layout(second)),
+        },
+    }
+}
+
+fn layout_to_node(layout: &Layout, next_id: &mut PaneId) -> Node<TerminalId> {
+    match layout {
+        Layout::Leaf { terminal } => {
+            let id = *next_id;
+            *next_id += 1;
+            Node::Leaf {
+                id,
+                payload: *terminal,
+            }
+        }
+        Layout::Split {
+            axis,
+            ratio,
+            first,
+            second,
+        } => Node::Split {
+            axis: *axis,
+            ratio: *ratio,
+            first: Box::new(layout_to_node(first, next_id)),
+            second: Box::new(layout_to_node(second, next_id)),
+        },
+    }
+}
+
 // --- tree helpers ---
 
 fn find_payload<P: Copy>(node: &Node<P>, id: PaneId) -> Option<Option<P>> {
@@ -230,7 +285,6 @@ fn find_payload<P: Copy>(node: &Node<P>, id: PaneId) -> Option<Option<P>> {
     }
 }
 
-#[cfg(test)]
 fn collect_payloads<P: Copy>(node: &Node<P>, out: &mut Vec<P>) {
     match node {
         Node::Leaf { payload, .. } => {
@@ -521,6 +575,29 @@ mod tests {
         t.open(b);
         assert_eq!(t.focused_payload(), Some(b));
         assert_eq!(t.payloads().len(), 2);
+    }
+
+    #[test]
+    fn layout_roundtrips_through_serialization() {
+        let mut t = PaneTree::new();
+        let a = TerminalId::new();
+        t.open(a);
+        t.split(Axis::LeftRight);
+        let b = TerminalId::new();
+        t.open(b);
+        t.split(Axis::TopBottom);
+        let c = TerminalId::new();
+        t.open(c);
+
+        let before = t.layout(area());
+        let saved = t.to_layout().expect("non-empty");
+        let restored = PaneTree::<TerminalId>::from_layout(&saved);
+
+        // Same panes at the same rectangles after a save/restore.
+        let after = restored.layout(area());
+        let rects_before: Vec<_> = before.iter().map(|p| (p.payload, p.rect)).collect();
+        let rects_after: Vec<_> = after.iter().map(|p| (p.payload, p.rect)).collect();
+        assert_eq!(rects_before, rects_after);
     }
 
     #[test]

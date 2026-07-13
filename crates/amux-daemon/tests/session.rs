@@ -11,7 +11,7 @@ use amux_core::hook::{HookEvent, HookReport, PaneMessage};
 use amux_core::nav::Dir;
 use amux_core::worktree::WorktreeService;
 use amux_daemon::{bind_mailbox, serve, serve_mailbox, Registry};
-use amux_proto::{AgentInfo, ClientCodec, ClientMsg, DaemonMsg, Size, PROTO_VERSION};
+use amux_proto::{AgentInfo, ClientCodec, ClientMsg, DaemonMsg, Layout, Size, PROTO_VERSION};
 use futures::{SinkExt, StreamExt};
 use git2::Repository;
 use tokio::io::AsyncWriteExt;
@@ -77,6 +77,10 @@ async fn handshake(socket: &Path) -> Client {
     match client.next().await {
         Some(Ok(DaemonMsg::Agents(_))) => {}
         other => panic!("expected Agents, got {other:?}"),
+    }
+    match client.next().await {
+        Some(Ok(DaemonMsg::Layouts(_))) => {}
+        other => panic!("expected Layouts, got {other:?}"),
     }
     client
 }
@@ -566,6 +570,68 @@ async fn unread_is_set_on_finish_when_unfocused_and_cleared_on_focus() {
         still_read,
         "a finish while the agent is focused must stay read"
     );
+}
+
+#[tokio::test]
+async fn layout_persists_for_a_reconnecting_client() {
+    let tmp = tempfile::tempdir().unwrap();
+    let repo = tmp.path().join("repo");
+    std::fs::create_dir(&repo).unwrap();
+    init_repo(&repo);
+    let worktrees = WorktreeService::with_base(&repo, tmp.path().join("wt")).unwrap();
+    let adapter = Box::new(ClaudeAdapter::with_command(vec!["cat".into()]));
+    let registry = Registry::new(adapter);
+    let repo_id = registry.register(worktrees).id;
+    let socket = tmp.path().join("amuxd.sock");
+    let listener = UnixListener::bind(&socket).unwrap();
+    tokio::spawn(serve(listener, registry));
+
+    let mut client = handshake(&socket).await;
+    let agent = create_agent(&mut client, repo_id, "feat/layout").await;
+    let layout = Layout::Leaf {
+        terminal: Some(agent.primary_terminal),
+    };
+    client
+        .send(ClientMsg::SetLayout {
+            agent: agent.id,
+            layout: Some(layout.clone()),
+        })
+        .await
+        .unwrap();
+    // Round-trip a command so the daemon has surely processed SetLayout before we reconnect.
+    client.send(ClientMsg::ListAgents).await.unwrap();
+    tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            if let Some(Ok(DaemonMsg::Agents(_))) = client.next().await {
+                return;
+            }
+        }
+    })
+    .await
+    .unwrap();
+
+    // A fresh connection's handshake must replay the saved layout.
+    let stream = UnixStream::connect(&socket).await.unwrap();
+    let mut c2 = Framed::new(stream, ClientCodec::new());
+    c2.send(ClientMsg::Hello {
+        proto_version: PROTO_VERSION,
+    })
+    .await
+    .unwrap();
+    let got = tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            match c2.next().await {
+                Some(Ok(DaemonMsg::Layouts(list))) => {
+                    return list.iter().any(|(a, l)| *a == agent.id && *l == layout);
+                }
+                Some(Ok(_)) => {}
+                _ => return false,
+            }
+        }
+    })
+    .await
+    .unwrap_or(false);
+    assert!(got, "reconnecting client should receive the saved layout");
 }
 
 #[tokio::test]

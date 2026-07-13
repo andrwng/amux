@@ -100,6 +100,9 @@ struct State {
     /// The agent the user is currently viewing, if any. A notable event on this agent does not
     /// mark it unread (you're watching it); everyone else's does.
     focused: Option<AgentId>,
+    /// Saved pane layouts per agent, replayed to a re-attaching client so splits survive the TUI
+    /// closing. In-memory (survives client restart, not a daemon restart — that's state.json).
+    layouts: HashMap<AgentId, amux_proto::Layout>,
 }
 
 /// Where the daemon's hook mailbox lives and how to invoke the bridge, so launched CLIs can
@@ -203,6 +206,30 @@ impl Registry {
     pub fn register_path(&self, path: &Path, location: WorktreeLocation) -> Result<RepoInfo> {
         let worktrees = WorktreeService::new(path, location).context("open repository")?;
         Ok(self.register(worktrees))
+    }
+
+    /// Save (or clear, on `None`) an agent's pane layout for replay to re-attaching clients.
+    pub fn set_layout(&self, agent: AgentId, layout: Option<amux_proto::Layout>) {
+        let mut state = self.state.lock().unwrap();
+        match layout {
+            Some(l) => {
+                state.layouts.insert(agent, l);
+            }
+            None => {
+                state.layouts.remove(&agent);
+            }
+        }
+    }
+
+    /// All saved layouts (sent to a client on connect).
+    pub fn layouts(&self) -> Vec<(AgentId, amux_proto::Layout)> {
+        self.state
+            .lock()
+            .unwrap()
+            .layouts
+            .iter()
+            .map(|(id, l)| (*id, l.clone()))
+            .collect()
     }
 
     pub fn repos(&self) -> Vec<RepoInfo> {
@@ -535,6 +562,7 @@ impl Registry {
         let sessions: Vec<Arc<Session>> = {
             let mut state = self.state.lock().unwrap();
             state.agents.remove(&id);
+            state.layouts.remove(&id);
             let terminal_ids: Vec<TerminalId> = state
                 .terminals
                 .iter()

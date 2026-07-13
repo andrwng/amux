@@ -99,11 +99,16 @@ orphaned worktrees). `Ctrl+l` moves into panes.
 **DoD:** pure unit tests for directional nav, split, close, and resize on the pane tree; the
 prefix + resize state machines tested; keys route to the right pane; interactive check.
 
-## S.4 — Persistence hook (small)
+## S.4 — Layout persistence (DONE, proto v10)
 
-The pane tree + focus is workspace layout — it rides the same `~/.amux/state.json` /
-`SetLayout` mechanism as the rest (deferred with the other persistence work). Not required for
-a first splits release.
+Each agent's pane tree is persisted so splits survive closing the TUI. The client serializes the
+active agent's tree to a `Layout` (leaves = terminal ids, splits = axis + ratio) and sends
+`SetLayout { agent, layout }` on every layout change (via `reconcile`); the daemon holds the
+layouts and replays them to a re-attaching client (`DaemonMsg::Layouts` on connect). On first
+open of an agent, the client rebuilds its tree from the saved layout and re-attaches the shells
+(which kept running headless in the daemon). This covers **client** restarts; surviving a
+**daemon** restart needs `~/.amux/state.json` (the terminals themselves don't persist yet — still
+deferred). `Axis`/`Dir` are shared via `amux_core::nav`.
 
 ---
 

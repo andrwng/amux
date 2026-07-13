@@ -156,8 +156,11 @@ struct App {
     /// The **active** agent's live pane layout (what the main area shows). Each agent owns its own
     /// workspace: opening an agent swaps this out, and splits belong to that agent.
     tree: PaneTree<TerminalId>,
-    /// Saved layouts for the non-active agents, restored when you switch back to them.
+    /// Saved layouts for the non-active agents (this session), restored when you switch back.
     trees: HashMap<AgentId, PaneTree<TerminalId>>,
+    /// Layouts the daemon persisted from a previous client session — restored the first time you
+    /// open each agent, so splits survive closing the TUI.
+    saved_layouts: HashMap<AgentId, amux_proto::Layout>,
     /// The agent whose workspace is currently on screen (`None` = nothing opened yet).
     active_agent: Option<AgentId>,
     terminals: HashMap<TerminalId, AgentId>,
@@ -201,6 +204,7 @@ impl App {
             sidebar_sel: None,
             tree: PaneTree::new(),
             trees: HashMap::new(),
+            saved_layouts: HashMap::new(),
             active_agent: None,
             terminals: HashMap::new(),
             parsers: HashMap::new(),
@@ -247,6 +251,9 @@ impl App {
             DaemonMsg::Agents(list) => {
                 self.agents = list;
                 self.ensure_sidebar_sel();
+            }
+            DaemonMsg::Layouts(list) => {
+                self.saved_layouts = list.into_iter().collect();
             }
             DaemonMsg::AgentAdded(info) => {
                 // Select the freshly-created agent so the next Enter opens it.
@@ -495,8 +502,21 @@ impl App {
             if let Some(prev) = self.active_agent {
                 self.trees.insert(prev, std::mem::take(&mut self.tree));
             }
-            self.tree = self.trees.remove(&id).unwrap_or_default();
+            // This session's live tree, else a layout the daemon persisted from a past session.
+            self.tree = self
+                .trees
+                .remove(&id)
+                .or_else(|| {
+                    self.saved_layouts
+                        .remove(&id)
+                        .map(|l| PaneTree::from_layout(&l))
+                })
+                .unwrap_or_default();
             self.active_agent = Some(id);
+            // A restored layout's terminals belong to this agent (for rendering + splits).
+            for t in self.tree.payloads() {
+                self.terminals.insert(t, id);
+            }
         }
         // First time (or after its panes were all closed): show the agent's primary terminal.
         if self.tree.is_empty() {
@@ -988,6 +1008,15 @@ impl App {
             sink.send(ClientMsg::Detach { terminal }).await?;
             self.attached.remove(&terminal);
             self.parsers.remove(&terminal);
+        }
+
+        // Persist the active agent's layout so its splits survive closing the TUI.
+        if let Some(agent) = self.active_agent {
+            sink.send(ClientMsg::SetLayout {
+                agent,
+                layout: self.tree.to_layout(),
+            })
+            .await?;
         }
         Ok(())
     }

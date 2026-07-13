@@ -6,9 +6,25 @@
 use std::path::PathBuf;
 
 use amux_core::agent::{AgentId, AgentState, RepoId, TerminalId};
-use amux_core::nav::Dir;
+use amux_core::nav::{Axis, Dir};
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
+
+/// A persisted pane layout for one agent — the tiled tree, serialized. Leaves carry a terminal
+/// (or none for an empty pane); splits carry their axis + ratio. The daemon remembers this across
+/// client re-attaches so your splits come back.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub enum Layout {
+    Leaf {
+        terminal: Option<TerminalId>,
+    },
+    Split {
+        axis: Axis,
+        ratio: f32,
+        first: Box<Layout>,
+        second: Box<Layout>,
+    },
+}
 
 /// Terminal dimensions in character cells.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -44,7 +60,7 @@ pub struct AgentInfo {
 }
 
 /// Messages the client sends to the daemon.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)] // no Eq: Layout carries an f32 ratio
 pub enum ClientMsg {
     /// First frame: the client's protocol version.
     Hello { proto_version: u32 },
@@ -76,6 +92,12 @@ pub enum ClientMsg {
     /// daemon clears its unread bit and, while it's focused, keeps notable events from marking it
     /// unread — so "Claude finished while you were watching" stays read.
     Focus { agent: Option<AgentId> },
+    /// Persist an agent's pane layout (`None` = it has no panes). The daemon remembers it and
+    /// replays it to a re-attaching client so splits survive closing the TUI.
+    SetLayout {
+        agent: AgentId,
+        layout: Option<Layout>,
+    },
     /// Start streaming a terminal into a pane (snapshot then live output).
     Attach { terminal: TerminalId, size: Size },
     /// Stop streaming a terminal (its pane closed / was replaced).
@@ -90,7 +112,7 @@ pub enum ClientMsg {
 }
 
 /// Messages the daemon sends to the client.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)] // no Eq: Layout carries an f32 ratio
 pub enum DaemonMsg {
     /// Reply to `Hello`: the daemon's protocol version.
     Hello { proto_version: u32 },
@@ -100,6 +122,8 @@ pub enum DaemonMsg {
     RepoAdded(RepoInfo),
     /// The full agent roster (on connect and in reply to `ListAgents`).
     Agents(Vec<AgentInfo>),
+    /// Saved pane layouts (on connect) so a re-attaching client can restore its splits.
+    Layouts(Vec<(AgentId, Layout)>),
     /// A new agent appeared.
     AgentAdded(AgentInfo),
     /// An agent was deleted.
