@@ -146,7 +146,7 @@ impl AgentState {
     pub fn glyph(&self) -> char {
         match self {
             AgentState::Starting => '◌',
-            AgentState::Working => '…',
+            AgentState::Working => '⋯',
             AgentState::NeedsAttention { .. } => '⚠',
             AgentState::Idle => '○',
             AgentState::Exited { .. } => '□',
