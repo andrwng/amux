@@ -127,12 +127,36 @@ impl Session {
         }))
     }
 
-    /// Current screen as a `contents_formatted()` dump — sent to a (re)attaching client.
+    /// Current screen as a `contents_formatted()` dump — sent to a (re)attaching client. Prefixed
+    /// with a **mode preamble** because `contents_formatted()` replays cells + attributes but NOT
+    /// terminal modes: without this, a client rebuilding its parser from the snapshot would lose
+    /// mouse tracking (breaks wheel forwarding), the alternate screen, and DECCKM (arrow keys).
     pub fn snapshot(&self) -> Vec<u8> {
-        self.parser
-            .lock()
-            .map(|p| p.screen().contents_formatted())
-            .unwrap_or_default()
+        let Ok(parser) = self.parser.lock() else {
+            return Vec::new();
+        };
+        let screen = parser.screen();
+        let mut out = Vec::new();
+        if screen.alternate_screen() {
+            out.extend_from_slice(b"\x1b[?1049h");
+        }
+        if screen.application_cursor() {
+            out.extend_from_slice(b"\x1b[?1h");
+        }
+        out.extend_from_slice(match screen.mouse_protocol_mode() {
+            vt100::MouseProtocolMode::None => b"".as_slice(),
+            vt100::MouseProtocolMode::Press => b"\x1b[?9h",
+            vt100::MouseProtocolMode::PressRelease => b"\x1b[?1000h",
+            vt100::MouseProtocolMode::ButtonMotion => b"\x1b[?1002h",
+            vt100::MouseProtocolMode::AnyMotion => b"\x1b[?1003h",
+        });
+        out.extend_from_slice(match screen.mouse_protocol_encoding() {
+            vt100::MouseProtocolEncoding::Default => b"".as_slice(),
+            vt100::MouseProtocolEncoding::Utf8 => b"\x1b[?1005h",
+            vt100::MouseProtocolEncoding::Sgr => b"\x1b[?1006h",
+        });
+        out.extend_from_slice(&screen.contents_formatted());
+        out
     }
 
     pub fn subscribe(&self) -> broadcast::Receiver<Vec<u8>> {

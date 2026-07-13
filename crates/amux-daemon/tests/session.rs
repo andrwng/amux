@@ -218,6 +218,71 @@ async fn create_attach_echo_delete() {
 }
 
 #[tokio::test]
+async fn reattach_snapshot_preserves_mouse_mode() {
+    // A re-attaching client rebuilds its parser from the snapshot; the snapshot must replay the
+    // app's terminal modes (here mouse tracking), or wheel forwarding etc. would silently break.
+    let tmp = tempfile::tempdir().unwrap();
+    let repo = tmp.path().join("repo");
+    std::fs::create_dir(&repo).unwrap();
+    init_repo(&repo);
+    let worktrees = WorktreeService::with_base(&repo, tmp.path().join("wt")).unwrap();
+    // An agent that *prints* the mouse-mode enable (so the daemon's parser records it), then idles.
+    let adapter = Box::new(ClaudeAdapter::with_command(vec![
+        "sh".into(),
+        "-c".into(),
+        "printf '\\033[?1003h\\033[?1006hMARK\\n'; sleep 30".into(),
+    ]));
+    let registry = Registry::new(adapter);
+    let repo_id = registry.register(worktrees).id;
+    let socket = tmp.path().join("amuxd.sock");
+    let listener = UnixListener::bind(&socket).unwrap();
+    tokio::spawn(serve(listener, registry));
+    let mut client = handshake(&socket).await;
+    let agent = create_agent(&mut client, repo_id, "feat/mouse").await;
+    let term = agent.primary_terminal;
+
+    client
+        .send(ClientMsg::Attach {
+            terminal: term,
+            size: SIZE,
+        })
+        .await
+        .unwrap();
+    assert!(
+        wait_for_output(&mut client, "MARK").await,
+        "agent did not print"
+    );
+
+    // Re-attach: the fresh snapshot must include the mouse-mode preamble.
+    client
+        .send(ClientMsg::Detach { terminal: term })
+        .await
+        .unwrap();
+    client
+        .send(ClientMsg::Attach {
+            terminal: term,
+            size: SIZE,
+        })
+        .await
+        .unwrap();
+    let ok = tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            match client.next().await {
+                Some(Ok(DaemonMsg::OutputSnapshot { bytes, .. })) => {
+                    let s = String::from_utf8_lossy(&bytes);
+                    return s.contains("\x1b[?1003h") && s.contains("\x1b[?1006h");
+                }
+                Some(Ok(_)) => {}
+                _ => return false,
+            }
+        }
+    })
+    .await
+    .unwrap_or(false);
+    assert!(ok, "re-attach snapshot must replay the mouse mode");
+}
+
+#[tokio::test]
 async fn hooks_drive_the_state_machine_over_the_mailbox() {
     let tmp = tempfile::tempdir().unwrap();
     let repo = tmp.path().join("repo");
