@@ -103,7 +103,9 @@ impl AgentAdapter for ClaudeAdapter {
                 command.push(id.to_string());
             }
         }
-        let mut env = vec![("TERM".to_string(), "xterm-256color".to_string())];
+        // TERM/COLORTERM are owned by the daemon's PTY layer (it advertises a screen-family
+        // terminal so apps fill backgrounds), so they're deliberately not set here.
+        let mut env: Vec<(String, String)> = Vec::new();
         // Export the mailbox wiring so the CLI's hooks (see `prepare_worktree`) can reach the
         // daemon and tag their reports with this agent.
         if let Some(hooks) = ctx.hooks {
@@ -182,7 +184,8 @@ mod tests {
         let spec = adapter.spawn_spec(&ctx(Path::new("/tmp/wt/feature-x"), "feature/x", None));
         assert_eq!(spec.command, vec!["claude".to_string()]);
         assert_eq!(spec.cwd, PathBuf::from("/tmp/wt/feature-x"));
-        assert!(spec.env.iter().any(|(k, _)| k == "TERM"));
+        // TERM is set by the daemon's PTY layer, not the adapter.
+        assert!(!spec.env.iter().any(|(k, _)| k == "TERM"));
         // No hook wiring without a HookSetup.
         assert!(!spec.env.iter().any(|(k, _)| k == "AMUX_HOOK_SOCK"));
     }

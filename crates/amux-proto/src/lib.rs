@@ -14,5 +14,7 @@ pub use message::{AgentInfo, ClientMsg, DaemonMsg, Layout, RepoInfo, Size};
 /// so a pre-hook daemon is auto-refreshed even though the control wire is unchanged); v8 inbox
 /// read/unread (AgentInfo.unread, Focus, UnreadChanged); v9 vim-aware nav (TerminalApp, Navigate);
 /// v10 layout persistence (SetLayout, Layouts); v11 mini persistence (SetMinis, Minis); v12 active
-/// agent persistence (SetActive, Active — restores the main pane on reconnect).
-pub const PROTO_VERSION: u32 = 12;
+/// agent persistence (SetActive, Active — restores the main pane on reconnect); v13 screen-family
+/// pane TERM (bumped so a running daemon auto-refreshes to spawn panes with the new TERM, though
+/// the control wire is unchanged).
+pub const PROTO_VERSION: u32 = 13;

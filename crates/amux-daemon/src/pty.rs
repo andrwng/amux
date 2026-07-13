@@ -8,7 +8,7 @@
 
 use std::io::{Read, Write};
 use std::path::Path;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::thread::{self, JoinHandle};
 
 use anyhow::{Context, Result};
@@ -18,6 +18,37 @@ use portable_pty::{native_pty_system, CommandBuilder, MasterPty, PtySize};
 use tokio::sync::{broadcast, watch};
 
 use amux_proto::Size;
+
+/// The `TERM` advertised to panes, resolved once. We mirror tmux: a screen-family terminfo has no
+/// `bce` (background-color-erase) capability, so full-screen apps like vim paint every cell's
+/// background explicitly instead of relying on the terminal to fill erased regions with the default
+/// background. That's what makes a dark vim theme fill the whole pane here (an `xterm-256color`
+/// TERM, which *has* `bce`, leaves vim's "empty" cells at the pane's default background — the
+/// black-only-behind-text look). Prefer `tmux-256color` (adds italics), fall back to the
+/// universally present `screen-256color`. Paired with `COLORTERM=truecolor` so 24-bit color still
+/// works (neither screen terminfo advertises it).
+fn pane_term() -> &'static str {
+    static TERM: OnceLock<&'static str> = OnceLock::new();
+    TERM.get_or_init(|| {
+        if terminfo_exists("tmux-256color") {
+            "tmux-256color"
+        } else {
+            "screen-256color"
+        }
+    })
+}
+
+/// Whether a terminfo entry named `name` is installed (via `infocmp`, part of ncurses). Used to
+/// avoid handing panes a `TERM` the system can't describe.
+fn terminfo_exists(name: &str) -> bool {
+    std::process::Command::new("infocmp")
+        .arg(name)
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+        .map(|s| s.success())
+        .unwrap_or(false)
+}
 
 /// Scrollback retained by the daemon-side parser (used for snapshots).
 const SCROLLBACK: usize = 2000;
@@ -64,10 +95,13 @@ impl Session {
             cmd.arg(arg);
         }
         cmd.cwd(cwd);
-        cmd.env("TERM", "xterm-256color");
         for (key, value) in env {
             cmd.env(key, value);
         }
+        // amux owns TERM/COLORTERM for every pane — applied last so they win over any inherited or
+        // adapter-provided value. See `pane_term`.
+        cmd.env("TERM", pane_term());
+        cmd.env("COLORTERM", "truecolor");
 
         let child = pair.slave.spawn_command(cmd).context("spawn child")?;
         drop(pair.slave); // child owns the only slave fd → its exit is observable
