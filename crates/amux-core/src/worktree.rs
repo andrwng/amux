@@ -205,10 +205,22 @@ impl WorktreeService {
     }
 }
 
-/// Find the working directory of the git repository containing `from` (walking up).
+/// Find the working directory of the git repository containing `from` (walking up). When `from`
+/// is inside a **linked worktree** (as every amux agent's cwd is), git reports the worktree's own
+/// checkout as its `workdir()`; we resolve that back to the **main** repository so a worktree is
+/// never mistaken for a repo — otherwise registering it mints a phantom repo named after the
+/// branch (the "mount" bug). The main repo's common dir (`<main>/.git`) opens as the main repo.
 pub fn discover_repo(from: &Path) -> Result<PathBuf> {
     let repo = Repository::discover(from)
         .with_context(|| format!("not inside a git repository: {}", from.display()))?;
+    if repo.is_worktree() {
+        let main = Repository::open(repo.commondir())
+            .context("open main repository from worktree common dir")?;
+        return main
+            .workdir()
+            .map(Path::to_path_buf)
+            .context("main repository has no working directory");
+    }
     repo.workdir()
         .map(Path::to_path_buf)
         .context("bare repository has no working directory")
@@ -217,6 +229,24 @@ pub fn discover_repo(from: &Path) -> Result<PathBuf> {
 fn canonical_repo(repo_path: &Path) -> Result<PathBuf> {
     std::fs::canonicalize(repo_path)
         .with_context(|| format!("repository path does not exist: {}", repo_path.display()))
+}
+
+/// True if `repo_path` lives under amux's own worktrees directory (`<amux_home>/worktrees`) — i.e.
+/// it is an amux-managed agent worktree, not a real project repo. Registering such a path would
+/// mint a phantom repo named after a branch (the "mount" bug), so the daemon refuses it.
+pub fn is_managed_worktree(repo_path: &Path) -> Result<bool> {
+    Ok(is_under(
+        &crate::paths::amux_home()?.join("worktrees"),
+        repo_path,
+    ))
+}
+
+/// Pure: is `path` inside `base`? Compares canonicalized paths so symlinks/`..`/trailing-slash
+/// differences don't defeat the prefix check; falls back to the raw path when it doesn't exist yet.
+fn is_under(base: &Path, path: &Path) -> bool {
+    let base = std::fs::canonicalize(base).unwrap_or_else(|_| base.to_path_buf());
+    let path = std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
+    path.starts_with(&base)
 }
 
 fn sanitize(branch: &str) -> String {
@@ -412,5 +442,56 @@ mod tests {
         // A relocated amux home places worktrees under it, not under ~/.amux.
         let base = worktrees_base(Path::new("/home/u/xfs2/.amux"), Path::new("/home/u/proj"));
         assert!(base.starts_with("/home/u/xfs2/.amux/worktrees"));
+    }
+
+    #[test]
+    fn discover_repo_from_inside_a_worktree_resolves_to_the_main_repo() {
+        let tmp = tempfile::tempdir().unwrap();
+        let repo_path = tmp.path().join("repo");
+        std::fs::create_dir(&repo_path).unwrap();
+        init_repo(&repo_path);
+        let svc = WorktreeService::with_base(&repo_path, tmp.path().join("wt")).unwrap();
+        let wt = svc.create("feature/x").unwrap();
+
+        // Discovering from inside a linked worktree must resolve to the MAIN repo, not the
+        // worktree's own checkout — otherwise the worktree gets registered as a phantom repo
+        // named after its branch ("feature-x"). See the "mount" bug.
+        let discovered = discover_repo(&wt).unwrap();
+        assert_eq!(
+            std::fs::canonicalize(&discovered).unwrap(),
+            std::fs::canonicalize(&repo_path).unwrap(),
+        );
+    }
+
+    #[test]
+    fn discover_repo_from_the_main_repo_is_the_main_repo() {
+        let tmp = tempfile::tempdir().unwrap();
+        let repo_path = tmp.path().join("repo");
+        std::fs::create_dir(&repo_path).unwrap();
+        init_repo(&repo_path);
+
+        let discovered = discover_repo(&repo_path).unwrap();
+        assert_eq!(
+            std::fs::canonicalize(&discovered).unwrap(),
+            std::fs::canonicalize(&repo_path).unwrap(),
+        );
+    }
+
+    #[test]
+    fn is_under_flags_amux_managed_worktrees_only() {
+        let tmp = tempfile::tempdir().unwrap();
+        let base = tmp.path().join("worktrees");
+        let managed = base.join("amux-8b759dcc/mount");
+        std::fs::create_dir_all(&managed).unwrap();
+        let project = tmp.path().join("Repos/amux");
+        std::fs::create_dir_all(&project).unwrap();
+
+        // A path inside <amux_home>/worktrees is an amux-managed worktree...
+        assert!(is_under(&base, &managed));
+        // ...a real project repo living elsewhere is not.
+        assert!(!is_under(&base, &project));
+        // The base directory itself is not a repo we'd register either, but a nonexistent path
+        // under it must still be flagged (canonicalize falls back to the raw path).
+        assert!(is_under(&base, &base.join("amux-8b759dcc/gone")));
     }
 }

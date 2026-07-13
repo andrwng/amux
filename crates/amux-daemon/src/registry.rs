@@ -260,6 +260,16 @@ impl Registry {
 
     /// Register the repository at `path` (idempotent), building its worktree service.
     pub fn register_path(&self, path: &Path, location: WorktreeLocation) -> Result<RepoInfo> {
+        // Guard: never register a path inside amux's own worktrees directory. `discover_repo`
+        // already collapses a worktree cwd to its main repo, but a worktree path can still arrive
+        // raw (via `--repo <worktree>` or the create-at flow); accepting it would mint a phantom
+        // repo named after a branch (the "mount" bug).
+        if amux_core::worktree::is_managed_worktree(path)? {
+            anyhow::bail!(
+                "{} is inside amux's worktrees directory (an agent worktree, not a repository)",
+                path.display()
+            );
+        }
         let worktrees = WorktreeService::new(path, location).context("open repository")?;
         Ok(self.register(worktrees))
     }
