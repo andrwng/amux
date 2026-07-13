@@ -259,10 +259,11 @@ impl App {
             return (self.area, None);
         }
         let mini_h = (self.area.height / 2).clamp(3, MINI_ROWS);
+        // Inset the band 1 cell on the bottom + right, leaving room for the drop shadow.
         let minis = Rect::new(
             self.area.x,
-            self.area.y + self.area.height.saturating_sub(mini_h),
-            self.area.width,
+            self.area.y + self.area.height.saturating_sub(mini_h + 1),
+            self.area.width.saturating_sub(1),
             mini_h,
         );
         (self.area, Some(minis))
@@ -1011,6 +1012,33 @@ impl App {
             _ => {}
         }
 
+        // Minis float over the panes, so a click/wheel over one targets the mini, not the pane.
+        if let Some((i, inner)) = self.mini_at(me.column, me.row) {
+            match me.kind {
+                MouseEventKind::Down(MouseButton::Left) => self.enter_mini(i),
+                MouseEventKind::ScrollUp | MouseEventKind::ScrollDown => {
+                    let up = matches!(me.kind, MouseEventKind::ScrollUp);
+                    let minimized = self
+                        .minis
+                        .get(i)
+                        .is_some_and(|a| self.minimized.contains(a));
+                    if let (false, Some(terminal)) = (minimized, self.mini_terminal(i)) {
+                        if self.app_wants_mouse(terminal) {
+                            if let Some(bytes) =
+                                self.encode_wheel(terminal, up, me.column, me.row, inner)
+                            {
+                                sink.send(ClientMsg::Input { terminal, bytes }).await?;
+                            }
+                        } else {
+                            self.wheel_scroll(terminal, up);
+                        }
+                    }
+                }
+                _ => {}
+            }
+            return Ok(());
+        }
+
         let Some((terminal, inner)) = self.pane_at(me.column, me.row) else {
             return Ok(());
         };
@@ -1081,6 +1109,25 @@ impl App {
             }
         }
         Some(out)
+    }
+
+    /// The mini index (and its inner content area) under screen point `(col, row)`, if any. Minis
+    /// float over the panes, so this is checked before `pane_at`.
+    fn mini_at(&self, col: u16, row: u16) -> Option<(usize, Rect)> {
+        let (_, minis_area) = self.regions();
+        let ma = minis_area?;
+        for (i, rect) in self.mini_rects(ma).iter().enumerate() {
+            if col >= rect.x && col < rect.right() && row >= rect.y && row < rect.bottom() {
+                let inner = Rect {
+                    x: rect.x + 1,
+                    y: rect.y + 1,
+                    width: rect.width.saturating_sub(2),
+                    height: rect.height.saturating_sub(2),
+                };
+                return Some((i, inner));
+            }
+        }
+        None
     }
 
     /// The terminal (and its inner content area) under screen point `(col, row)`, if any pane is.
@@ -1550,7 +1597,30 @@ fn render(frame: &mut Frame, app: &App) {
 
 fn render_minis(frame: &mut Frame, area: Rect, app: &App) {
     let by_id: HashMap<_, _> = app.agents.iter().map(|a| (a.id, a)).collect();
-    for (i, rect) in app.mini_rects(area).iter().enumerate() {
+    let rects = app.mini_rects(area);
+
+    // A drop shadow around the whole floating group (its right column + bottom row, offset 1),
+    // so the windows read as floating above the panes. Drawn first; the windows draw over it.
+    if let (Some(left), Some(right)) = (
+        rects.iter().map(|r| r.x).min(),
+        rects.iter().map(|r| r.right()).max(),
+    ) {
+        let bottom = area.y + area.height; // one row below the band content (reserved margin)
+        let shadow = Style::default().bg(Color::Black);
+        let buf = frame.buffer_mut();
+        for y in (area.y + 1)..=bottom {
+            if let Some(cell) = buf.cell_mut((right, y)) {
+                cell.set_symbol(" ").set_style(shadow);
+            }
+        }
+        for x in (left + 1)..=right {
+            if let Some(cell) = buf.cell_mut((x, bottom)) {
+                cell.set_symbol(" ").set_style(shadow);
+            }
+        }
+    }
+
+    for (i, rect) in rects.iter().enumerate() {
         let Some(agent_id) = app.minis.get(i) else {
             continue;
         };
@@ -1956,12 +2026,21 @@ mod tests {
         app.navigate(Dir::Left);
         assert_eq!(app.focus, Focus::Sidebar);
 
-        // Two minis tile the row side by side, filling its width.
+        // Two minis sit adjacent, right-anchored to the (inset) minis band.
         let (_, minis_area) = app.regions();
-        let rects = app.mini_rects(minis_area.unwrap());
+        let band = minis_area.unwrap();
+        let rects = app.mini_rects(band);
         assert_eq!(rects.len(), 2);
         assert_eq!(rects[0].x + rects[0].width, rects[1].x);
-        assert_eq!(rects[1].x + rects[1].width, app.area.x + app.area.width);
+        assert_eq!(rects[1].x + rects[1].width, band.x + band.width);
+
+        // A click inside a mini hit-tests to it (they float over the panes); the top of the main
+        // area (over the panes) hits no mini.
+        assert_eq!(
+            app.mini_at(rects[1].x + 1, rects[1].y + 1).map(|(i, _)| i),
+            Some(1)
+        );
+        assert_eq!(app.mini_at(app.area.x + 1, app.area.y), None);
     }
 
     #[test]
