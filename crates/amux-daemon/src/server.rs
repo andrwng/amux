@@ -208,6 +208,16 @@ fn attach(
     terminal: TerminalId,
     size: Size,
 ) {
+    // A suspended primary (e.g. after a daemon restart) has no session yet — attaching one revives
+    // it, resuming the agent's CLI in place. Errors here fall through to the "no live session" path.
+    if registry.session(terminal).is_none() {
+        if let Err(e) = registry.resume_for_terminal(terminal) {
+            let _ = out_tx.send(DaemonMsg::Error {
+                message: format!("could not resume terminal: {e:#}"),
+            });
+            return;
+        }
+    }
     let Some(session) = registry.session(terminal) else {
         let _ = out_tx.send(DaemonMsg::Error {
             message: "terminal has no live session".to_string(),

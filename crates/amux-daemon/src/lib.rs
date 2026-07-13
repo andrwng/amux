@@ -84,7 +84,10 @@ pub fn run_blocking(repo: PathBuf) -> Result<()> {
             std::process::id()
         );
 
-        let registry = Registry::with_hooks(adapter, mailbox.clone(), amux_exe);
+        let state_path = amux_core::paths::state_file()?;
+        let registry = Registry::with_hooks(adapter, mailbox.clone(), amux_exe, state_path);
+        // Reinstate agents/repos/minis from a previous run (suspended until a client opens them).
+        registry.load_state();
         // Pre-register the launching repo so `amux` in a repo dir works out of the box; clients
         // also register their own cwd on connect, so the daemon serves many repos over time.
         if let Err(e) = registry.register_path(&repo, WorktreeLocation::Global) {
@@ -100,6 +103,8 @@ pub fn run_blocking(repo: PathBuf) -> Result<()> {
             _ = sigint.recv() => { tracing::info!("SIGINT, shutting down"); Ok(()) }
         };
 
+        // Capture any last durable changes (e.g. unread/activity) before the processes die.
+        registry.save();
         registry.shutdown_all();
         std::fs::remove_file(&socket).ok();
         std::fs::remove_file(&mailbox).ok();

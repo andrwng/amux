@@ -12,6 +12,7 @@ use std::time::Duration;
 
 use anyhow::{Context, Result};
 use chrono::{DateTime, Utc};
+use serde::{Deserialize, Serialize};
 use tokio::sync::broadcast;
 
 use amux_core::adapter::{AgentAdapter, HookSetup, LaunchContext};
@@ -52,7 +53,6 @@ struct Agent {
     branch: String,
     worktree: PathBuf,
     ai_session_id: Option<String>,
-    #[allow(dead_code)] // durable metadata; used by state.json persistence (deferred)
     created_at: DateTime<Utc>,
     last_activity: DateTime<Utc>,
     state: AgentState,
@@ -107,6 +107,40 @@ struct State {
     minis: Vec<AgentId>,
 }
 
+/// The durable slice of the daemon's state, written to `state.json` so agents/repos/minis survive
+/// a daemon restart. Live processes (PTYs) are *not* here — they die with the daemon and are
+/// re-spawned lazily (via `resume`) when a client next attaches a suspended agent's primary.
+#[derive(Serialize, Deserialize, Default)]
+struct PersistedState {
+    repos: Vec<PersistedRepo>,
+    agents: Vec<PersistedAgent>,
+    /// Which agents were open as minis, in order.
+    minis: Vec<AgentId>,
+}
+
+/// A repo as `repo` + `base` paths, enough to rebuild its [`WorktreeService`] verbatim.
+#[derive(Serialize, Deserialize)]
+struct PersistedRepo {
+    repo: PathBuf,
+    base: PathBuf,
+}
+
+/// An agent's durable identity. State is not persisted — a reloaded agent is suspended (`Exited`)
+/// until a client attaches its primary, which resumes it (reusing `primary` + `ai_session_id`).
+#[derive(Serialize, Deserialize)]
+struct PersistedAgent {
+    id: AgentId,
+    repo: RepoId,
+    name: String,
+    branch: String,
+    worktree: PathBuf,
+    ai_session_id: Option<String>,
+    created_at: DateTime<Utc>,
+    last_activity: DateTime<Utc>,
+    unread: bool,
+    primary: TerminalId,
+}
+
 /// Where the daemon's hook mailbox lives and how to invoke the bridge, so launched CLIs can
 /// push status back. Absent in tests (the fake `cat` agent has no hooks).
 struct HookIntegration {
@@ -121,36 +155,48 @@ pub struct Registry {
     hooks: Option<HookIntegration>,
     /// PTY-silence window after which the heartbeat settles a `Working` agent to `Idle`.
     idle_timeout: Duration,
+    /// Where durable state (repos/agents/minis) is written so it survives a daemon restart.
+    /// `None` disables persistence (tests, unless they opt in via [`Registry::with_state`]).
+    state_path: Option<PathBuf>,
 }
 
 impl Registry {
     pub fn new(adapter: Box<dyn AgentAdapter>) -> Arc<Self> {
-        Self::build(adapter, None, DEFAULT_IDLE_TIMEOUT)
+        Self::build(adapter, None, DEFAULT_IDLE_TIMEOUT, None)
     }
 
-    /// Build a registry that wires launched agents' hooks to `socket`, invoking `amux_exe hook`.
+    /// Build a registry that wires launched agents' hooks to `socket`, invoking `amux_exe hook`,
+    /// and persists durable state to `state_path`.
     pub fn with_hooks(
         adapter: Box<dyn AgentAdapter>,
         socket: PathBuf,
         amux_exe: PathBuf,
+        state_path: PathBuf,
     ) -> Arc<Self> {
         Self::build(
             adapter,
             Some(HookIntegration { socket, amux_exe }),
             DEFAULT_IDLE_TIMEOUT,
+            Some(state_path),
         )
     }
 
     /// Build a registry with a custom heartbeat idle timeout — used by tests to exercise the
     /// backstop on a human timescale.
     pub fn with_idle_timeout(adapter: Box<dyn AgentAdapter>, idle_timeout: Duration) -> Arc<Self> {
-        Self::build(adapter, None, idle_timeout)
+        Self::build(adapter, None, idle_timeout, None)
+    }
+
+    /// Build a registry that persists durable state to `state_path` (for persistence tests).
+    pub fn with_state(adapter: Box<dyn AgentAdapter>, state_path: PathBuf) -> Arc<Self> {
+        Self::build(adapter, None, DEFAULT_IDLE_TIMEOUT, Some(state_path))
     }
 
     fn build(
         adapter: Box<dyn AgentAdapter>,
         hooks: Option<HookIntegration>,
         idle_timeout: Duration,
+        state_path: Option<PathBuf>,
     ) -> Arc<Self> {
         let (events, _) = broadcast::channel(EVENT_BACKLOG);
         Arc::new(Self {
@@ -159,6 +205,7 @@ impl Registry {
             events,
             hooks,
             idle_timeout,
+            state_path,
         })
     }
 
@@ -199,6 +246,7 @@ impl Registry {
             }
         };
         if is_new {
+            self.save();
             let _ = self.events.send(DaemonMsg::RepoAdded(info.clone()));
         }
         info
@@ -237,10 +285,152 @@ impl Registry {
     /// Persist which agents are open as minis (replayed to a re-attaching client).
     pub fn set_minis(&self, minis: Vec<AgentId>) {
         self.state.lock().unwrap().minis = minis;
+        self.save();
     }
 
     pub fn minis(&self) -> Vec<AgentId> {
         self.state.lock().unwrap().minis.clone()
+    }
+
+    /// Serialize durable state (repos/agents/minis) to `state.json` via an atomic temp+rename.
+    /// No-op without a state path; a write failure is logged, never fatal.
+    pub fn save(&self) {
+        let Some(path) = &self.state_path else {
+            return;
+        };
+        let snapshot = {
+            let state = self.state.lock().unwrap();
+            PersistedState {
+                repos: state
+                    .repos
+                    .values()
+                    .map(|e| PersistedRepo {
+                        repo: e.worktrees.repo().to_path_buf(),
+                        base: e.worktrees.base().to_path_buf(),
+                    })
+                    .collect(),
+                agents: state
+                    .agents
+                    .values()
+                    .map(|a| PersistedAgent {
+                        id: a.id,
+                        repo: a.repo,
+                        name: a.name.clone(),
+                        branch: a.branch.clone(),
+                        worktree: a.worktree.clone(),
+                        ai_session_id: a.ai_session_id.clone(),
+                        created_at: a.created_at,
+                        last_activity: a.last_activity,
+                        unread: a.unread,
+                        primary: a.primary,
+                    })
+                    .collect(),
+                minis: state.minis.clone(),
+            }
+        };
+        if let Err(e) = write_atomic(path, &snapshot) {
+            tracing::warn!("could not persist state to {}: {e:#}", path.display());
+        }
+    }
+
+    /// Load durable state on startup: re-register repos and reinstate their agents as **suspended**
+    /// (no live session, `Exited`) with a dormant primary terminal, so a later attach can resume
+    /// them (reusing the primary id + `ai_session_id`). No-op if the file is absent/unreadable.
+    pub fn load_state(&self) {
+        let Some(path) = &self.state_path else {
+            return;
+        };
+        let bytes = match std::fs::read(path) {
+            Ok(b) => b,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return,
+            Err(e) => {
+                tracing::warn!("could not read state {}: {e:#}", path.display());
+                return;
+            }
+        };
+        let persisted: PersistedState = match serde_json::from_slice(&bytes) {
+            Ok(p) => p,
+            Err(e) => {
+                tracing::warn!("ignoring unreadable state {}: {e:#}", path.display());
+                return;
+            }
+        };
+        let mut state = self.state.lock().unwrap();
+        for r in persisted.repos {
+            match WorktreeService::with_base(&r.repo, &r.base) {
+                Ok(worktrees) => {
+                    let id = RepoId::from_canonical_path(worktrees.repo());
+                    let name = worktrees
+                        .repo()
+                        .file_name()
+                        .map(|n| n.to_string_lossy().into_owned())
+                        .unwrap_or_else(|| "repo".to_string());
+                    let info = RepoInfo {
+                        id,
+                        name,
+                        path: worktrees.repo().to_path_buf(),
+                    };
+                    state
+                        .repos
+                        .entry(id)
+                        .or_insert(RepoEntry { info, worktrees });
+                }
+                Err(e) => tracing::warn!("dropping saved repo {}: {e:#}", r.repo.display()),
+            }
+        }
+        for a in persisted.agents {
+            // Skip agents whose repo could not be re-registered (its worktree base is gone).
+            if !state.repos.contains_key(&a.repo) {
+                continue;
+            }
+            // A dormant primary terminal (no session) so `resume` can find and revive it.
+            state.terminals.insert(
+                a.primary,
+                Terminal {
+                    agent: a.id,
+                    worktree: a.worktree.clone(),
+                    primary: true,
+                    session: None,
+                    passthrough: false,
+                },
+            );
+            state.agents.insert(
+                a.id,
+                Agent {
+                    id: a.id,
+                    repo: a.repo,
+                    name: a.name,
+                    branch: a.branch,
+                    worktree: a.worktree,
+                    ai_session_id: a.ai_session_id,
+                    created_at: a.created_at,
+                    last_activity: a.last_activity,
+                    state: AgentState::Exited { code: None },
+                    unread: a.unread,
+                    primary: a.primary,
+                },
+            );
+        }
+        // Keep only minis whose agent survived the load.
+        state.minis = persisted
+            .minis
+            .into_iter()
+            .filter(|id| state.agents.contains_key(id))
+            .collect();
+    }
+
+    /// Ensure `terminal`'s agent is live, resuming a suspended primary if needed. Called when a
+    /// client attaches a primary with no session (e.g. after a daemon restart). No-op if it's
+    /// already live or the terminal isn't a suspended primary.
+    pub fn resume_for_terminal(self: &Arc<Self>, terminal: TerminalId) -> Result<()> {
+        let agent = {
+            let state = self.state.lock().unwrap();
+            match state.terminals.get(&terminal) {
+                Some(t) if t.primary && t.session.is_none() => t.agent,
+                _ => return Ok(()),
+            }
+        };
+        self.resume(agent)
     }
 
     pub fn repos(&self) -> Vec<RepoInfo> {
@@ -354,6 +544,7 @@ impl Registry {
             info
         };
         self.spawn_primary_monitor(agent_id, terminal_id, session);
+        self.save();
         let _ = self.events.send(DaemonMsg::AgentAdded(info.clone()));
         Ok(info)
     }
@@ -390,10 +581,23 @@ impl Registry {
     /// and no-op events are silently ignored.
     pub fn on_hook(&self, report: HookReport) {
         let classified = classify(&report.event);
-        if let Some(sid) = classified.session_id {
-            if let Some(agent) = self.state.lock().unwrap().agents.get_mut(&report.agent) {
-                agent.ai_session_id = Some(sid);
+        // Capturing the AI session id is the one hook-driven change worth persisting (it's what
+        // lets a resume across a daemon restart continue the same conversation). Save only when it
+        // actually changes — every hook carries it, but it's set once per session.
+        let session_changed = if let Some(sid) = classified.session_id {
+            let mut state = self.state.lock().unwrap();
+            match state.agents.get_mut(&report.agent) {
+                Some(a) if a.ai_session_id.as_deref() != Some(sid.as_str()) => {
+                    a.ai_session_id = Some(sid);
+                    true
+                }
+                _ => false,
             }
+        } else {
+            false
+        };
+        if session_changed {
+            self.save();
         }
         if let Some(event) = classified.event {
             self.apply_event(report.agent, event);
@@ -593,6 +797,7 @@ impl Registry {
         if let Some(worktrees) = worktrees {
             worktrees.remove(&branch).ok();
         }
+        self.save();
         let _ = self.events.send(DaemonMsg::AgentRemoved { id });
         Ok(DeleteOutcome::Deleted)
     }
@@ -712,6 +917,19 @@ impl Registry {
 
 fn agent_name(branch: &str) -> String {
     branch.rsplit('/').next().unwrap_or(branch).to_string()
+}
+
+/// Write `state` to `path` atomically: serialize to a sibling temp file, then rename over `path`
+/// so a reader never sees a half-written file.
+fn write_atomic(path: &Path, state: &PersistedState) -> Result<()> {
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent).with_context(|| format!("create {}", parent.display()))?;
+    }
+    let json = serde_json::to_vec_pretty(state).context("serialize state")?;
+    let tmp = path.with_extension("json.tmp");
+    std::fs::write(&tmp, &json).with_context(|| format!("write {}", tmp.display()))?;
+    std::fs::rename(&tmp, path).with_context(|| format!("rename into {}", path.display()))?;
+    Ok(())
 }
 
 /// Apply `next` to `id` inside the locked state: update the state + activity, and flag the agent

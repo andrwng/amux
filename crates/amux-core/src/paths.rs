@@ -37,3 +37,10 @@ fn fallback_dir() -> Result<PathBuf> {
     let base = directories::BaseDirs::new().context("cannot determine home directory")?;
     Ok(base.home_dir().join(".amux").join("run"))
 }
+
+/// The daemon's durable state file (`~/.amux/state.json`). Unlike the runtime dir (which may live
+/// under `/run` and be wiped on reboot), this persists agents/repos/minis across daemon restarts.
+pub fn state_file() -> Result<PathBuf> {
+    let base = directories::BaseDirs::new().context("cannot determine home directory")?;
+    Ok(base.home_dir().join(".amux").join("state.json"))
+}

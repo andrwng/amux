@@ -852,3 +852,58 @@ async fn dirty_worktree_requires_delete_confirmation() {
         "worktree should be gone after force delete"
     );
 }
+
+/// Durable state survives a daemon restart: a fresh registry loads the previous run's repo,
+/// agent, and mini from `state.json`, reinstating the agent as suspended until it's resumed.
+#[tokio::test]
+async fn durable_state_survives_a_daemon_restart() {
+    let tmp = tempfile::tempdir().unwrap();
+    let repo = tmp.path().join("repo");
+    std::fs::create_dir(&repo).unwrap();
+    init_repo(&repo);
+    let wt_base = tmp.path().join("wt");
+    let state_path = tmp.path().join("state.json");
+
+    // First daemon: register a repo, create an agent, mark it a mini. Each persists.
+    let info = {
+        let worktrees = WorktreeService::with_base(&repo, &wt_base).unwrap();
+        let adapter = Box::new(ClaudeAdapter::with_command(vec!["cat".into()]));
+        let registry = Registry::with_state(adapter, state_path.clone());
+        let repo_id = registry.register(worktrees).id;
+        let info = registry.create(repo_id, "feature").unwrap();
+        registry.set_minis(vec![info.id]);
+        info
+    };
+    assert!(state_path.exists(), "state.json is written");
+
+    // Second daemon: load_state re-registers the repo from state.json — no manual register here.
+    let adapter = Box::new(ClaudeAdapter::with_command(vec!["cat".into()]));
+    let registry = Registry::with_state(adapter, state_path.clone());
+    registry.load_state();
+
+    let infos = registry.infos();
+    assert_eq!(infos.len(), 1, "the agent reloaded");
+    let loaded = &infos[0];
+    assert_eq!(loaded.id, info.id);
+    assert_eq!(loaded.branch, "feature");
+    assert_eq!(
+        loaded.primary_terminal, info.primary_terminal,
+        "stable primary id"
+    );
+    assert!(
+        matches!(loaded.state, AgentState::Exited { .. }),
+        "reloaded agents are suspended until opened, got {:?}",
+        loaded.state
+    );
+    assert_eq!(registry.minis(), vec![info.id], "the mini reloaded");
+
+    // The primary is dormant until attached; resuming revives its session in place, reusing the id.
+    assert!(registry.session(info.primary_terminal).is_none());
+    registry
+        .resume_for_terminal(info.primary_terminal)
+        .expect("resume the suspended primary");
+    assert!(
+        registry.session(info.primary_terminal).is_some(),
+        "the primary is live after resume"
+    );
+}

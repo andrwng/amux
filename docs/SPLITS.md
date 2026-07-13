@@ -115,9 +115,25 @@ active agent's tree to a `Layout` (leaves = terminal ids, splits = axis + ratio)
 `SetLayout { agent, layout }` on every layout change (via `reconcile`); the daemon holds the
 layouts and replays them to a re-attaching client (`DaemonMsg::Layouts` on connect). On first
 open of an agent, the client rebuilds its tree from the saved layout and re-attaches the shells
-(which kept running headless in the daemon). This covers **client** restarts; surviving a
-**daemon** restart needs `~/.amux/state.json` (the terminals themselves don't persist yet — still
-deferred). `Axis`/`Dir` are shared via `amux_core::nav`.
+(which kept running headless in the daemon). This covers **client** restarts. `Axis`/`Dir` are
+shared via `amux_core::nav`.
+
+## S.5 — Daemon-restart persistence (DONE, `~/.amux/state.json`)
+
+The daemon writes its **durable** state — repos (as repo+base paths), agents (id, repo, branch,
+worktree, `ai_session_id`, timestamps, unread, **primary terminal id**), and the minis list — to
+`~/.amux/state.json` on every meaningful change (create/delete/repo-add/set-minis/first
+session-id capture) via an atomic temp+rename, plus a final flush on shutdown. On startup it
+`load_state()`s: repos re-register (rebuilt via `WorktreeService::with_base`, so ids match) and
+agents come back **suspended** (`Exited`, no live session) with a dormant primary terminal.
+
+Live processes (PTYs) die with the daemon and are **not** persisted; instead a suspended agent
+is revived **lazily** — when a client attaches its primary and finds no session, the daemon
+`resume`s it (reusing the same primary id + `ai_session_id`, so Claude continues the same
+conversation). Only *visible* agents (the active one + minis) resume on reconnect; the rest stay
+suspended in the sidebar until opened. Pane **layouts don't survive a daemon restart** (their
+shell processes are gone) — an agent reopens with a single primary pane. No proto change: this is
+entirely server-side, transparent over the existing `Attach`/`StateChanged` wire.
 
 ---
 
