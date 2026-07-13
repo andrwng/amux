@@ -16,5 +16,6 @@ pub use message::{AgentInfo, ClientMsg, DaemonMsg, Layout, RepoInfo, Size};
 /// v10 layout persistence (SetLayout, Layouts); v11 mini persistence (SetMinis, Minis); v12 active
 /// agent persistence (SetActive, Active — restores the main pane on reconnect); v13 screen-family
 /// pane TERM (bumped so a running daemon auto-refreshes to spawn panes with the new TERM, though
-/// the control wire is unchanged).
-pub const PROTO_VERSION: u32 = 13;
+/// the control wire is unchanged); v14 agents launch/resume Idle not Working (bumped to refresh a
+/// daemon still starting agents in the false Working state).
+pub const PROTO_VERSION: u32 = 14;

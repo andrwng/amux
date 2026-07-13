@@ -572,7 +572,10 @@ impl Registry {
                 ai_session_id: None,
                 created_at: now,
                 last_activity: now,
-                state: AgentState::Working,
+                // A freshly launched CLI is sitting at its prompt — idle/waiting, not working.
+                // Real work is signalled by hooks (UserPromptSubmit/… → Working); starting in
+                // Working would show a false "⋯" and, when the heartbeat settled it, a false unread.
+                state: AgentState::Idle,
                 unread: false,
                 primary: terminal_id,
             };
@@ -776,7 +779,9 @@ impl Registry {
             }
             match state.agents.get_mut(&id) {
                 Some(agent) => {
-                    agent.state = AgentState::Working;
+                    // Resuming lands back at the prompt — idle/waiting, not working (same reasoning
+                    // as create): let hooks drive Working so we don't flash a false "⋯"/unread.
+                    agent.state = AgentState::Idle;
                     agent.last_activity = Utc::now();
                     agent.state.clone()
                 }

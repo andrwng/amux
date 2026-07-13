@@ -476,8 +476,27 @@ async fn heartbeat_settles_a_silent_working_agent_to_idle() {
 
     let mut client = handshake(&socket).await;
     let agent = create_agent(&mut client, repo_id, "feat/idle").await;
-    assert!(matches!(agent.state, AgentState::Working));
+    // A freshly launched agent is idle at its prompt, not working.
+    assert!(matches!(agent.state, AgentState::Idle));
 
+    // Real activity (a hook) drives it to Working...
+    registry.on_hook(HookReport {
+        agent: agent.id,
+        event: hook("PreToolUse", None, None),
+    });
+    assert!(
+        wait_for_state(&mut client, agent.id, |s| matches!(s, AgentState::Working)).await,
+        "a hook should move the agent to Working"
+    );
+    // ...and then, with the PTY quiet, the heartbeat backstop settles it to Idle. One byte of input
+    // (echoed by the pty) re-arms the heartbeat before cat goes silent again.
+    client
+        .send(ClientMsg::Input {
+            terminal: agent.primary_terminal,
+            bytes: b"x\n".to_vec(),
+        })
+        .await
+        .unwrap();
     assert!(
         wait_for_state(&mut client, agent.id, |s| matches!(s, AgentState::Idle)).await,
         "the heartbeat should settle a silent Working agent to Idle"
@@ -505,7 +524,20 @@ async fn unread_is_set_on_finish_when_unfocused_and_cleared_on_focus() {
     let mut client = handshake(&socket).await;
     let agent = create_agent(&mut client, repo_id, "feat/unread").await;
 
-    // Focus is in the sidebar (nothing viewed). Claude finishes a turn → unread.
+    // Focus is in the sidebar (nothing viewed). A real turn — activity then finish — marks unread;
+    // a bare Stop on an already-idle agent wouldn't (it never worked).
+    send_hook(
+        &mailbox,
+        HookReport {
+            agent: agent.id,
+            event: hook("PreToolUse", None, None),
+        },
+    )
+    .await;
+    assert!(
+        wait_for_state(&mut client, agent.id, |s| matches!(s, AgentState::Working)).await,
+        "activity moves it to Working"
+    );
     send_hook(
         &mailbox,
         HookReport {
