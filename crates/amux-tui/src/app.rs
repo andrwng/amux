@@ -1754,22 +1754,31 @@ fn render_sidebar(frame: &mut Frame, area: Rect, app: &App) {
                     continue;
                 };
                 let is_open = open.contains(&id);
-                // Unread agents render bold with a leading • dot; read ones are plain.
+                // Unread agents get a bold cyan gutter bar (▌) down the left edge plus a bold name,
+                // so a waiting agent is obvious at a glance; read ones are plain. The bar sits in
+                // its own column beside the selection cursor, so a selected *and* unread row shows
+                // both.
                 let name_style = if agent.unread || selected {
                     Style::default().add_modifier(Modifier::BOLD)
                 } else {
                     Style::default()
                 };
-                let dot = if agent.unread { "\u{2022}" } else { " " };
+                let unread_bar = if agent.unread { "\u{258c}" } else { " " };
                 let name = if is_open {
                     format!("{:<10.10}*", agent.name)
                 } else {
                     format!("{:<11.11}", agent.name)
                 };
                 lines.push(Line::from(vec![
-                    Span::styled(format!("{marker} {dot} "), Style::default().fg(Color::Cyan)),
+                    Span::styled(marker.to_string(), Style::default().fg(Color::Cyan)),
                     Span::styled(
-                        format!("{} ", agent.state.glyph()),
+                        unread_bar,
+                        Style::default()
+                            .fg(Color::Cyan)
+                            .add_modifier(Modifier::BOLD),
+                    ),
+                    Span::styled(
+                        format!(" {} ", agent.state.glyph()),
                         Style::default().fg(color_for(&agent.state)),
                     ),
                     Span::styled(name, name_style),
