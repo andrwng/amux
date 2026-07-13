@@ -80,6 +80,7 @@ async fn handle_client(stream: UnixStream, registry: Arc<Registry>) -> Result<()
     framed.send(DaemonMsg::Repos(registry.repos())).await?;
     framed.send(DaemonMsg::Agents(registry.infos())).await?;
     framed.send(DaemonMsg::Layouts(registry.layouts())).await?;
+    framed.send(DaemonMsg::Minis(registry.minis())).await?;
 
     let (mut sink, mut stream) = framed.split();
     let (out_tx, mut out_rx) = mpsc::unbounded_channel::<DaemonMsg>();
@@ -163,6 +164,7 @@ fn handle_command(
         }
         ClientMsg::Focus { agent } => registry.focus(agent),
         ClientMsg::SetLayout { agent, layout } => registry.set_layout(agent, layout),
+        ClientMsg::SetMinis(minis) => registry.set_minis(minis),
         ClientMsg::DoctorRepo { repo } => match registry.doctor(repo) {
             Ok(report) => {
                 let _ = out_tx.send(DaemonMsg::DoctorReport {

@@ -103,6 +103,8 @@ struct State {
     /// Saved pane layouts per agent, replayed to a re-attaching client so splits survive the TUI
     /// closing. In-memory (survives client restart, not a daemon restart — that's state.json).
     layouts: HashMap<AgentId, amux_proto::Layout>,
+    /// Which agents are open as minis (left-to-right) — replayed to a re-attaching client.
+    minis: Vec<AgentId>,
 }
 
 /// Where the daemon's hook mailbox lives and how to invoke the bridge, so launched CLIs can
@@ -230,6 +232,15 @@ impl Registry {
             .iter()
             .map(|(id, l)| (*id, l.clone()))
             .collect()
+    }
+
+    /// Persist which agents are open as minis (replayed to a re-attaching client).
+    pub fn set_minis(&self, minis: Vec<AgentId>) {
+        self.state.lock().unwrap().minis = minis;
+    }
+
+    pub fn minis(&self) -> Vec<AgentId> {
+        self.state.lock().unwrap().minis.clone()
     }
 
     pub fn repos(&self) -> Vec<RepoInfo> {
@@ -563,6 +574,7 @@ impl Registry {
             let mut state = self.state.lock().unwrap();
             state.agents.remove(&id);
             state.layouts.remove(&id);
+            state.minis.retain(|a| *a != id);
             let terminal_ids: Vec<TerminalId> = state
                 .terminals
                 .iter()

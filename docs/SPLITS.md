@@ -87,8 +87,17 @@ time. Opening an agent from the sidebar **swaps** the whole main area to that ag
 (created with its primary terminal the first time, restored thereafter); splitting adds a sibling
 shell **to that agent's** workspace. Switching agents **detaches** the previous agent's terminals
 (they keep running headless in the daemon and restore on return) — it never mixes two agents in
-one layout. The only place different agents appear at once is the floating **minis** (Phase 3),
-each showing just that agent's primary (Claude) terminal.
+one layout. The only place different agents appear at once is the **minis** (below), each showing just that
+agent's primary (Claude) terminal.
+
+### Minis (Phase 3, proto v10–v11)
+A docked row of small live terminals **below** the main panes — the bottom row of the same grid.
+`m` in the sidebar opens the selected agent as a mini (an agent is never both in the main area and
+a mini). Spatial `Ctrl+hjkl` flows in/out (`Ctrl+j` from the bottom pane → minis, `Ctrl+k` back,
+`Ctrl+h/l` across, `Ctrl+h` off the left → sidebar); a focused mini takes keystrokes to its primary
+terminal. `Ctrl+B`: `Enter` promote→main · `-` minimize (status-only strip, terminal detached) ·
+`z` peek (hide the whole row) · `x` close. Which agents are minis persists across TUI restarts
+(`SetMinis`/`Minis`, same mechanism as the layout).
 
 ### Sidebar cell (when focused)
 `j`/`k` select · `n` new · `d` delete · `r` resume · `Enter`/`l` open the selected agent into the

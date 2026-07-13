@@ -13,5 +13,5 @@ pub use message::{AgentInfo, ClientMsg, DaemonMsg, Layout, RepoInfo, Size};
 /// v5 multi-repo; v6 doctor (prune orphaned worktrees); v7 hook mailbox + real `claude` (bumped
 /// so a pre-hook daemon is auto-refreshed even though the control wire is unchanged); v8 inbox
 /// read/unread (AgentInfo.unread, Focus, UnreadChanged); v9 vim-aware nav (TerminalApp, Navigate);
-/// v10 layout persistence (SetLayout, Layouts).
-pub const PROTO_VERSION: u32 = 10;
+/// v10 layout persistence (SetLayout, Layouts); v11 mini persistence (SetMinis, Minis).
+pub const PROTO_VERSION: u32 = 11;

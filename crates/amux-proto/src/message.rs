@@ -98,6 +98,8 @@ pub enum ClientMsg {
         agent: AgentId,
         layout: Option<Layout>,
     },
+    /// Persist which agents are open as minis (left-to-right), so they survive closing the TUI.
+    SetMinis(Vec<AgentId>),
     /// Start streaming a terminal into a pane (snapshot then live output).
     Attach { terminal: TerminalId, size: Size },
     /// Stop streaming a terminal (its pane closed / was replaced).
@@ -124,6 +126,8 @@ pub enum DaemonMsg {
     Agents(Vec<AgentInfo>),
     /// Saved pane layouts (on connect) so a re-attaching client can restore its splits.
     Layouts(Vec<(AgentId, Layout)>),
+    /// The persisted minis list (on connect) so a re-attaching client restores its minis.
+    Minis(Vec<AgentId>),
     /// A new agent appeared.
     AgentAdded(AgentInfo),
     /// An agent was deleted.

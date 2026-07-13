@@ -82,6 +82,10 @@ async fn handshake(socket: &Path) -> Client {
         Some(Ok(DaemonMsg::Layouts(_))) => {}
         other => panic!("expected Layouts, got {other:?}"),
     }
+    match client.next().await {
+        Some(Ok(DaemonMsg::Minis(_))) => {}
+        other => panic!("expected Minis, got {other:?}"),
+    }
     client
 }
 
@@ -598,6 +602,10 @@ async fn layout_persists_for_a_reconnecting_client() {
         })
         .await
         .unwrap();
+    client
+        .send(ClientMsg::SetMinis(vec![agent.id]))
+        .await
+        .unwrap();
     // Round-trip a command so the daemon has surely processed SetLayout before we reconnect.
     client.send(ClientMsg::ListAgents).await.unwrap();
     tokio::time::timeout(Duration::from_secs(5), async {
@@ -618,20 +626,32 @@ async fn layout_persists_for_a_reconnecting_client() {
     })
     .await
     .unwrap();
-    let got = tokio::time::timeout(Duration::from_secs(5), async {
+    let (mut got_layout, mut got_minis) = (false, false);
+    tokio::time::timeout(Duration::from_secs(5), async {
         loop {
             match c2.next().await {
                 Some(Ok(DaemonMsg::Layouts(list))) => {
-                    return list.iter().any(|(a, l)| *a == agent.id && *l == layout);
+                    got_layout = list.iter().any(|(a, l)| *a == agent.id && *l == layout);
+                }
+                Some(Ok(DaemonMsg::Minis(minis))) => {
+                    got_minis = minis == vec![agent.id];
+                    return; // Minis is the last handshake frame
                 }
                 Some(Ok(_)) => {}
-                _ => return false,
+                _ => return,
             }
         }
     })
     .await
-    .unwrap_or(false);
-    assert!(got, "reconnecting client should receive the saved layout");
+    .unwrap();
+    assert!(
+        got_layout,
+        "reconnecting client should receive the saved layout"
+    );
+    assert!(
+        got_minis,
+        "reconnecting client should receive the saved minis"
+    );
 }
 
 #[tokio::test]

@@ -330,6 +330,15 @@ impl App {
             DaemonMsg::Layouts(list) => {
                 self.saved_layouts = list.into_iter().collect();
             }
+            DaemonMsg::Minis(list) => {
+                // Restore minis for agents that still exist (their terminals kept running).
+                self.minis = list
+                    .into_iter()
+                    .filter(|id| self.agents.iter().any(|a| a.id == *id))
+                    .filter(|id| Some(*id) != self.active_agent)
+                    .collect();
+                self.reconcile(sink).await?;
+            }
             DaemonMsg::AgentAdded(info) => {
                 // Select the freshly-created agent so the next Enter opens it.
                 let id = info.id;
@@ -1227,7 +1236,7 @@ impl App {
             self.parsers.remove(&terminal);
         }
 
-        // Persist the active agent's layout so its splits survive closing the TUI.
+        // Persist the active agent's layout + the open minis so they survive closing the TUI.
         if let Some(agent) = self.active_agent {
             sink.send(ClientMsg::SetLayout {
                 agent,
@@ -1235,6 +1244,7 @@ impl App {
             })
             .await?;
         }
+        sink.send(ClientMsg::SetMinis(self.minis.clone())).await?;
         Ok(())
     }
 
