@@ -24,8 +24,19 @@ the daemon only relays the announce/nav intents.
 The plugin self-disables unless `$AMUX_TERMINAL_ID` is set (i.e. only inside an amux pane), so it's
 safe to always load.
 
-- **vim-plug:** `Plug 'you/amux', { 'rtp': 'contrib' }`
-- **manual:** copy `amux.vim` to `~/.vim/plugin/` (vim) or `~/.config/nvim/plugin/` (neovim).
+- **Symlink (simplest, stays in sync with the repo):**
+  ```sh
+  mkdir -p ~/.vim/plugin                # or ~/.config/nvim/plugin for neovim
+  ln -s /path/to/amux/contrib/plugin/amux.vim ~/.vim/plugin/amux.vim
+  ```
+  Files in `~/.vim/plugin/` load after your vim-plug plugins, so `amux.vim`'s mappings already win
+  inside amux.
+
+- **vim-plug (from a local checkout):** add to your vimrc **after** any `vim-tmux-navigator` line,
+  then `:PlugInstall`:
+  ```vim
+  Plug '/path/to/amux', { 'rtp': 'contrib' }
+  ```
 
 If you also use `vim-tmux-navigator`, load `amux.vim` **after** it so its mappings win inside amux.
 Outside amux, `amux.vim` is inert and `vim-tmux-navigator` behaves normally.
