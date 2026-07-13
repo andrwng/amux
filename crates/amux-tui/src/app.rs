@@ -1769,11 +1769,13 @@ fn render_sidebar(frame: &mut Frame, area: Rect, app: &App) {
                     Style::default()
                 };
                 let unread_bar = if agent.unread { "\u{258c}" } else { " " };
-                let name = if is_open {
-                    format!("{:<10.10}*", agent.name)
-                } else {
-                    format!("{:<11.11}", agent.name)
-                };
+                // An open agent gets a leading '*'; the marker sits in its own column so names
+                // stay aligned whether open or not. The name then takes whatever width is left,
+                // truncating only when it doesn't fit. Prefix columns: cursor (1) + unread bar
+                // (1) + " glyph " (3) + open marker (1) = 6.
+                let open_marker = if is_open { "*" } else { " " };
+                let name_w = (inner.width as usize).saturating_sub(6);
+                let name = format!("{:.name_w$}", agent.name);
                 lines.push(Line::from(vec![
                     Span::styled(marker.to_string(), Style::default().fg(Color::Cyan)),
                     Span::styled(
@@ -1786,6 +1788,7 @@ fn render_sidebar(frame: &mut Frame, area: Rect, app: &App) {
                         format!(" {} ", agent.state.glyph()),
                         Style::default().fg(color_for(&agent.state)),
                     ),
+                    Span::styled(open_marker, name_style),
                     Span::styled(name, name_style),
                 ]));
                 if let AgentState::NeedsAttention {
