@@ -541,8 +541,11 @@ impl App {
             }
             Focus::Panes => match self.tree.navigate(dir, pane_area) {
                 Nav::ExitLeft => self.focus = Focus::Sidebar,
-                // Off the bottom of the panes drops into the minis row.
-                Nav::Stay if dir == Dir::Down && !self.minis.is_empty() => self.enter_mini(0),
+                // The minis sit below and to the right of the panes, so hitting the bottom or right
+                // edge drops into the leftmost mini (adjacent to the main area).
+                Nav::Stay if matches!(dir, Dir::Down | Dir::Right) && !self.minis.is_empty() => {
+                    self.enter_mini(0)
+                }
                 _ => {}
             },
             Focus::Mini(i) => match dir {
@@ -2043,10 +2046,13 @@ mod tests {
         // Up climbs back into the main layout.
         app.navigate(Dir::Up);
         assert_eq!(app.focus, Focus::Panes);
-        // Left off the leftmost mini lands in the sidebar.
-        app.focus = Focus::Mini(0);
+        // Right off the right edge of the panes also drops into the leftmost mini (they sit to the
+        // right of the main area as well as below it)...
+        app.navigate(Dir::Right);
+        assert_eq!(app.focus, Focus::Mini(0));
+        // ...and left off the leftmost mini re-enters the panes.
         app.navigate(Dir::Left);
-        assert_eq!(app.focus, Focus::Sidebar);
+        assert_eq!(app.focus, Focus::Panes);
 
         // Two minis sit adjacent, right-anchored to the (inset) minis band.
         let (_, minis_area) = app.regions();
