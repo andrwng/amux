@@ -146,6 +146,10 @@ struct App {
     input: InputMode,
     prefix: bool,
     resize_mode: bool,
+    /// Scroll (copy) mode: the terminal being scrolled and how many rows back into its
+    /// scrollback the view is. `None` = live at the bottom.
+    scroll_mode: Option<TerminalId>,
+    scroll_offset: usize,
     /// Branch buffer (both `n` and `N`); repo-path buffer + focused field (`N` only).
     create_buf: String,
     dir_buf: String,
@@ -177,6 +181,8 @@ impl App {
             input: InputMode::Normal,
             prefix: false,
             resize_mode: false,
+            scroll_mode: None,
+            scroll_offset: 0,
             create_buf: String::new(),
             dir_buf: String::new(),
             create_field: Field::Dir,
@@ -322,6 +328,12 @@ impl App {
             InputMode::Confirming => return self.key_confirm(key, sink).await,
             InputMode::Normal => {}
         }
+        if let Some(terminal) = self.scroll_mode {
+            if self.parsers.contains_key(&terminal) {
+                return Ok(self.key_scroll(key, terminal));
+            }
+            self.scroll_mode = None; // the pane went away
+        }
         if self.resize_mode {
             return self.key_resize(key, sink).await;
         }
@@ -459,6 +471,13 @@ impl App {
                 self.reconcile(sink).await?;
             }
             KeyCode::Char('r') if !self.tree.is_empty() => self.resize_mode = true,
+            // Enter scroll (copy) mode on the focused pane — tmux `Ctrl+B [`.
+            KeyCode::Char('[') if self.focus == Focus::Panes => {
+                if let Some(t) = self.tree.focused_payload() {
+                    self.scroll_mode = Some(t);
+                    self.apply_scroll(t, 0);
+                }
+            }
             // Direct resize (tmux muscle memory): `Ctrl+B` then capital H/J/K/L resizes the
             // focused pane one step and stays in resize mode so you can keep nudging (like `-r`).
             KeyCode::Char('H' | 'J' | 'K' | 'L') if !self.tree.is_empty() => {
@@ -503,6 +522,52 @@ impl App {
         })
         .await?;
         self.reconcile(sink).await
+    }
+
+    /// Scroll (copy) mode keys — vi-style, matching tmux `mode-keys vi`: j/k line, Ctrl-u/Ctrl-d
+    /// half-page, PageUp/PageDown page, g/G top/bottom, q/Esc/Enter to exit.
+    fn key_scroll(&mut self, key: KeyEvent, terminal: TerminalId) -> Flow {
+        let page = self
+            .attached
+            .get(&terminal)
+            .map(|s| s.rows as usize)
+            .unwrap_or(24)
+            .max(1);
+        let half = (page / 2).max(1);
+        let offset = self.scroll_offset;
+        let requested = match key.code {
+            KeyCode::Char('k') | KeyCode::Up => offset.saturating_add(1),
+            KeyCode::Char('j') | KeyCode::Down => offset.saturating_sub(1),
+            KeyCode::PageUp => offset.saturating_add(page),
+            KeyCode::PageDown => offset.saturating_sub(page),
+            KeyCode::Char('u') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                offset.saturating_add(half)
+            }
+            KeyCode::Char('d') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                offset.saturating_sub(half)
+            }
+            KeyCode::Char('g') => usize::MAX, // clamped to the buffer length below
+            KeyCode::Char('G') => 0,
+            KeyCode::Char('q') | KeyCode::Esc | KeyCode::Enter => {
+                self.apply_scroll(terminal, 0); // back to live
+                self.scroll_mode = None;
+                return Flow::Continue;
+            }
+            _ => return Flow::Continue,
+        };
+        self.apply_scroll(terminal, requested);
+        Flow::Continue
+    }
+
+    /// Set a terminal's scrollback view to `requested` rows back (clamped to its buffer), and
+    /// remember the actual offset for the status/indicator.
+    fn apply_scroll(&mut self, terminal: TerminalId, requested: usize) {
+        if let Some(parser) = self.parsers.get_mut(&terminal) {
+            parser.screen_mut().set_scrollback(requested);
+            self.scroll_offset = parser.screen().scrollback();
+        } else {
+            self.scroll_offset = 0;
+        }
     }
 
     async fn key_resize(&mut self, key: KeyEvent, sink: &mut Sink) -> Result<Flow> {
@@ -998,7 +1063,7 @@ fn render_panes(frame: &mut Frame, area: Rect, app: &App) {
     let by_id: HashMap<_, _> = app.agents.iter().map(|a| (a.id, a)).collect();
     for place in app.tree.layout(area) {
         let focused = place.focused && app.focus == Focus::Panes;
-        let (title, color) = match place.payload {
+        let (mut title, color) = match place.payload {
             Some(terminal) => match app.terminals.get(&terminal).and_then(|id| by_id.get(id)) {
                 Some(agent) if agent.primary_terminal == terminal => (
                     format!(" {} {} ", agent.state.glyph(), agent.branch),
@@ -1009,6 +1074,10 @@ fn render_panes(frame: &mut Frame, area: Rect, app: &App) {
             },
             None => (" empty ".to_string(), Color::DarkGray),
         };
+        // Show how far back this pane is scrolled while in scroll mode.
+        if app.scroll_mode == place.payload && app.scroll_offset > 0 {
+            title.push_str(&format!("\u{2191}{} ", app.scroll_offset));
+        }
         let border = if focused {
             Style::default()
                 .fg(Color::Cyan)
@@ -1067,6 +1136,14 @@ fn render_status(frame: &mut Frame, area: Rect, app: &App) {
             format!(" {} — delete anyway? y/n", app.confirm_msg),
             Style::default().fg(Color::White).bg(Color::Red),
         )
+    } else if app.scroll_mode.is_some() {
+        (
+            format!(
+                " SCROLL \u{2191}{} — j/k line \u{b7} ^u/^d half \u{b7} PgUp/PgDn page \u{b7} g/G top/bottom \u{b7} q done",
+                app.scroll_offset
+            ),
+            Style::default().fg(Color::Black).bg(Color::Yellow),
+        )
     } else if app.resize_mode {
         (
             " RESIZE — hjkl grow/shrink \u{b7} esc done".to_string(),
@@ -1074,7 +1151,7 @@ fn render_status(frame: &mut Frame, area: Rect, app: &App) {
         )
     } else if app.prefix {
         (
-            " Ctrl+B — % split \u{b7} \" split \u{b7} x close \u{b7} HJKL/r resize \u{b7} tab unread"
+            " Ctrl+B — % / \" split \u{b7} x close \u{b7} HJKL/r resize \u{b7} [ scroll \u{b7} tab unread"
                 .to_string(),
             Style::default().fg(Color::Black).bg(Color::Cyan),
         )
@@ -1100,4 +1177,51 @@ fn render_status(frame: &mut Frame, area: Rect, app: &App) {
         (hint.to_string(), Style::default().fg(Color::DarkGray))
     };
     frame.render_widget(Paragraph::new(Line::from(text)).style(style), area);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn key(code: KeyCode) -> KeyEvent {
+        KeyEvent::new(code, KeyModifiers::NONE)
+    }
+    fn ctrl(c: char) -> KeyEvent {
+        KeyEvent::new(KeyCode::Char(c), KeyModifiers::CONTROL)
+    }
+
+    #[test]
+    fn scroll_mode_moves_and_clamps_within_scrollback() {
+        let mut app = App::new(100, 40);
+        let t = TerminalId::new();
+        // A tiny 4-row viewport with plenty of history to scroll through.
+        let mut parser = vt100::Parser::new(4, 20, 100);
+        for i in 0..50 {
+            parser.process(format!("line {i}\r\n").as_bytes());
+        }
+        app.parsers.insert(t, parser);
+        app.attached.insert(t, Size { cols: 20, rows: 4 });
+        app.scroll_mode = Some(t);
+        app.apply_scroll(t, 0);
+        assert_eq!(app.scroll_offset, 0);
+
+        // k scrolls up a line; Ctrl-u scrolls a half page (rows/2 = 2).
+        app.key_scroll(key(KeyCode::Char('k')), t);
+        assert_eq!(app.scroll_offset, 1);
+        app.key_scroll(ctrl('u'), t);
+        assert_eq!(app.scroll_offset, 3);
+
+        // g jumps to the top of the scrollback; further up is clamped there.
+        app.key_scroll(key(KeyCode::Char('g')), t);
+        let top = app.scroll_offset;
+        assert!(top > 3, "g reaches the top of history");
+        app.key_scroll(key(KeyCode::Char('k')), t);
+        assert_eq!(app.scroll_offset, top, "clamped at the top");
+
+        // G returns to live; q exits scroll mode.
+        app.key_scroll(key(KeyCode::Char('G')), t);
+        assert_eq!(app.scroll_offset, 0);
+        app.key_scroll(key(KeyCode::Char('q')), t);
+        assert!(app.scroll_mode.is_none());
+    }
 }
