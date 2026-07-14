@@ -1,0 +1,8 @@
+#!/usr/bin/env bash
+# One-time setup: point git at the repo's tracked hooks so commits stay CI-green.
+# Safe to re-run. Git will not adopt committed hooks automatically (by design),
+# so every clone runs this once.
+set -euo pipefail
+
+git config core.hooksPath .githooks
+echo "✓ core.hooksPath set to .githooks — the pre-commit hook is now active."

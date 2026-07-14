@@ -1,0 +1,29 @@
+#!/usr/bin/env bash
+# amux pre-commit hook — runs the fast half of CI locally so commits stay green.
+#
+# Checks (mirrors the "Format" and "Clippy" steps of .github/workflows/ci.yml):
+#   - cargo fmt --all -- --check
+#   - cargo clippy --workspace --all-targets -- -D warnings
+#
+# Install once per clone:  ./.githooks/setup   (or: git config core.hooksPath .githooks)
+# Bypass a single commit:  git commit --no-verify
+set -euo pipefail
+
+# Match CI: treat all warnings as errors.
+export RUSTFLAGS="-D warnings"
+
+echo "pre-commit: cargo fmt --all -- --check"
+if ! cargo fmt --all -- --check; then
+	echo >&2
+	echo "✗ Formatting check failed. Run 'cargo fmt --all', re-stage, and commit again." >&2
+	exit 1
+fi
+
+echo "pre-commit: cargo clippy --workspace --all-targets -- -D warnings"
+if ! cargo clippy --workspace --all-targets -- -D warnings; then
+	echo >&2
+	echo "✗ Clippy failed. Fix the warnings above and commit again." >&2
+	exit 1
+fi
+
+echo "✓ pre-commit checks passed"

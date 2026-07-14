@@ -18,3 +18,15 @@ cargo run --example spike   # quit with Ctrl-Q
 ```
 
 On Ubuntu you need a C toolchain first: `sudo apt-get install -y build-essential pkg-config`.
+
+## Development
+
+Enable the shared git hooks once per clone so your commits stay CI-green:
+
+```sh
+./.githooks/setup   # sets core.hooksPath to .githooks
+```
+
+The `pre-commit` hook runs `cargo fmt --check` and `cargo clippy -D warnings` — the
+fast half of [CI](.github/workflows/ci.yml). Bypass it for a single commit with
+`git commit --no-verify`.
