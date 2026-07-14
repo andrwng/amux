@@ -1118,18 +1118,17 @@ impl App {
                 if self.tree.focus_payload(terminal) {
                     self.focus = Focus::Panes;
                 }
-                // Start a pane-isolated selection — unless a full-screen mouse app owns the mouse.
-                if self.on_alternate_screen(terminal) && self.app_wants_mouse(terminal) {
-                    self.selection = None;
-                } else {
-                    let p = clamp_to(inner, me.column, me.row);
-                    self.selection = Some(Selection {
-                        terminal,
-                        inner,
-                        anchor: p,
-                        head: p,
-                    });
-                }
+                // Always own the left-drag for a pane-isolated text selection, even when the pane's
+                // app tracks the mouse (Claude, vim, less). amux never forwards left-clicks to pane
+                // apps — only the wheel — so this takes away no interaction they had, and it makes
+                // their output highlightable and copyable (via OSC 52) instead of unselectable.
+                let p = clamp_to(inner, me.column, me.row);
+                self.selection = Some(Selection {
+                    terminal,
+                    inner,
+                    anchor: p,
+                    head: p,
+                });
             }
             MouseEventKind::ScrollUp | MouseEventKind::ScrollDown => {
                 let up = matches!(me.kind, MouseEventKind::ScrollUp);
@@ -1225,14 +1224,6 @@ impl App {
         self.parsers
             .get(&terminal)
             .is_some_and(|p| p.screen().mouse_protocol_mode() != vt100::MouseProtocolMode::None)
-    }
-
-    /// Whether the app in `terminal` is drawing on the alternate screen (a full-screen TUI with no
-    /// scrollback of its own).
-    fn on_alternate_screen(&self, terminal: TerminalId) -> bool {
-        self.parsers
-            .get(&terminal)
-            .is_some_and(|p| p.screen().alternate_screen())
     }
 
     /// Encode a wheel tick as a mouse report in the app's requested encoding, with coordinates
@@ -2247,6 +2238,48 @@ mod tests {
             s.starts_with("\u{1b}[<64;") && s.ends_with('M'),
             "SGR wheel-up report: {s:?}"
         );
+    }
+
+    /// A left-press inside a Claude-style pane — one on the alternate screen that *also* tracks the
+    /// mouse — must still start amux's own selection, exactly like a plain shell pane, so the text
+    /// can be highlighted and copied (via OSC 52). amux never forwards left-clicks to pane apps, so
+    /// owning the drag for selection costs the app nothing. Regression guard for the mouse-tracking
+    /// pane that used to be left unselectable.
+    #[tokio::test]
+    async fn left_press_starts_selection_even_when_pane_app_tracks_mouse() {
+        let (client_end, _server_end) = UnixStream::pair().unwrap();
+        let (mut sink, _rx) = Framed::new(client_end, ClientCodec::default()).split();
+
+        let mut app = App::new(100, 40);
+        let t = TerminalId::new();
+        app.tree.open(t);
+        let mut parser = vt100::Parser::new(24, 80, 100);
+        // Alternate screen + SGR mouse tracking — the exact combination Claude Code sets up.
+        parser.process(b"\x1b[?1049h\x1b[?1000h\x1b[?1006h");
+        app.parsers.insert(t, parser);
+
+        // Preconditions: the click lands on the pane, and it is the guarded alt-screen+mouse case.
+        assert!(
+            app.pane_at(40, 10).is_some(),
+            "the click must land on the pane"
+        );
+        assert!(
+            app.parsers[&t].screen().alternate_screen() && app.app_wants_mouse(t),
+            "precondition: a Claude-like alt-screen, mouse-tracking pane",
+        );
+
+        let press = MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column: 40,
+            row: 10,
+            modifiers: KeyModifiers::NONE,
+        };
+        app.on_mouse(press, &mut sink).await.unwrap();
+
+        let sel = app
+            .selection
+            .expect("a left-press must start a selection even in a mouse-tracking pane");
+        assert_eq!(sel.terminal, t);
     }
 
     #[test]
