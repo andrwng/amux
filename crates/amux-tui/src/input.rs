@@ -45,6 +45,27 @@ pub fn key_to_bytes(key: KeyEvent, app_cursor: bool) -> Option<Vec<u8>> {
     Some(bytes)
 }
 
+/// Bracketed-paste markers — what a terminal wraps pasted text in once an app enables DECSET 2004.
+const PASTE_START: &[u8] = b"\x1b[200~";
+const PASTE_END: &[u8] = b"\x1b[201~";
+
+/// Encode a whole paste as one PTY write. Newlines are normalized to `\r` (what a real terminal
+/// sends for a line break in pasted text). When `bracketed` — the child asked for bracketed paste
+/// (Claude's TUI, vim, a shell with it on) — the payload is wrapped in the start/end markers so the
+/// child inserts it as a single blob; without the wrapper each embedded newline reads as Enter and
+/// a multi-line paste would submit line-by-line. See `docs/DESIGN.md` §7.3.
+pub fn encode_paste(text: &str, bracketed: bool) -> Vec<u8> {
+    let body = text.replace("\r\n", "\r").replace('\n', "\r").into_bytes();
+    if !bracketed {
+        return body;
+    }
+    let mut out = Vec::with_capacity(PASTE_START.len() + body.len() + PASTE_END.len());
+    out.extend_from_slice(PASTE_START);
+    out.extend_from_slice(&body);
+    out.extend_from_slice(PASTE_END);
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -84,6 +105,21 @@ mod tests {
         assert_eq!(
             key_to_bytes(press(KeyCode::Backspace), false),
             Some(vec![0x7f])
+        );
+    }
+
+    #[test]
+    fn paste_wraps_only_when_child_wants_bracketed() {
+        assert_eq!(encode_paste("hi", false), b"hi".to_vec());
+        assert_eq!(encode_paste("hi", true), b"\x1b[200~hi\x1b[201~".to_vec());
+    }
+
+    #[test]
+    fn paste_normalizes_newlines_to_cr() {
+        assert_eq!(encode_paste("a\r\nb\nc", false), b"a\rb\rc".to_vec());
+        assert_eq!(
+            encode_paste("a\nb", true),
+            b"\x1b[200~a\rb\x1b[201~".to_vec()
         );
     }
 }

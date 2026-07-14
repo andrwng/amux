@@ -28,7 +28,7 @@ use tui_term::widget::PseudoTerminal;
 use amux_core::agent::{sort_for_sidebar, AgentId, AgentState, RepoId, RosterItem, TerminalId};
 use amux_proto::{AgentInfo, ClientCodec, ClientMsg, DaemonMsg, RepoInfo, Size};
 
-use crate::input::key_to_bytes;
+use crate::input::{encode_paste, key_to_bytes};
 use crate::pane::{Axis, Dir, Nav, PaneTree};
 
 const SIDEBAR_W: u16 = 30;
@@ -86,14 +86,18 @@ enum Flow {
 }
 
 pub async fn run() -> Result<()> {
-    use crossterm::event::{DisableMouseCapture, EnableMouseCapture};
+    use crossterm::event::{
+        DisableBracketedPaste, DisableMouseCapture, EnableBracketedPaste, EnableMouseCapture,
+    };
     let (framed, repo) = crate::client::connect().await?;
     let mut terminal = ratatui::init();
     // Capture the mouse so the wheel reaches panes (forwarded to apps that want it, else scrolls
     // amux's own scrollback). Hold Shift to bypass for native terminal selection.
-    let _ = crossterm::execute!(std::io::stdout(), EnableMouseCapture);
+    // Bracketed paste lets the outer terminal hand us a paste as one `Event::Paste` instead of a
+    // storm of per-character key events — one write to the child, one redraw. See `on_paste`.
+    let _ = crossterm::execute!(std::io::stdout(), EnableMouseCapture, EnableBracketedPaste);
     let result = event_loop(&mut terminal, framed, repo).await;
-    let _ = crossterm::execute!(std::io::stdout(), DisableMouseCapture);
+    let _ = crossterm::execute!(std::io::stdout(), DisableMouseCapture, DisableBracketedPaste);
     ratatui::restore();
     result
 }
@@ -126,6 +130,7 @@ async fn event_loop(
                 }
                 Some(Ok(Event::Resize(c, r))) => app.on_resize(c, r, &mut sink).await?,
                 Some(Ok(Event::Mouse(me))) => app.on_mouse(me, &mut sink).await?,
+                Some(Ok(Event::Paste(text))) => app.on_paste(text, &mut sink).await?,
                 Some(Ok(_)) => {}
                 _ => break,
             },
@@ -502,6 +507,51 @@ impl App {
             Focus::Panes => self.key_pane(key, sink).await,
             Focus::Mini(i) => self.key_mini(key, i, sink).await,
         }
+    }
+
+    /// The terminal keystrokes are currently routed to (a focused pane or mini), if any.
+    fn focused_terminal(&self) -> Option<TerminalId> {
+        match self.focus {
+            Focus::Panes => self.tree.focused_payload(),
+            Focus::Mini(i) => self.mini_terminal(i),
+            Focus::Sidebar => None,
+        }
+    }
+
+    /// A bracketed paste from the outer terminal, coalesced into a single event. Routes to wherever
+    /// keystrokes go: a text prompt's buffer, or the focused terminal as one write (wrapped in paste
+    /// markers when the child wants bracketed paste). Handling it here — rather than as per-character
+    /// keys — is what makes pasting fast; it's one `Input` frame and one redraw regardless of length.
+    async fn on_paste(&mut self, text: String, sink: &mut Sink) -> Result<()> {
+        match self.input {
+            // Prompt buffers are single-line; drop control chars so a stray newline can't submit.
+            InputMode::Creating => {
+                self.create_buf.extend(text.chars().filter(|c| !c.is_control()));
+            }
+            InputMode::CreatingRepo => {
+                let buf = self.active_buf();
+                buf.extend(text.chars().filter(|c| !c.is_control()));
+            }
+            // A y/n confirm takes no free text.
+            InputMode::Confirming => {}
+            InputMode::Normal => {
+                // Sub-modes consume keys for navigation/sizing, not text — ignore pastes there.
+                if self.scroll_mode.is_some() || self.resize_mode || self.prefix {
+                    return Ok(());
+                }
+                let Some(terminal) = self.focused_terminal() else {
+                    return Ok(());
+                };
+                let bracketed = self
+                    .parsers
+                    .get(&terminal)
+                    .map(|p| p.screen().bracketed_paste())
+                    .unwrap_or(false);
+                let bytes = encode_paste(&text, bracketed);
+                sink.send(ClientMsg::Input { terminal, bytes }).await?;
+            }
+        }
+        Ok(())
     }
 
     /// Keystrokes for a focused mini go to that agent's primary terminal.
@@ -1966,6 +2016,40 @@ mod tests {
     }
     fn ctrl(c: char) -> KeyEvent {
         KeyEvent::new(KeyCode::Char(c), KeyModifiers::CONTROL)
+    }
+
+    /// A multi-line paste into a focused pane whose child wants bracketed paste must reach the
+    /// daemon as exactly one `Input` frame, wrapped in paste markers (not one frame per character).
+    #[tokio::test]
+    async fn paste_sends_one_wrapped_input_frame() {
+        use amux_proto::ServerCodec;
+
+        // A socket pair: the app writes ClientMsgs on one end; we decode them on the other.
+        let (client_end, server_end) = UnixStream::pair().unwrap();
+        let (mut sink, _rx) = Framed::new(client_end, ClientCodec::default()).split();
+        let mut server = Framed::new(server_end, ServerCodec::default());
+
+        // A focused pane whose child turned bracketed paste on (DECSET 2004).
+        let mut app = App::new(100, 40);
+        let t = TerminalId::new();
+        let mut parser = vt100::Parser::new(24, 80, 0);
+        parser.process(b"\x1b[?2004h");
+        assert!(parser.screen().bracketed_paste(), "child requested bracketed paste");
+        app.parsers.insert(t, parser);
+        app.tree.open(t);
+        app.focus = Focus::Panes;
+
+        app.on_paste("multi\nline".to_string(), &mut sink)
+            .await
+            .unwrap();
+
+        match server.next().await {
+            Some(Ok(ClientMsg::Input { terminal, bytes })) => {
+                assert_eq!(terminal, t);
+                assert_eq!(bytes, b"\x1b[200~multi\rline\x1b[201~".to_vec());
+            }
+            other => panic!("expected a single Input frame, got {other:?}"),
+        }
     }
 
     #[test]
