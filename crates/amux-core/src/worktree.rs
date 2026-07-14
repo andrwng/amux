@@ -241,12 +241,29 @@ pub fn is_managed_worktree(repo_path: &Path) -> Result<bool> {
     ))
 }
 
-/// Pure: is `path` inside `base`? Compares canonicalized paths so symlinks/`..`/trailing-slash
-/// differences don't defeat the prefix check; falls back to the raw path when it doesn't exist yet.
+/// Pure: is `path` inside `base`? Both operands are resolved the same way (see
+/// `canonicalized_prefix`) so symlinks (e.g. macOS `/var` -> `/private/var`), `..`, and trailing
+/// slashes don't defeat the prefix check — consistently, even when `path` doesn't fully exist yet.
 fn is_under(base: &Path, path: &Path) -> bool {
-    let base = std::fs::canonicalize(base).unwrap_or_else(|_| base.to_path_buf());
-    let path = std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
-    path.starts_with(&base)
+    canonicalized_prefix(path).starts_with(canonicalized_prefix(base))
+}
+
+/// Canonicalize the longest *existing* ancestor of `p`, then re-append the not-yet-existing tail.
+/// Canonicalizing the whole path fails when it doesn't exist, and canonicalizing one operand but
+/// not the other mismatches under a symlinked prefix (the macOS `/var` bug) — so both operands of
+/// `is_under` pass through here for a like-for-like comparison.
+fn canonicalized_prefix(p: &Path) -> PathBuf {
+    let mut ancestor = p;
+    loop {
+        if let Ok(real) = std::fs::canonicalize(ancestor) {
+            let tail = p.strip_prefix(ancestor).unwrap_or(Path::new(""));
+            return real.join(tail);
+        }
+        match ancestor.parent() {
+            Some(parent) => ancestor = parent,
+            None => return p.to_path_buf(),
+        }
+    }
 }
 
 fn sanitize(branch: &str) -> String {
@@ -493,5 +510,29 @@ mod tests {
         // The base directory itself is not a repo we'd register either, but a nonexistent path
         // under it must still be flagged (canonicalize falls back to the raw path).
         assert!(is_under(&base, &base.join("amux-8b759dcc/gone")));
+    }
+
+    /// Regression (macOS CI): `$TMPDIR` lives under `/var`, a symlink to `/private/var`, so an
+    /// existing `base` canonicalizes to a `/private/var/...` prefix while a not-yet-created child
+    /// stays `/var/...` — defeating a naive prefix check. `is_under` must resolve both sides
+    /// consistently and still flag the child. Reproduced on any platform via an explicit symlink.
+    #[test]
+    fn is_under_survives_a_symlinked_base_prefix() {
+        use std::os::unix::fs::symlink;
+        let tmp = tempfile::tempdir().unwrap();
+        let real = tmp.path().join("real");
+        std::fs::create_dir_all(real.join("worktrees")).unwrap();
+        symlink(&real, tmp.path().join("link")).unwrap();
+
+        // Reach `base` through the symlink; the queried worktree path does not exist yet.
+        let base = tmp.path().join("link/worktrees");
+        let pending = base.join("amux-8b759dcc/gone");
+        assert!(base.exists(), "base exists through the symlink");
+        assert!(
+            !pending.exists(),
+            "the queried worktree path does not exist yet"
+        );
+
+        assert!(is_under(&base, &pending));
     }
 }
