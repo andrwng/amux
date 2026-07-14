@@ -152,9 +152,6 @@ impl WorktreeService {
     pub fn orphans(&self, keep_branches: &[String]) -> Result<Vec<Orphan>> {
         let keep: Vec<String> = keep_branches.iter().map(|b| sanitize(b)).collect();
         let repo = Repository::open(&self.repo).context("open repository")?;
-        // Compare canonicalized paths: git records a worktree's path resolved (e.g. `/private/…`
-        // on macOS), which won't share a prefix with a non-canonical base otherwise.
-        let base = std::fs::canonicalize(&self.base).unwrap_or_else(|_| self.base.clone());
         let mut out = Vec::new();
         for name in self.list()? {
             if keep.contains(&name) {
@@ -164,10 +161,11 @@ impl WorktreeService {
                 continue;
             };
             let path = worktree.path().to_path_buf();
-            let canon = std::fs::canonicalize(&path).unwrap_or_else(|_| path.clone());
             // Safety: only ever touch worktrees that live under amux's own base directory, so a
-            // user's hand-made worktree elsewhere is never a prune candidate.
-            if !canon.starts_with(&base) {
+            // user's hand-made worktree elsewhere is never a prune candidate. `is_under` resolves
+            // both sides consistently — symlinks (git records macOS paths as `/private/…`) and a
+            // worktree whose dir was already deleted alike — so the prefix check isn't defeated.
+            if !is_under(&self.base, &path) {
                 continue;
             }
             let dirty = if path.exists() {
@@ -440,6 +438,35 @@ mod tests {
         assert!(!svc.exists("orphan"));
         assert!(svc.exists("live"));
         assert!(svc.exists("dirty"));
+    }
+
+    /// Regression: a git-tracked worktree whose directory was deleted out-of-band (the wedged-branch
+    /// case `orphans` exists to unstick) must still be reported even when the base is reached via a
+    /// symlink — mirroring macOS's `/var` -> `/private/var`. A naive check that canonicalizes the
+    /// base but falls back to the raw (symlinked) path for the now-missing worktree would drop it.
+    #[test]
+    fn orphans_reports_a_deleted_worktree_under_a_symlinked_base() {
+        use std::os::unix::fs::symlink;
+        let tmp = tempfile::tempdir().unwrap();
+        let real = tmp.path().join("real");
+        std::fs::create_dir_all(&real).unwrap();
+        let repo_path = real.join("repo");
+        std::fs::create_dir(&repo_path).unwrap();
+        init_repo(&repo_path);
+        symlink(&real, tmp.path().join("link")).unwrap();
+
+        // Reach the worktree base through the symlink, then delete the worktree dir out-of-band
+        // while git still tracks it.
+        let svc = WorktreeService::with_base(&repo_path, tmp.path().join("link/wt")).unwrap();
+        let wt = svc.create("wedged").unwrap();
+        std::fs::remove_dir_all(&wt).unwrap();
+        assert!(!wt.exists());
+
+        let orphans = svc.orphans(&[]).unwrap();
+        assert!(
+            orphans.iter().any(|o| o.name == "wedged"),
+            "a git-tracked worktree whose dir was deleted must still be flagged as an orphan",
+        );
     }
 
     #[test]
