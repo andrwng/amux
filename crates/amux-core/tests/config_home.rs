@@ -8,7 +8,11 @@ fn configured_root_relocates_the_whole_amux_home() {
     let tmp = tempfile::tempdir().unwrap();
     let cfg_dir = tmp.path().join("config").join("amux");
     std::fs::create_dir_all(&cfg_dir).unwrap();
-    std::fs::write(cfg_dir.join("config.toml"), "root = \"/data/relocated-amux\"\n").unwrap();
+    std::fs::write(
+        cfg_dir.join("config.toml"),
+        "root = \"/data/relocated-amux\"\n",
+    )
+    .unwrap();
 
     // BaseDirs reads XDG_CONFIG_HOME when constructed, so set it before resolving.
     std::env::set_var("XDG_CONFIG_HOME", tmp.path().join("config"));

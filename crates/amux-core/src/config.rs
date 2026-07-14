@@ -64,7 +64,10 @@ mod tests {
 
     #[test]
     fn malformed_toml_is_an_error() {
-        assert!(Config::from_toml("root = ").is_err(), "syntactically broken TOML must error");
+        assert!(
+            Config::from_toml("root = ").is_err(),
+            "syntactically broken TOML must error"
+        );
     }
 
     #[test]

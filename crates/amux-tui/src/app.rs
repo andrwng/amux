@@ -97,7 +97,11 @@ pub async fn run() -> Result<()> {
     // storm of per-character key events — one write to the child, one redraw. See `on_paste`.
     let _ = crossterm::execute!(std::io::stdout(), EnableMouseCapture, EnableBracketedPaste);
     let result = event_loop(&mut terminal, framed, repo).await;
-    let _ = crossterm::execute!(std::io::stdout(), DisableMouseCapture, DisableBracketedPaste);
+    let _ = crossterm::execute!(
+        std::io::stdout(),
+        DisableMouseCapture,
+        DisableBracketedPaste
+    );
     ratatui::restore();
     result
 }
@@ -526,7 +530,8 @@ impl App {
         match self.input {
             // Prompt buffers are single-line; drop control chars so a stray newline can't submit.
             InputMode::Creating => {
-                self.create_buf.extend(text.chars().filter(|c| !c.is_control()));
+                self.create_buf
+                    .extend(text.chars().filter(|c| !c.is_control()));
             }
             InputMode::CreatingRepo => {
                 let buf = self.active_buf();
@@ -2034,7 +2039,10 @@ mod tests {
         let t = TerminalId::new();
         let mut parser = vt100::Parser::new(24, 80, 0);
         parser.process(b"\x1b[?2004h");
-        assert!(parser.screen().bracketed_paste(), "child requested bracketed paste");
+        assert!(
+            parser.screen().bracketed_paste(),
+            "child requested bracketed paste"
+        );
         app.parsers.insert(t, parser);
         app.tree.open(t);
         app.focus = Focus::Panes;

@@ -104,17 +104,29 @@ mod tests {
     #[test]
     fn expand_tilde_handles_bare_and_prefixed_and_passthrough() {
         assert_eq!(expand_tilde("~", &home()), PathBuf::from("/home/u"));
-        assert_eq!(expand_tilde("~/xfs2/.amux", &home()), PathBuf::from("/home/u/xfs2/.amux"));
-        assert_eq!(expand_tilde("/abs/path", &home()), PathBuf::from("/abs/path"));
+        assert_eq!(
+            expand_tilde("~/xfs2/.amux", &home()),
+            PathBuf::from("/home/u/xfs2/.amux")
+        );
+        assert_eq!(
+            expand_tilde("/abs/path", &home()),
+            PathBuf::from("/abs/path")
+        );
         // A `~` not followed by `/` is not a home reference — leave it be.
         assert_eq!(expand_tilde("~foo", &home()), PathBuf::from("~foo"));
     }
 
     #[test]
     fn amux_home_defaults_when_no_root() {
-        assert_eq!(resolve_amux_home(None, &home()), PathBuf::from("/home/u/.amux"));
+        assert_eq!(
+            resolve_amux_home(None, &home()),
+            PathBuf::from("/home/u/.amux")
+        );
         // Whitespace-only root is treated as unset.
-        assert_eq!(resolve_amux_home(Some("  "), &home()), PathBuf::from("/home/u/.amux"));
+        assert_eq!(
+            resolve_amux_home(Some("  "), &home()),
+            PathBuf::from("/home/u/.amux")
+        );
     }
 
     #[test]
