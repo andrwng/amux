@@ -193,7 +193,8 @@ regression test needs.
   `PseudoTerminal`) — untouched. If, after this change, profiling shows per-draw
   cost dominates rather than draw *count*, that becomes the next target.
 - **No wire change** (`PROTO_VERSION` unchanged) and **no new dependency**
-  (`futures` is already used; `std::future::ready` is std). The `app.rs` view
+  (`futures` is already a workspace dep; `drain_ready` uses `futures::future::poll_fn`
+  and `poll_next_unpin`). The `app.rs` view
   model stays a projection mutated only from `DaemonMsg`s (DESIGN §7), and no
   new tasks are spawned, so structured concurrency (DESIGN §5.2) is unaffected.
 
