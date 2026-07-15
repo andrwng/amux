@@ -39,7 +39,7 @@ const MINI_ROWS: u16 = 14;
 type Sink = SplitSink<Framed<UnixStream, ClientCodec>, ClientMsg>;
 
 /// One selectable line in the sidebar: a repo header or an agent under it.
-#[derive(Clone, Copy, PartialEq, Eq)]
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum Row {
     Repo(RepoId),
     Agent(AgentId),
@@ -502,6 +502,12 @@ impl App {
             // own splits, and hands back to amux at its edge via `amux nav`).
             if self.focus == Focus::Panes && self.focused_is_passthrough() {
                 return self.key_pane(key, sink).await;
+            }
+            // In the sidebar, Ctrl+j/Ctrl+k jump the selection to the next unread agent (down/up)
+            // rather than a spatial move — there's nothing above/below the sidebar to move into.
+            if self.focus == Focus::Sidebar && matches!(dir, Dir::Up | Dir::Down) {
+                self.jump_unread(dir == Dir::Down);
+                return Ok(Flow::Continue);
             }
             self.navigate(dir);
             return Ok(Flow::Continue);
@@ -1476,6 +1482,30 @@ impl App {
         self.sidebar_sel = Some(rows[next]);
     }
 
+    /// Move the sidebar selection to the next **unread** agent in `dir` (down = `true`), skipping
+    /// read rows and repo headers. No wrap and a silent no-op when none lies that way — a directional
+    /// key shouldn't teleport across the list, matching how `j`/`k` clamp at the ends. Bound to
+    /// `Ctrl+j`/`Ctrl+k` in the sidebar (distinct from `Ctrl+B Tab`, which cycles *and opens*).
+    fn jump_unread(&mut self, down: bool) {
+        let rows = self.sidebar_rows();
+        let is_unread_agent = |r: &Row| match r {
+            Row::Agent(id) => self.agents.iter().any(|a| a.id == *id && a.unread),
+            Row::Repo(_) => false,
+        };
+        let cur = self
+            .sidebar_sel
+            .and_then(|s| rows.iter().position(|&r| r == s))
+            .unwrap_or(0);
+        let found = if down {
+            ((cur + 1)..rows.len()).find(|&i| is_unread_agent(&rows[i]))
+        } else {
+            (0..cur).rev().find(|&i| is_unread_agent(&rows[i]))
+        };
+        if let Some(i) = found {
+            self.sidebar_sel = Some(rows[i]);
+        }
+    }
+
     fn ensure_sidebar_sel(&mut self) {
         let rows = self.sidebar_rows();
         if !self.sidebar_sel.is_some_and(|s| rows.contains(&s)) {
@@ -1989,7 +2019,7 @@ fn render_status(frame: &mut Frame, area: Rect, app: &App) {
     } else {
         let hint = match app.focus {
             Focus::Sidebar => {
-                " n new \u{b7} enter open \u{b7} m mini \u{b7} d del \u{b7} r resume \u{b7} P prune \u{b7} ctrl+hjkl \u{b7} ctrl+q quit"
+                " n new \u{b7} enter open \u{b7} m mini \u{b7} d del \u{b7} r resume \u{b7} P prune \u{b7} ctrl+jk unread \u{b7} ctrl+q quit"
             }
             Focus::Panes => {
                 " ctrl+hjkl move \u{b7} ctrl+b %/\"/x/r \u{b7} type to talk \u{b7} ctrl+q quit"
@@ -2317,5 +2347,91 @@ mod tests {
             offset_before + 5,
             "the cached offset tracks the anchor (5 new lines)"
         );
+    }
+
+    fn agent_with(state: AgentState, unread: bool) -> AgentInfo {
+        AgentInfo {
+            id: AgentId::new(),
+            repo: RepoId::from_canonical_path(std::path::Path::new("/r")),
+            name: "a".into(),
+            branch: "b".into(),
+            state,
+            last_activity: Utc::now(),
+            unread,
+            primary_terminal: TerminalId::new(),
+        }
+    }
+
+    /// `Ctrl+j`/`Ctrl+k` in the sidebar move the selection to the next unread agent below/above,
+    /// skipping read agents and repo headers, without wrapping past the ends.
+    #[test]
+    fn ctrl_jk_jump_between_unread_agents_in_the_sidebar() {
+        use amux_core::agent::AttentionKind;
+        let mut app = App::new(100, 40);
+        let repo = RepoId::from_canonical_path(std::path::Path::new("/r"));
+        app.repos = vec![RepoInfo {
+            id: repo,
+            name: "r".into(),
+            path: "/r".into(),
+        }];
+
+        // Four agents with distinct state priorities so the sidebar order is fixed regardless of
+        // the unread bit (which only tiebreaks *within* a priority): NeedsAttention(0) < Working(1)
+        // < Idle(2) < Exited(3). Mark the 2nd and 4th unread → order is read, unread, read, unread.
+        let s0 = agent_with(
+            AgentState::NeedsAttention {
+                kind: AttentionKind::Question,
+                message: None,
+            },
+            false,
+        );
+        let s1 = agent_with(AgentState::Working, true);
+        let s2 = agent_with(AgentState::Idle, false);
+        let s3 = agent_with(AgentState::Exited { code: Some(0) }, true);
+        let (id0, id1, id2, id3) = (s0.id, s1.id, s2.id, s3.id);
+        // Insertion order scrambled to prove the sort — not the push order — fixes the layout.
+        app.agents = vec![s2, s0, s3, s1];
+
+        let order: Vec<AgentId> = app
+            .sidebar_rows()
+            .into_iter()
+            .filter_map(|r| match r {
+                Row::Agent(id) => Some(id),
+                Row::Repo(_) => None,
+            })
+            .collect();
+        assert_eq!(
+            order,
+            vec![id0, id1, id2, id3],
+            "sidebar order precondition"
+        );
+
+        // Ctrl-j from the first (read) agent walks down through the unread ones, then stops.
+        app.sidebar_sel = Some(Row::Agent(id0));
+        app.jump_unread(true);
+        assert_eq!(app.sidebar_sel, Some(Row::Agent(id1)));
+        app.jump_unread(true);
+        assert_eq!(app.sidebar_sel, Some(Row::Agent(id3)));
+        app.jump_unread(true);
+        assert_eq!(
+            app.sidebar_sel,
+            Some(Row::Agent(id3)),
+            "no wrap past the last unread"
+        );
+
+        // Ctrl-k walks back up through the unread ones, then stops (id0 is read, so nothing above).
+        app.jump_unread(false);
+        assert_eq!(app.sidebar_sel, Some(Row::Agent(id1)));
+        app.jump_unread(false);
+        assert_eq!(
+            app.sidebar_sel,
+            Some(Row::Agent(id1)),
+            "no wrap above the first unread"
+        );
+
+        // From a repo header, Ctrl-j finds the first unread below it.
+        app.sidebar_sel = Some(Row::Repo(repo));
+        app.jump_unread(true);
+        assert_eq!(app.sidebar_sel, Some(Row::Agent(id1)));
     }
 }
