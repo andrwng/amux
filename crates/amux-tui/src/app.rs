@@ -61,13 +61,17 @@ struct Selection {
     inner: Rect,
     anchor: (u16, u16),
     head: (u16, u16),
+    /// Set once a `Drag` event arrives — a real drag gesture, even one confined to the anchor
+    /// cell — as distinct from a bare click. Gates the highlight and the copy-on-release.
+    dragged: bool,
 }
 
 impl Selection {
-    /// Whether the pointer actually moved from the anchor — i.e. a real drag, not a bare click.
-    /// A click leaves `head == anchor`; such a selection neither highlights nor copies.
+    /// Whether a drag gesture occurred (a `Drag` event since the press), as opposed to a bare
+    /// click. True even for a drag that never leaves the anchor cell, so a one-character selection
+    /// still copies; a plain click (no pointer movement) stays false — no highlight, no copy.
     fn is_dragged(&self) -> bool {
-        self.head != self.anchor
+        self.dragged
     }
 }
 
@@ -1173,11 +1177,12 @@ impl App {
             MouseEventKind::Drag(MouseButton::Left) => {
                 if let Some(sel) = &mut self.selection {
                     sel.head = clamp_to(sel.inner, me.column, me.row);
+                    sel.dragged = true; // a real gesture, even if it never leaves the anchor cell
                 }
                 return Ok(());
             }
             MouseEventKind::Up(MouseButton::Left) => {
-                // Only a real drag copies; a bare click (head == anchor) selected nothing.
+                // Only a real drag copies; a bare click (no pointer movement) selected nothing.
                 if self.selection.is_some_and(|s| s.is_dragged()) {
                     if let Some(text) = self.selection_text() {
                         if !text.trim().is_empty() {
@@ -1244,6 +1249,7 @@ impl App {
                     inner,
                     anchor: p,
                     head: p,
+                    dragged: false,
                 });
             }
             MouseEventKind::ScrollUp | MouseEventKind::ScrollDown => {
@@ -1691,7 +1697,7 @@ fn ordered(a: (u16, u16), b: (u16, u16)) -> ((u16, u16), (u16, u16)) {
 
 /// Reverse-video the selected cells of `sel` in the frame buffer (drawn over the pane's content).
 fn highlight_selection(buf: &mut Buffer, sel: Selection) {
-    // A bare click (head == anchor) selected nothing — draw no highlight.
+    // A bare click (no drag gesture) selected nothing — draw no highlight.
     if !sel.is_dragged() {
         return;
     }
@@ -2512,6 +2518,7 @@ mod tests {
             inner,
             anchor: (1, 1), // 'a' of alpha (screen col 1 = pane col 0, row 1 = pane row 0)
             head: (1 + 4, 1 + 1), // 'o' of bravo (pane row 1, col 4)
+            dragged: true,
         });
         assert_eq!(app.selection_text().unwrap(), "alpha\nbravo");
     }
@@ -2614,36 +2621,46 @@ mod tests {
             })
         };
 
-        // No-drag click: anchor == head. Nothing should be highlighted.
-        let mut buf = Buffer::empty(Rect::new(0, 0, 12, 5));
-        highlight_selection(
-            &mut buf,
-            Selection {
+        let paints = |sel: Selection| {
+            let mut buf = Buffer::empty(Rect::new(0, 0, 12, 5));
+            highlight_selection(&mut buf, sel);
+            any_reversed(&buf)
+        };
+
+        // No-drag click (dragged == false): nothing highlighted, even over a cell.
+        assert!(
+            !paints(Selection {
                 terminal: t,
                 inner,
                 anchor: (2, 2),
                 head: (2, 2),
-            },
-        );
-        assert!(
-            !any_reversed(&buf),
+                dragged: false,
+            }),
             "a no-drag click must not paint a highlight"
         );
 
-        // Real drag: head != anchor. The span should be reverse-videoed.
-        let mut dragged = Buffer::empty(Rect::new(0, 0, 12, 5));
-        highlight_selection(
-            &mut dragged,
-            Selection {
+        // A drag confined to one cell (dragged, head == anchor): that single cell is highlighted.
+        assert!(
+            paints(Selection {
+                terminal: t,
+                inner,
+                anchor: (2, 2),
+                head: (2, 2),
+                dragged: true,
+            }),
+            "a single-cell drag must paint its one cell"
+        );
+
+        // A multi-cell drag: the whole span is reverse-videoed.
+        assert!(
+            paints(Selection {
                 terminal: t,
                 inner,
                 anchor: (2, 2),
                 head: (5, 2),
-            },
-        );
-        assert!(
-            any_reversed(&dragged),
-            "a drag selection must paint a highlight"
+                dragged: true,
+            }),
+            "a drag selection must paint its span"
         );
     }
 
@@ -2700,6 +2717,7 @@ mod tests {
             inner: Rect::new(31, 1, 40, 20),
             anchor: (31, 1),
             head: (35, 1),
+            dragged: true,
         });
         assert!(
             app.selection.is_some_and(|s| s.is_dragged()),
@@ -2718,6 +2736,45 @@ mod tests {
         assert!(
             app.selection.is_none(),
             "a fresh left-press must clear a stale selection so its Up can't re-copy"
+        );
+    }
+
+    /// A drag that stays within a single cell is still a drag — the pointer moved with the button
+    /// held, so the one character under it must stay selectable and copyable. Guards single-char
+    /// copy against a cell-span definition, which would treat a one-cell selection as a bare click.
+    #[tokio::test]
+    async fn single_cell_drag_counts_as_a_drag() {
+        let (mut sink, _server) = test_sink();
+        let mut app = App::new(100, 40);
+        let t = TerminalId::new();
+        app.tree.open(t);
+        let mut parser = vt100::Parser::new(24, 80, 100);
+        parser.process(b"hello\r\n");
+        app.parsers.insert(t, parser);
+        assert!(
+            app.pane_at(31, 1).is_some(),
+            "precondition: the gesture lands on the pane"
+        );
+
+        let at = |kind| MouseEvent {
+            kind,
+            column: 31,
+            row: 1,
+            modifiers: KeyModifiers::NONE,
+        };
+        app.on_mouse(at(MouseEventKind::Down(MouseButton::Left)), &mut sink)
+            .await
+            .unwrap();
+        // Press-and-drag without leaving the cell: a real gesture, but head stays == anchor.
+        app.on_mouse(at(MouseEventKind::Drag(MouseButton::Left)), &mut sink)
+            .await
+            .unwrap();
+
+        let sel = app.selection.expect("the drag keeps the selection");
+        assert_eq!(sel.anchor, sel.head, "the pointer never left the cell");
+        assert!(
+            sel.is_dragged(),
+            "a drag within one cell still counts as a drag (so its one character copies)"
         );
     }
 
