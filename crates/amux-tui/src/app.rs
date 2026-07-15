@@ -106,6 +106,28 @@ pub async fn run() -> Result<()> {
     result
 }
 
+/// Pull every item already ready on `stream` into `out`, without awaiting new I/O. Returns
+/// `true` iff the stream has ended (yielded `None`); `false` if it is merely out of ready items
+/// for now (still open). This is the coalescing primitive: one call collects a whole burst so
+/// the caller can render it in a single pass. See `docs/superpowers/specs/2026-07-15-coalesced-draw-design.md`.
+#[allow(dead_code)]
+async fn drain_ready<S, T>(stream: &mut S, out: &mut Vec<T>) -> bool
+where
+    S: futures::Stream<Item = T> + Unpin,
+{
+    loop {
+        // Poll the stream exactly once, resolving immediately whether it is Ready or Pending —
+        // never parking the task on new I/O.
+        let polled =
+            futures::future::poll_fn(|cx| std::task::Poll::Ready(stream.poll_next_unpin(cx))).await;
+        match polled {
+            std::task::Poll::Ready(Some(item)) => out.push(item),
+            std::task::Poll::Ready(None) => return true, // stream ended
+            std::task::Poll::Pending => return false,    // nothing more ready right now
+        }
+    }
+}
+
 async fn event_loop(
     terminal: &mut DefaultTerminal,
     framed: Framed<UnixStream, ClientCodec>,
@@ -2433,5 +2455,39 @@ mod tests {
         app.sidebar_sel = Some(Row::Repo(repo));
         app.jump_unread(true);
         assert_eq!(app.sidebar_sel, Some(Row::Agent(id1)));
+    }
+
+    #[tokio::test]
+    async fn drain_ready_collects_all_ready_then_reports_ended() {
+        let mut s = futures::stream::iter(vec![1, 2, 3]);
+        let mut out = Vec::new();
+        let ended = drain_ready(&mut s, &mut out).await;
+        assert_eq!(out, vec![1, 2, 3]);
+        assert!(ended, "an exhausted iter() reports the stream ended");
+    }
+
+    #[tokio::test]
+    async fn drain_ready_stops_at_pending_and_leaves_stream_open() {
+        // Three ready items, then a source that never yields again.
+        let mut s = futures::stream::iter(vec![1, 2, 3]).chain(futures::stream::pending::<i32>());
+        let mut out = Vec::new();
+        let ended = drain_ready(&mut s, &mut out).await;
+        assert_eq!(out, vec![1, 2, 3]);
+        assert!(!ended, "a pending tail means still-open, not ended");
+
+        // A second drain finds nothing new and still reports open.
+        let mut out2 = Vec::new();
+        let ended2 = drain_ready(&mut s, &mut out2).await;
+        assert!(out2.is_empty());
+        assert!(!ended2);
+    }
+
+    #[tokio::test]
+    async fn drain_ready_on_empty_pending_collects_nothing() {
+        let mut s = futures::stream::pending::<i32>();
+        let mut out = Vec::new();
+        let ended = drain_ready(&mut s, &mut out).await;
+        assert!(out.is_empty());
+        assert!(!ended);
     }
 }
