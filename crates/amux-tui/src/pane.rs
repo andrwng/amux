@@ -2,6 +2,8 @@
 //! navigate, and resize. Generic over the pane payload (the app stores a `TerminalId`). No I/O,
 //! no rendering — it only computes rectangles. Heavily unit-tested. See `docs/SPLITS.md`.
 
+use std::collections::HashMap;
+
 use ratatui::layout::Rect;
 
 /// Movement/resize direction and split axis, shared with the wire (and the mailbox) so `amux nav`,
@@ -46,6 +48,11 @@ pub struct PaneTree<P> {
     root: Option<Node<P>>,
     focus: PaneId,
     next_id: PaneId,
+    /// Monotonic focus clock + per-pane stamp of when it was last focused (by any means).
+    /// Used by [`navigate`](Self::navigate) to prefer returning where the user last worked when
+    /// several candidates tie geometrically. Session-only — never persisted in a `Layout`.
+    clock: u64,
+    last_focus: HashMap<PaneId, u64>,
 }
 
 impl<P: Copy + PartialEq> Default for PaneTree<P> {
@@ -60,7 +67,17 @@ impl<P: Copy + PartialEq> PaneTree<P> {
             root: None,
             focus: 0,
             next_id: 1,
+            clock: 0,
+            last_focus: HashMap::new(),
         }
+    }
+
+    /// Move focus to `id`, stamping it as the most recently focused pane. Every path that
+    /// changes focus goes through here so recency reflects *any* visit (keys, mouse, splits).
+    fn set_focus(&mut self, id: PaneId) {
+        self.focus = id;
+        self.clock += 1;
+        self.last_focus.insert(id, self.clock);
     }
 
     fn alloc(&mut self) -> PaneId {
@@ -98,7 +115,7 @@ impl<P: Copy + PartialEq> PaneTree<P> {
                     id,
                     payload: Some(payload),
                 });
-                self.focus = id;
+                self.set_focus(id);
             }
             Some(node) => set_payload(node, self.focus, Some(payload)),
         }
@@ -114,7 +131,7 @@ impl<P: Copy + PartialEq> PaneTree<P> {
         if let Some(root) = self.root.take() {
             self.root = Some(split_leaf(root, focus, axis, new_id));
         }
-        self.focus = new_id;
+        self.set_focus(new_id);
     }
 
     /// Close the focused pane; focus moves to its sibling. Empties the tree if it was the last.
@@ -137,17 +154,21 @@ impl<P: Copy + PartialEq> PaneTree<P> {
         if let Some(root) = self.root.take() {
             let (new_root, sibling) = close_leaf(root, id);
             self.root = new_root;
+            self.last_focus.remove(&id);
             if self.focus == id {
-                self.focus = sibling
-                    .or_else(|| self.root.as_ref().map(first_leaf))
-                    .unwrap_or(0);
+                match sibling.or_else(|| self.root.as_ref().map(first_leaf)) {
+                    Some(next) => self.set_focus(next),
+                    // The tree is now empty: nothing to focus, so nothing to stamp.
+                    None => self.focus = 0,
+                }
             }
         }
     }
 
     pub fn focus_first(&mut self) {
         if let Some(node) = &self.root {
-            self.focus = first_leaf(node);
+            let id = first_leaf(node);
+            self.set_focus(id);
         }
     }
 
@@ -156,7 +177,7 @@ impl<P: Copy + PartialEq> PaneTree<P> {
     pub fn focus_payload(&mut self, payload: P) -> bool {
         if let Some(node) = &self.root {
             if let Some(id) = leaf_with_payload(node, payload) {
-                self.focus = id;
+                self.set_focus(id);
                 return true;
             }
         }
@@ -164,6 +185,8 @@ impl<P: Copy + PartialEq> PaneTree<P> {
     }
 
     /// Move focus in `dir` within `area`; reports whether it moved, stayed, or hit the left edge.
+    /// Among candidates the nearest wins; ties prefer the most recently focused pane ("go back
+    /// where I was"), then center alignment for panes with no history (a restored layout).
     pub fn navigate(&mut self, dir: Dir, area: Rect) -> Nav {
         let places = self.layout(area);
         let Some(current) = places.iter().find(|p| p.id == self.focus).map(|p| p.rect) else {
@@ -172,10 +195,14 @@ impl<P: Copy + PartialEq> PaneTree<P> {
         let best = places
             .iter()
             .filter(|p| p.id != self.focus && in_dir(dir, current, p.rect))
-            .min_by_key(|p| dist(dir, current, p.rect));
+            .min_by_key(|p| {
+                let (gap, perp) = dist(dir, current, p.rect);
+                let recency = self.last_focus.get(&p.id).copied().unwrap_or(0);
+                (gap, std::cmp::Reverse(recency), perp)
+            });
         match best {
             Some(p) => {
-                self.focus = p.id;
+                self.set_focus(p.id);
                 Nav::Moved
             }
             None if dir == Dir::Left => Nav::ExitLeft,
@@ -219,16 +246,22 @@ impl PaneTree<TerminalId> {
         self.root.as_ref().map(node_to_layout)
     }
 
-    /// Rebuild a tree from a saved [`Layout`]; focus lands on the first pane.
+    /// Rebuild a tree from a saved [`Layout`]; focus lands on the first pane. Focus history is
+    /// not persisted, so only that initial focus carries a recency stamp — directional ties in
+    /// a fresh restore fall back to center alignment until the user starts moving around.
     pub fn from_layout(layout: &Layout) -> Self {
         let mut next_id = 1;
         let root = layout_to_node(layout, &mut next_id);
         let focus = first_leaf(&root);
-        Self {
+        let mut tree = Self {
             root: Some(root),
-            focus,
+            focus: 0,
             next_id,
-        }
+            clock: 0,
+            last_focus: HashMap::new(),
+        };
+        tree.set_focus(focus);
+        tree
     }
 }
 
@@ -674,6 +707,107 @@ mod tests {
         assert_eq!(t.navigate(Dir::Left, a), Nav::ExitLeft);
         assert_eq!(t.navigate(Dir::Right, a), Nav::Moved);
         assert_eq!(t.navigate(Dir::Up, a), Nav::Stay);
+    }
+
+    /// A full-width top pane over three bottom panes (b1 | b2 | b3), built interactively.
+    /// With `area()` the bottom rects are b1 x0..50, b2 x50..75, b3 x75..100, so the top pane's
+    /// center (x=50) is nearest b2's center — the pane pure center-alignment picks going Down.
+    fn top_over_three() -> (PaneTree<TerminalId>, TerminalId, [TerminalId; 3]) {
+        let mut t = PaneTree::new();
+        let top = TerminalId::new();
+        t.open(top);
+        t.split(Axis::TopBottom);
+        let b1 = TerminalId::new();
+        t.open(b1);
+        t.split(Axis::LeftRight);
+        let b2 = TerminalId::new();
+        t.open(b2);
+        t.split(Axis::LeftRight);
+        let b3 = TerminalId::new();
+        t.open(b3);
+        (t, top, [b1, b2, b3])
+    }
+
+    #[test]
+    fn navigate_returns_to_the_most_recently_focused_pane() {
+        // Walk to the bottom-left pane, go up to the full-width top pane, come back down:
+        // focus must return to bottom-left, not the center-aligned middle pane.
+        let (mut t, top, [b1, _, _]) = top_over_three();
+        let a = area();
+        assert_eq!(t.navigate(Dir::Left, a), Nav::Moved); // b3 → b2
+        assert_eq!(t.navigate(Dir::Left, a), Nav::Moved); // b2 → b1
+        assert_eq!(t.focused_payload(), Some(b1));
+        assert_eq!(t.navigate(Dir::Up, a), Nav::Moved);
+        assert_eq!(t.focused_payload(), Some(top));
+        assert_eq!(t.navigate(Dir::Down, a), Nav::Moved);
+        assert_eq!(
+            t.focused_payload(),
+            Some(b1),
+            "Down must return where I was"
+        );
+    }
+
+    #[test]
+    fn mouse_focus_counts_for_navigation_recency() {
+        // Focus moved by focus_payload (a click) must stamp recency just like navigation.
+        let (mut t, top, [b1, _, b3]) = top_over_three();
+        let a = area();
+        assert_eq!(t.navigate(Dir::Left, a), Nav::Moved);
+        assert_eq!(t.navigate(Dir::Left, a), Nav::Moved);
+        assert_eq!(t.focused_payload(), Some(b1));
+        assert!(t.focus_payload(b3)); // "click" the bottom-right pane
+        assert_eq!(t.navigate(Dir::Up, a), Nav::Moved);
+        assert_eq!(t.focused_payload(), Some(top));
+        assert_eq!(t.navigate(Dir::Down, a), Nav::Moved);
+        assert_eq!(
+            t.focused_payload(),
+            Some(b3),
+            "the click was the last visit"
+        );
+    }
+
+    #[test]
+    fn restored_layout_falls_back_to_center_alignment() {
+        // A tree restored from a saved layout has no focus history (only the restored focus
+        // itself), so Down from the top pane keeps today's center-alignment choice.
+        let (t, top, [_, b2, _]) = top_over_three();
+        let saved = t.to_layout().expect("non-empty");
+        let mut restored = PaneTree::<TerminalId>::from_layout(&saved);
+        let a = area();
+        assert_eq!(
+            restored.focused_payload(),
+            Some(top),
+            "first leaf is the top pane"
+        );
+        assert_eq!(restored.navigate(Dir::Down, a), Nav::Moved);
+        assert_eq!(
+            restored.focused_payload(),
+            Some(b2),
+            "no history → center-aligned pane"
+        );
+    }
+
+    #[test]
+    fn nearer_pane_beats_more_recent_pane() {
+        // Three stacked rows: a / m / b. From the top, Down must pick the adjacent middle row
+        // even when the bottom row was focused more recently — gap dominates recency.
+        let mut t = PaneTree::new();
+        let a_pane = TerminalId::new();
+        t.open(a_pane);
+        t.split(Axis::TopBottom);
+        let m = TerminalId::new();
+        t.open(m);
+        t.split(Axis::TopBottom);
+        let b = TerminalId::new();
+        t.open(b); // focused last — the most recent stamp
+        assert!(t.focus_payload(a_pane));
+        let ar = area();
+        assert_eq!(t.navigate(Dir::Down, ar), Nav::Moved);
+        assert_eq!(
+            t.focused_payload(),
+            Some(m),
+            "adjacent row wins over recency"
+        );
     }
 
     #[test]
