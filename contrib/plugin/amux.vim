@@ -5,9 +5,10 @@
 " plugin then moves between vim's own splits, and hands navigation back to amux at the edge via
 " `amux nav`.
 "
-" Install (vim-plug):   Plug 'you/amux', { 'rtp': 'contrib' }
-"   or copy this file to ~/.vim/plugin/amux.vim (or ~/.config/nvim/plugin/).
-" If you also use vim-tmux-navigator, load amux.vim AFTER it so these mappings win inside amux.
+" Install (vim-plug):   Plug 'you/amux', { 'rtp': 'contrib' }  (after any vim-tmux-navigator line)
+"   or copy this file to ~/.vim/after/plugin/amux.vim (or ~/.config/nvim/after/plugin/) — it must
+"   load AFTER vim-tmux-navigator, whose Ctrl+hjkl mappings would otherwise win; `after/` is what
+"   guarantees that (plain ~/.vim/plugin/ sources BEFORE plugin-manager directories).
 "
 " It self-disables outside amux (keyed on $AMUX_TERMINAL_ID), so it's inert under plain tmux/shell.
 

@@ -26,11 +26,14 @@ safe to always load.
 
 - **Symlink (simplest, stays in sync with the repo):**
   ```sh
-  mkdir -p ~/.vim/plugin                # or ~/.config/nvim/plugin for neovim
-  ln -s /path/to/amux/contrib/plugin/amux.vim ~/.vim/plugin/amux.vim
+  mkdir -p ~/.vim/after/plugin          # or ~/.config/nvim/after/plugin for neovim
+  ln -s /path/to/amux/contrib/plugin/amux.vim ~/.vim/after/plugin/amux.vim
   ```
-  Files in `~/.vim/plugin/` load after your vim-plug plugins, so `amux.vim`'s mappings already win
-  inside amux.
+  It must be `after/plugin`, not `plugin`: vim sources `~/.vim/plugin/` **before** plugin-manager
+  directories (they come later on `runtimepath`), so from there `vim-tmux-navigator` would override
+  `amux.vim`'s `Ctrl+hjkl` mappings — and outside tmux its fallback is a bare `wincmd`, which moves
+  inside vim but silently does nothing at the edge. `~/.vim/after/` is last on `runtimepath`, so
+  `amux.vim`'s mappings win inside amux.
 
 - **vim-plug (from a local checkout):** add to your vimrc **after** any `vim-tmux-navigator` line,
   then `:PlugInstall`:
