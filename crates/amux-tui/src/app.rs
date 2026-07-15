@@ -63,6 +63,14 @@ struct Selection {
     head: (u16, u16),
 }
 
+impl Selection {
+    /// Whether the pointer actually moved from the anchor — i.e. a real drag, not a bare click.
+    /// A click leaves `head == anchor`; such a selection neither highlights nor copies.
+    fn is_dragged(&self) -> bool {
+        self.head != self.anchor
+    }
+}
+
 /// Which field the two-field "new agent in a repo by path" prompt is editing.
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Field {
@@ -1169,15 +1177,26 @@ impl App {
                 return Ok(());
             }
             MouseEventKind::Up(MouseButton::Left) => {
-                if let Some(text) = self.selection_text() {
-                    if !text.trim().is_empty() {
-                        copy_to_clipboard(&text);
-                        self.info = format!("copied {} chars to clipboard", text.chars().count());
+                // Only a real drag copies; a bare click (head == anchor) selected nothing.
+                if self.selection.is_some_and(|s| s.is_dragged()) {
+                    if let Some(text) = self.selection_text() {
+                        if !text.trim().is_empty() {
+                            copy_to_clipboard(&text);
+                            self.info =
+                                format!("copied {} chars to clipboard", text.chars().count());
+                        }
                     }
                 }
                 return Ok(());
             }
             _ => {}
+        }
+
+        // A fresh left-press dismisses any prior selection (and its lingering highlight); the pane
+        // branch below re-creates one under the cursor. Without this, a completed drag-selection
+        // persists and the next Up over a non-pane target (a mini, the sidebar) would re-copy it.
+        if let MouseEventKind::Down(MouseButton::Left) = me.kind {
+            self.selection = None;
         }
 
         // Minis float over the panes, so a click/wheel over one targets the mini, not the pane.
@@ -1672,6 +1691,10 @@ fn ordered(a: (u16, u16), b: (u16, u16)) -> ((u16, u16), (u16, u16)) {
 
 /// Reverse-video the selected cells of `sel` in the frame buffer (drawn over the pane's content).
 fn highlight_selection(buf: &mut Buffer, sel: Selection) {
+    // A bare click (head == anchor) selected nothing — draw no highlight.
+    if !sel.is_dragged() {
+        return;
+    }
     let (start, end) = ordered(sel.anchor, sel.head);
     let right = sel.inner.x + sel.inner.width.saturating_sub(1);
     for y in start.1..=end.1 {
@@ -2574,6 +2597,128 @@ mod tests {
             .selection
             .expect("a left-press must start a selection even in a mouse-tracking pane");
         assert_eq!(sel.terminal, t);
+    }
+
+    /// A no-drag click (anchor == head) must paint no highlight; only a real drag reverse-videos
+    /// its span. Regression guard: a plain click used to light up the single cell under the cursor.
+    #[test]
+    fn click_paints_no_highlight_but_a_drag_does() {
+        let inner = Rect::new(1, 1, 10, 3);
+        let t = TerminalId::new();
+        let any_reversed = |b: &Buffer| {
+            (0..b.area.height).any(|dy| {
+                (0..b.area.width).any(|dx| {
+                    b.cell((b.area.x + dx, b.area.y + dy))
+                        .is_some_and(|c| c.style().add_modifier.contains(Modifier::REVERSED))
+                })
+            })
+        };
+
+        // No-drag click: anchor == head. Nothing should be highlighted.
+        let mut buf = Buffer::empty(Rect::new(0, 0, 12, 5));
+        highlight_selection(
+            &mut buf,
+            Selection {
+                terminal: t,
+                inner,
+                anchor: (2, 2),
+                head: (2, 2),
+            },
+        );
+        assert!(
+            !any_reversed(&buf),
+            "a no-drag click must not paint a highlight"
+        );
+
+        // Real drag: head != anchor. The span should be reverse-videoed.
+        let mut dragged = Buffer::empty(Rect::new(0, 0, 12, 5));
+        highlight_selection(
+            &mut dragged,
+            Selection {
+                terminal: t,
+                inner,
+                anchor: (2, 2),
+                head: (5, 2),
+            },
+        );
+        assert!(
+            any_reversed(&dragged),
+            "a drag selection must paint a highlight"
+        );
+    }
+
+    /// A left click with no drag (Down then Up over a non-blank cell) must NOT copy — no clipboard
+    /// write, no "copied" banner. Regression guard: a plain click used to copy the single character
+    /// under the cursor and clobber the clipboard.
+    #[tokio::test]
+    async fn bare_click_does_not_copy() {
+        let (mut sink, _server) = test_sink();
+        let mut app = App::new(100, 40);
+        let t = TerminalId::new();
+        app.tree.open(t);
+        let mut parser = vt100::Parser::new(24, 80, 100);
+        parser.process(b"hello world\r\n"); // ensure the clicked cell holds a visible glyph
+        app.parsers.insert(t, parser);
+
+        // The pane's inner content starts at screen (31, 1) (main area x=30 + border); (31,1) = 'h'.
+        // Guard against layout drift making the click miss the pane (which would pass vacuously).
+        assert!(
+            app.pane_at(31, 1).is_some(),
+            "precondition: the click must land inside a pane"
+        );
+        let click = |kind| MouseEvent {
+            kind,
+            column: 31,
+            row: 1,
+            modifiers: KeyModifiers::NONE,
+        };
+        app.on_mouse(click(MouseEventKind::Down(MouseButton::Left)), &mut sink)
+            .await
+            .unwrap();
+        app.on_mouse(click(MouseEventKind::Up(MouseButton::Left)), &mut sink)
+            .await
+            .unwrap();
+
+        assert!(
+            app.info.is_empty(),
+            "a no-drag click must not copy (unexpected banner: {:?})",
+            app.info
+        );
+    }
+
+    /// A completed drag-selection must not survive the next unrelated left-press: a fresh press
+    /// (e.g. on the sidebar, outside any pane) dismisses it, so the following Up can't re-copy the
+    /// stale text. Regression guard for a selection that persisted and re-copied on later clicks.
+    #[tokio::test]
+    async fn fresh_left_press_clears_a_prior_selection() {
+        let (mut sink, _server) = test_sink();
+        let mut app = App::new(100, 40);
+        let t = TerminalId::new();
+        // A completed drag-selection, lingering as it does after a copy until the next action.
+        app.selection = Some(Selection {
+            terminal: t,
+            inner: Rect::new(31, 1, 40, 20),
+            anchor: (31, 1),
+            head: (35, 1),
+        });
+        assert!(
+            app.selection.is_some_and(|s| s.is_dragged()),
+            "precondition: a live dragged selection"
+        );
+
+        // A left-press on the sidebar (column < SIDEBAR_W, outside any pane) must dismiss it.
+        let press = MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column: 5,
+            row: 5,
+            modifiers: KeyModifiers::NONE,
+        };
+        app.on_mouse(press, &mut sink).await.unwrap();
+
+        assert!(
+            app.selection.is_none(),
+            "a fresh left-press must clear a stale selection so its Up can't re-copy"
+        );
     }
 
     #[test]
