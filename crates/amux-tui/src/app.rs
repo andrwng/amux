@@ -26,7 +26,7 @@ use tokio_util::codec::Framed;
 use tui_term::widget::PseudoTerminal;
 
 use amux_core::agent::{sort_for_sidebar, AgentId, AgentState, RepoId, RosterItem, TerminalId};
-use amux_proto::{AgentInfo, ClientCodec, ClientMsg, DaemonMsg, RepoInfo, Size};
+use amux_proto::{AgentInfo, ClientCodec, ClientMsg, DaemonMsg, ProtoError, RepoInfo, Size};
 
 use crate::input::{encode_paste, key_to_bytes};
 use crate::pane::{Axis, Dir, Nav, PaneTree};
@@ -96,7 +96,22 @@ pub async fn run() -> Result<()> {
     // Bracketed paste lets the outer terminal hand us a paste as one `Event::Paste` instead of a
     // storm of per-character key events — one write to the child, one redraw. See `on_paste`.
     let _ = crossterm::execute!(std::io::stdout(), EnableMouseCapture, EnableBracketedPaste);
-    let result = event_loop(&mut terminal, framed, repo).await;
+
+    let (cols, rows) = crossterm::terminal::size().unwrap_or((80, 24));
+    let mut app = App::new(cols, rows);
+    let (mut sink, mut stream) = framed.split();
+    let mut events = EventStream::new();
+
+    let result = event_loop(
+        &mut app,
+        &mut sink,
+        &mut stream,
+        &mut events,
+        |app| draw(&mut terminal, app),
+        repo,
+    )
+    .await;
+
     let _ = crossterm::execute!(
         std::io::stdout(),
         DisableMouseCapture,
@@ -110,7 +125,6 @@ pub async fn run() -> Result<()> {
 /// `true` iff the stream has ended (yielded `None`); `false` if it is merely out of ready items
 /// for now (still open). This is the coalescing primitive: one call collects a whole burst so
 /// the caller can render it in a single pass. See `docs/superpowers/specs/2026-07-15-coalesced-draw-design.md`.
-#[allow(dead_code)]
 async fn drain_ready<S, T>(stream: &mut S, out: &mut Vec<T>) -> bool
 where
     S: futures::Stream<Item = T> + Unpin,
@@ -128,42 +142,62 @@ where
     }
 }
 
-async fn event_loop(
-    terminal: &mut DefaultTerminal,
-    framed: Framed<UnixStream, ClientCodec>,
+/// The client event loop: block for the first event, then apply everything else already queued
+/// on both sources (coalescing a burst), and redraw once per batch. `stream` carries daemon
+/// messages, `events` the terminal input; `render` draws the current view model (injected so
+/// tests can drive the loop headless and count renders). Generic over the two stream types for
+/// the same reason.
+async fn event_loop<S, E, R>(
+    app: &mut App,
+    sink: &mut Sink,
+    stream: &mut S,
+    events: &mut E,
+    mut render: R,
     repo: PathBuf,
-) -> Result<()> {
-    let (cols, rows) = crossterm::terminal::size().unwrap_or((80, 24));
-    let mut app = App::new(cols, rows);
-    let (mut sink, mut stream) = framed.split();
-    let mut events = EventStream::new();
-
+) -> Result<()>
+where
+    S: futures::Stream<Item = Result<DaemonMsg, ProtoError>> + Unpin,
+    E: futures::Stream<Item = std::io::Result<Event>> + Unpin,
+    R: FnMut(&App) -> Result<()>,
+{
     // Register this client's repo with the (possibly shared) daemon so its agents show up here.
     sink.send(ClientMsg::AddRepo { path: repo }).await?;
 
-    draw(terminal, &app)?;
+    render(app)?;
     loop {
-        tokio::select! {
-            msg = stream.next() => match msg {
-                Some(Ok(dm)) => app.on_daemon(dm, &mut sink).await?,
-                _ => break,
+        // Phase 1 — block until one source is ready.
+        let mut quit = matches!(
+            tokio::select! {
+                msg = stream.next() => app.handle_daemon(msg.and_then(|r| r.ok()), sink).await?,
+                ev  = events.next() => app.handle_event(ev.and_then(|r| r.ok()), sink).await?,
             },
-            ev = events.next() => match ev {
-                Some(Ok(Event::Key(key))) if key.kind == KeyEventKind::Press => {
-                    if let Flow::Quit = app.on_key(key, &mut sink).await? {
-                        break;
-                    }
+            Flow::Quit
+        );
+
+        // Phase 2 — drain everything else already queued on both sources, without blocking.
+        if !quit {
+            let mut dmsgs = Vec::new();
+            quit |= drain_ready(stream, &mut dmsgs).await; // did the daemon stream end?
+            for m in dmsgs {
+                if let Flow::Quit = app.handle_daemon(m.ok(), sink).await? {
+                    quit = true;
                 }
-                Some(Ok(Event::Resize(c, r))) => app.on_resize(c, r, &mut sink).await?,
-                Some(Ok(Event::Mouse(me))) => app.on_mouse(me, &mut sink).await?,
-                Some(Ok(Event::Paste(text))) => app.on_paste(text, &mut sink).await?,
-                Some(Ok(_)) => {}
-                _ => break,
-            },
+            }
+            let mut evs = Vec::new();
+            quit |= drain_ready(events, &mut evs).await; // did the event stream end?
+            for e in evs {
+                if let Flow::Quit = app.handle_event(e.ok(), sink).await? {
+                    quit = true;
+                }
+            }
+        }
+
+        if quit {
+            break; // teardown — no trailing render
         }
         // Report focus changes so the daemon can track read/unread.
-        app.sync_focus(&mut sink).await?;
-        draw(terminal, &app)?;
+        app.sync_focus(sink).await?;
+        render(app)?; // exactly one render per drained batch
     }
     Ok(())
 }
@@ -341,6 +375,41 @@ impl App {
     }
 
     // --- daemon events ---
+
+    /// Apply one daemon message. `None` means the daemon stream ended or errored (the daemon
+    /// went away) → stop the loop.
+    async fn handle_daemon(&mut self, msg: Option<DaemonMsg>, sink: &mut Sink) -> Result<Flow> {
+        match msg {
+            Some(dm) => {
+                self.on_daemon(dm, sink).await?;
+                Ok(Flow::Continue)
+            }
+            None => Ok(Flow::Quit),
+        }
+    }
+
+    /// Apply one terminal event. `None` means the event stream ended or errored → stop the loop.
+    async fn handle_event(&mut self, ev: Option<Event>, sink: &mut Sink) -> Result<Flow> {
+        match ev {
+            Some(Event::Key(key)) if key.kind == KeyEventKind::Press => {
+                self.on_key(key, sink).await
+            }
+            Some(Event::Resize(c, r)) => {
+                self.on_resize(c, r, sink).await?;
+                Ok(Flow::Continue)
+            }
+            Some(Event::Mouse(me)) => {
+                self.on_mouse(me, sink).await?;
+                Ok(Flow::Continue)
+            }
+            Some(Event::Paste(text)) => {
+                self.on_paste(text, sink).await?;
+                Ok(Flow::Continue)
+            }
+            Some(_) => Ok(Flow::Continue),
+            None => Ok(Flow::Quit),
+        }
+    }
 
     async fn on_daemon(&mut self, msg: DaemonMsg, sink: &mut Sink) -> Result<()> {
         match msg {
@@ -2064,6 +2133,179 @@ mod tests {
     }
     fn ctrl(c: char) -> KeyEvent {
         KeyEvent::new(KeyCode::Char(c), KeyModifiers::CONTROL)
+    }
+
+    fn output(terminal: TerminalId, byte: u8) -> DaemonMsg {
+        DaemonMsg::Output {
+            terminal,
+            bytes: vec![byte],
+        }
+    }
+
+    /// A daemon stream that yields every message immediately, then pends once, then ends —
+    /// modelling a burst, then quiet, then disconnect, deterministically (no cross-stream timing).
+    fn burst_then_close(
+        msgs: Vec<DaemonMsg>,
+    ) -> impl futures::Stream<Item = Result<DaemonMsg, amux_proto::ProtoError>> + Unpin {
+        let mut queue = msgs.into_iter();
+        let mut pended = false;
+        futures::stream::poll_fn(move |cx| {
+            if let Some(m) = queue.next() {
+                std::task::Poll::Ready(Some(Ok(m)))
+            } else if !pended {
+                pended = true;
+                cx.waker().wake_by_ref();
+                std::task::Poll::Pending
+            } else {
+                std::task::Poll::Ready(None)
+            }
+        })
+    }
+
+    /// A short socket pair whose write half becomes a real `Sink`; the read half is kept alive so
+    /// the loop's `AddRepo` send doesn't hit a broken pipe.
+    fn test_sink() -> (Sink, UnixStream) {
+        let (client_end, server_end) = UnixStream::pair().unwrap();
+        let (sink, _rx) = Framed::new(client_end, ClientCodec::default()).split();
+        (sink, server_end)
+    }
+
+    /// THE regression test: a burst of Output frames must coalesce into a SINGLE render (plus the
+    /// initial one), not one render per frame. Old loop drew 1 + 3 = 4; coalesced loop draws 2.
+    #[tokio::test]
+    async fn output_burst_coalesces_into_one_render() {
+        let (mut sink, _server) = test_sink();
+        let mut app = App::new(100, 40);
+        let t = TerminalId::new();
+        let mut daemon = burst_then_close(vec![output(t, b'a'), output(t, b'b'), output(t, b'c')]);
+        let mut events = futures::stream::pending::<std::io::Result<Event>>();
+
+        let renders = std::rc::Rc::new(std::cell::Cell::new(0usize));
+        let r = renders.clone();
+        event_loop(
+            &mut app,
+            &mut sink,
+            &mut daemon,
+            &mut events,
+            move |_app| {
+                r.set(r.get() + 1);
+                Ok(())
+            },
+            std::path::PathBuf::from("/repo"),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(
+            renders.get(),
+            2,
+            "the 3-frame burst should coalesce into one render (plus the initial frame)"
+        );
+    }
+
+    /// A single event with nothing else queued renders exactly once — the idle-typing common case
+    /// (no added latency, no dropped frame).
+    #[tokio::test]
+    async fn single_event_renders_once() {
+        let (mut sink, _server) = test_sink();
+        let mut app = App::new(100, 40);
+        let t = TerminalId::new();
+        let mut daemon = burst_then_close(vec![output(t, b'x')]);
+        let mut events = futures::stream::pending::<std::io::Result<Event>>();
+
+        let renders = std::rc::Rc::new(std::cell::Cell::new(0usize));
+        let r = renders.clone();
+        event_loop(
+            &mut app,
+            &mut sink,
+            &mut daemon,
+            &mut events,
+            move |_app| {
+                r.set(r.get() + 1);
+                Ok(())
+            },
+            std::path::PathBuf::from("/repo"),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(
+            renders.get(),
+            2,
+            "initial frame + one render for the single event"
+        );
+    }
+
+    /// A quit (Ctrl-Q) stops the loop immediately and draws no trailing frame.
+    #[tokio::test]
+    async fn quit_key_stops_without_trailing_render() {
+        let (mut sink, _server) = test_sink();
+        let mut app = App::new(100, 40);
+        let mut daemon = futures::stream::pending::<Result<DaemonMsg, amux_proto::ProtoError>>();
+        let evs: Vec<std::io::Result<Event>> = vec![Ok(Event::Key(ctrl('q')))];
+        let mut events = futures::stream::iter(evs);
+
+        let renders = std::rc::Rc::new(std::cell::Cell::new(0usize));
+        let r = renders.clone();
+        event_loop(
+            &mut app,
+            &mut sink,
+            &mut daemon,
+            &mut events,
+            move |_app| {
+                r.set(r.get() + 1);
+                Ok(())
+            },
+            std::path::PathBuf::from("/repo"),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(
+            renders.get(),
+            1,
+            "only the initial frame; quit short-circuits before any batch render"
+        );
+    }
+
+    /// A quit discovered while DRAINING the event stream — behind an earlier non-quit event, so it
+    /// is not the Phase-1 winner — still stops the loop with no trailing render. Exercises the
+    /// Phase-2 event-drain quit branch (symmetric to the daemon-drain path). `chain(pending())`
+    /// keeps the stream open so the quit can only come from applying the Ctrl-Q; the timeout turns
+    /// a regression (a dropped quit → the loop blocks forever) into a clean failure instead of a hang.
+    #[tokio::test]
+    async fn quit_while_draining_events_stops_without_trailing_render() {
+        let (mut sink, _server) = test_sink();
+        let mut app = App::new(100, 40);
+        let mut daemon = futures::stream::pending::<Result<DaemonMsg, amux_proto::ProtoError>>();
+        let evs: Vec<std::io::Result<Event>> =
+            vec![Ok(Event::FocusGained), Ok(Event::Key(ctrl('q')))];
+        let mut events =
+            futures::stream::iter(evs).chain(futures::stream::pending::<std::io::Result<Event>>());
+
+        let renders = std::rc::Rc::new(std::cell::Cell::new(0usize));
+        let r = renders.clone();
+        let run = event_loop(
+            &mut app,
+            &mut sink,
+            &mut daemon,
+            &mut events,
+            move |_app| {
+                r.set(r.get() + 1);
+                Ok(())
+            },
+            std::path::PathBuf::from("/repo"),
+        );
+        tokio::time::timeout(std::time::Duration::from_secs(5), run)
+            .await
+            .expect("event_loop must terminate when a quit is drained from the event stream")
+            .unwrap();
+
+        assert_eq!(
+            renders.get(),
+            1,
+            "a quit drained from the event stream stops the loop with no batch render"
+        );
     }
 
     /// A multi-line paste into a focused pane whose child wants bracketed paste must reach the
