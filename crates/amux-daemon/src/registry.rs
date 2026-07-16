@@ -803,7 +803,7 @@ impl Registry {
         spec.env
             .push(("AMUX_TERMINAL_ID".to_string(), primary.to_full_string()));
         let session = Session::spawn(&spec.command, &spec.cwd, &spec.env, DEFAULT_SIZE)?;
-        let state_change = {
+        let (state_change, at) = {
             let mut state = self.state.lock().unwrap();
             if let Some(term) = state.terminals.get_mut(&primary) {
                 term.session = Some(Arc::clone(&session));
@@ -813,18 +813,21 @@ impl Registry {
                     // Resuming lands back at the prompt — idle/waiting, not working (same reasoning
                     // as create): let hooks drive Working so we don't flash a false "⋯"/unread.
                     agent.state = AgentState::Idle;
-                    agent.last_activity = Utc::now();
-                    agent.last_opened = Utc::now();
-                    agent.state.clone()
+                    let at = Utc::now();
+                    agent.last_activity = at;
+                    agent.last_opened = at;
+                    (agent.state.clone(), at)
                 }
                 None => return Ok(()),
             }
         };
         self.spawn_primary_monitor(id, primary, session);
+        self.save();
         let _ = self.events.send(DaemonMsg::StateChanged {
             id,
             state: state_change,
         });
+        let _ = self.events.send(DaemonMsg::OpenedChanged { id, at });
         Ok(())
     }
 

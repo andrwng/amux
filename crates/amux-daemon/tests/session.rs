@@ -985,3 +985,69 @@ async fn durable_state_survives_a_daemon_restart() {
         "the primary is live after resume"
     );
 }
+
+/// `resume()` re-stamps `last_opened` (same MRU reasoning as `focus()`): a reconnecting client
+/// should see the resumed agent jump to the top of the sidebar immediately, not only after the
+/// next reconnect. Drives the real wire path — `ClientMsg::ResumeAgent` over a connected client —
+/// so it also covers the server dispatch arm, not just the registry method.
+#[tokio::test]
+async fn resuming_an_agent_stamps_last_opened_and_broadcasts() {
+    let tmp = tempfile::tempdir().unwrap();
+    let repo = tmp.path().join("repo");
+    std::fs::create_dir(&repo).unwrap();
+    init_repo(&repo);
+    let wt_base = tmp.path().join("wt");
+    let state_path = tmp.path().join("state.json");
+
+    // First daemon: register a repo and create an agent. Each persists to state.json.
+    let (agent_id, before) = {
+        let worktrees = WorktreeService::with_base(&repo, &wt_base).unwrap();
+        let adapter = Box::new(ClaudeAdapter::with_command(vec!["cat".into()]));
+        let registry = Registry::with_state(adapter, state_path.clone());
+        let repo_id = registry.register(worktrees).id;
+        let info = registry.create(repo_id, "feature").unwrap();
+        (info.id, info.last_opened)
+    };
+
+    // Second daemon: load_state re-registers the repo from state.json — the agent comes back
+    // suspended (no live primary session), which is what makes `resume()` do real work below.
+    let adapter = Box::new(ClaudeAdapter::with_command(vec!["cat".into()]));
+    let registry = Registry::with_state(adapter, state_path.clone());
+    registry.load_state();
+    assert!(
+        registry
+            .session(
+                registry
+                    .infos()
+                    .iter()
+                    .find(|a| a.id == agent_id)
+                    .unwrap()
+                    .primary_terminal
+            )
+            .is_none(),
+        "reloaded primary starts suspended"
+    );
+
+    let socket = tmp.path().join("amuxd.sock");
+    let listener = UnixListener::bind(&socket).unwrap();
+    tokio::spawn(serve(listener, registry));
+
+    let mut client = handshake(&socket).await;
+    client
+        .send(ClientMsg::ResumeAgent { id: agent_id })
+        .await
+        .unwrap();
+    let at = tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            match client.next().await {
+                Some(Ok(DaemonMsg::OpenedChanged { id, at })) if id == agent_id => return Some(at),
+                Some(Ok(_)) => {}
+                _ => return None,
+            }
+        }
+    })
+    .await
+    .unwrap_or(None)
+    .expect("resuming an agent should broadcast OpenedChanged");
+    assert!(at >= before, "the MRU stamp moves forward on resume");
+}
