@@ -613,6 +613,33 @@ async fn unread_is_set_on_finish_when_unfocused_and_cleared_on_focus() {
 }
 
 #[tokio::test]
+async fn focusing_an_agent_stamps_last_opened() {
+    let (mut client, repo, _tmp) = setup().await;
+    let agent = create_agent(&mut client, repo, "feat/mru").await;
+    let before = agent.last_opened;
+
+    client
+        .send(ClientMsg::Focus {
+            agent: Some(agent.id),
+        })
+        .await
+        .unwrap();
+    let at = tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            match client.next().await {
+                Some(Ok(DaemonMsg::OpenedChanged { id, at })) if id == agent.id => return Some(at),
+                Some(Ok(_)) => {}
+                _ => return None,
+            }
+        }
+    })
+    .await
+    .unwrap_or(None)
+    .expect("focusing an agent should broadcast OpenedChanged");
+    assert!(at >= before, "the MRU stamp moves forward on focus");
+}
+
+#[tokio::test]
 async fn layout_persists_for_a_reconnecting_client() {
     let tmp = tempfile::tempdir().unwrap();
     let repo = tmp.path().join("repo");
@@ -910,6 +937,7 @@ async fn durable_state_survives_a_daemon_restart() {
         let mini = registry.create(repo_id, "mini").unwrap();
         registry.set_minis(vec![mini.id]);
         registry.set_active(Some(info.id));
+        registry.focus(Some(info.id));
         info
     };
     assert!(state_path.exists(), "state.json is written");
@@ -929,6 +957,10 @@ async fn durable_state_survives_a_daemon_restart() {
     assert_eq!(
         loaded.primary_terminal, info.primary_terminal,
         "stable primary id"
+    );
+    assert!(
+        loaded.last_opened >= info.last_opened,
+        "last_opened survives the restart (focus stamped it after create)"
     );
     assert!(
         matches!(loaded.state, AgentState::Exited { .. }),

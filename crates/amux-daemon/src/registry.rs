@@ -55,6 +55,9 @@ struct Agent {
     ai_session_id: Option<String>,
     created_at: DateTime<Utc>,
     last_activity: DateTime<Utc>,
+    /// When the user last opened (viewed) this agent — the sidebar's MRU key. Stamped on
+    /// create, focus, and resume; persisted so ordering survives a daemon restart.
+    last_opened: DateTime<Utc>,
     state: AgentState,
     /// Inbox unread bit — a notable moment the user hasn't seen yet (see `is_notable_transition`).
     unread: bool,
@@ -70,6 +73,7 @@ impl Agent {
             branch: self.branch.clone(),
             state: self.state.clone(),
             last_activity: self.last_activity,
+            last_opened: self.last_opened,
             unread: self.unread,
             primary_terminal: self.primary,
         }
@@ -143,6 +147,8 @@ struct PersistedAgent {
     ai_session_id: Option<String>,
     created_at: DateTime<Utc>,
     last_activity: DateTime<Utc>,
+    #[serde(default)]
+    last_opened: Option<DateTime<Utc>>,
     unread: bool,
     primary: TerminalId,
 }
@@ -363,6 +369,7 @@ impl Registry {
                         ai_session_id: a.ai_session_id.clone(),
                         created_at: a.created_at,
                         last_activity: a.last_activity,
+                        last_opened: Some(a.last_opened),
                         unread: a.unread,
                         primary: a.primary,
                     })
@@ -448,6 +455,7 @@ impl Registry {
                     ai_session_id: a.ai_session_id,
                     created_at: a.created_at,
                     last_activity: a.last_activity,
+                    last_opened: a.last_opened.unwrap_or(a.last_activity),
                     state: AgentState::Exited { code: None },
                     unread: a.unread,
                     primary: a.primary,
@@ -582,6 +590,7 @@ impl Registry {
                 ai_session_id: None,
                 created_at: now,
                 last_activity: now,
+                last_opened: now,
                 // A freshly launched CLI is sitting at its prompt — idle/waiting, not working.
                 // Real work is signalled by hooks (UserPromptSubmit/… → Working); starting in
                 // Working would show a false "⋯" and, when the heartbeat settled it, a false unread.
@@ -669,19 +678,31 @@ impl Registry {
     }
 
     /// Set (or clear) which agent the user is currently viewing. Focusing an agent clears its
-    /// unread bit; while focused, notable events on it won't re-mark it unread.
+    /// unread bit and stamps its `last_opened` (the sidebar's MRU key — persisted and broadcast);
+    /// while focused, notable events on it won't re-mark it unread.
     pub fn focus(&self, agent: Option<AgentId>) {
-        let cleared = {
+        let (opened, cleared) = {
             let mut state = self.state.lock().unwrap();
             state.focused = agent;
             match agent.and_then(|id| state.agents.get_mut(&id).map(|a| (id, a))) {
-                Some((id, a)) if a.unread => {
-                    a.unread = false;
-                    Some(id)
+                Some((id, a)) => {
+                    let at = Utc::now();
+                    a.last_opened = at;
+                    let cleared = if a.unread {
+                        a.unread = false;
+                        true
+                    } else {
+                        false
+                    };
+                    (Some((id, at)), cleared.then_some(id))
                 }
-                _ => None,
+                None => (None, None),
             }
         };
+        if let Some((id, at)) = opened {
+            self.save();
+            let _ = self.events.send(DaemonMsg::OpenedChanged { id, at });
+        }
         if let Some(id) = cleared {
             let _ = self
                 .events
@@ -793,6 +814,7 @@ impl Registry {
                     // as create): let hooks drive Working so we don't flash a false "⋯"/unread.
                     agent.state = AgentState::Idle;
                     agent.last_activity = Utc::now();
+                    agent.last_opened = Utc::now();
                     agent.state.clone()
                 }
                 None => return Ok(()),

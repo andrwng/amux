@@ -53,6 +53,8 @@ pub struct AgentInfo {
     pub branch: String,
     pub state: AgentState,
     pub last_activity: DateTime<Utc>,
+    /// When the user last opened (viewed) this agent — the sidebar's MRU sort key.
+    pub last_opened: DateTime<Utc>,
     /// Inbox unread bit: a notable moment (blocked / finished / exited) the user hasn't seen yet.
     pub unread: bool,
     /// The terminal that shows this agent's CLI (what "open in a pane" attaches to).
@@ -142,6 +144,8 @@ pub enum DaemonMsg {
     StateChanged { id: AgentId, state: AgentState },
     /// An agent's inbox unread bit changed (set by a notable event, cleared when you view it).
     UnreadChanged { id: AgentId, unread: bool },
+    /// The user opened (focused) an agent — the daemon's MRU stamp for sidebar ordering.
+    OpenedChanged { id: AgentId, at: DateTime<Utc> },
     /// A terminal's foreground app changed its `Ctrl+hjkl` passthrough state: when `true`, a
     /// vim-like program is running there and should receive `Ctrl+hjkl` instead of amux
     /// navigating. Announced by the in-pane navigator plugin via `amux passthrough`.

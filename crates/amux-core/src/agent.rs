@@ -158,16 +158,6 @@ impl AgentState {
     pub fn is_terminal(&self) -> bool {
         matches!(self, AgentState::Exited { .. } | AgentState::Error { .. })
     }
-
-    /// Sidebar sort bucket — lower sorts higher: attention first, terminal last.
-    pub fn priority(&self) -> u8 {
-        match self {
-            AgentState::NeedsAttention { .. } => 0,
-            AgentState::Working | AgentState::Starting => 1,
-            AgentState::Idle => 2,
-            AgentState::Exited { .. } | AgentState::Error { .. } => 3,
-        }
-    }
 }
 
 /// Inputs that drive [`next_state`]. Phase 1 emits the coarse ones; `NeedsUser` arrives in
@@ -211,7 +201,7 @@ pub fn next_state(current: &AgentState, event: &AgentEvent) -> AgentState {
 }
 
 /// The facet of an agent the sidebar sorts on — kept separate from the full agent record so
-/// the ordering policy stays pure and testable. The whole "how is the inbox ordered" question
+/// the ordering policy stays pure and testable. The whole "how is the sidebar ordered" question
 /// lives in [`sort_for_sidebar`]: one place to change.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RosterItem {
@@ -220,20 +210,28 @@ pub struct RosterItem {
     /// Whether the user hasn't yet seen this agent's latest notable moment (blocked / finished).
     pub unread: bool,
     pub last_activity: DateTime<Utc>,
+    /// When the user last opened (viewed) this agent — the MRU key for non-blocked rows.
+    pub last_opened: DateTime<Utc>,
 }
 
-/// Order agents for the sidebar inbox: by **condition** first (needs-attention → working → idle →
-/// terminal), then **unread before read** within a condition, then most-recent activity. Stable.
-///
-/// This yields the inbox ordering: 🔴 needs-you-new → 🟠 needs-you-seen → 🔵 finished-unread →
-/// ⚪ quiet. The tweak point for the whole "how is the inbox ordered" policy.
+/// Order agents for the sidebar: agents that **need attention** are pinned on top (unread
+/// first, then most-recently-blocked), and everything else follows in most-recently-**opened**
+/// order — MRU, like browser tabs. The inbox promise (a blocked agent is always visible)
+/// survives; the rest of the list tracks where the user is actually working. Stable.
 pub fn sort_for_sidebar(items: &mut [RosterItem]) {
+    let blocked = |i: &RosterItem| matches!(i.state, AgentState::NeedsAttention { .. });
     items.sort_by(|a, b| {
-        a.state
-            .priority()
-            .cmp(&b.state.priority())
-            .then_with(|| b.unread.cmp(&a.unread)) // unread (true) sorts before read (false)
-            .then_with(|| b.last_activity.cmp(&a.last_activity))
+        (!blocked(a)).cmp(&!blocked(b)).then_with(|| {
+            if blocked(a) {
+                b.unread
+                    .cmp(&a.unread) // unread (true) sorts before read (false)
+                    .then_with(|| b.last_activity.cmp(&a.last_activity))
+            } else {
+                b.last_opened
+                    .cmp(&a.last_opened)
+                    .then_with(|| b.last_activity.cmp(&a.last_activity))
+            }
+        })
     });
 }
 
@@ -349,53 +347,64 @@ mod tests {
         assert_eq!(glyphs.len(), 6);
     }
 
-    #[test]
-    fn sidebar_order_is_attention_first_then_recent() {
-        let base = DateTime::parse_from_rfc3339("2026-01-01T00:00:00Z")
+    fn at(secs: i64) -> DateTime<Utc> {
+        DateTime::parse_from_rfc3339("2026-01-01T00:00:00Z")
             .unwrap()
-            .with_timezone(&Utc);
-        let at = |secs: i64| base + chrono::Duration::seconds(secs);
-        let item = |state, secs| RosterItem {
+            .with_timezone(&Utc)
+            + chrono::Duration::seconds(secs)
+    }
+
+    fn item(state: AgentState, unread: bool, opened: i64, activity: i64) -> RosterItem {
+        RosterItem {
             id: AgentId::new(),
             state,
-            unread: false,
-            last_activity: at(secs),
-        };
-        let mut items = vec![
-            item(AgentState::Idle, 100),
-            item(needs_attention(), 10),
-            item(AgentState::Working, 50),
-            item(
-                AgentState::NeedsAttention {
-                    kind: AttentionKind::Question,
-                    message: None,
-                },
-                30,
-            ),
-            item(AgentState::Exited { code: Some(0) }, 200),
-        ];
-        sort_for_sidebar(&mut items);
-
-        let buckets: Vec<u8> = items.iter().map(|i| i.state.priority()).collect();
-        assert_eq!(buckets, vec![0, 0, 1, 2, 3]); // attention, attention, working, idle, exited
-        assert!(items[0].last_activity >= items[1].last_activity); // recent-first within a bucket
+            unread,
+            last_activity: at(activity),
+            last_opened: at(opened),
+        }
     }
 
     #[test]
-    fn unread_sorts_before_read_within_a_condition() {
-        let base = DateTime::parse_from_rfc3339("2026-01-01T00:00:00Z")
-            .unwrap()
-            .with_timezone(&Utc);
-        let item = |unread, secs| RosterItem {
-            id: AgentId::new(),
-            state: AgentState::Idle,
-            unread,
-            last_activity: base + chrono::Duration::seconds(secs),
-        };
-        // A newer *read* idle agent vs an older *unread* one: unread wins despite being older.
-        let mut items = vec![item(false, 100), item(true, 10)];
+    fn attention_is_pinned_above_everything() {
+        // A long-untouched blocked agent still outranks a just-opened working one.
+        let mut items = vec![
+            item(AgentState::Working, false, 100, 100),
+            item(needs_attention(), false, 0, 0),
+        ];
         sort_for_sidebar(&mut items);
-        assert!(items[0].unread && !items[1].unread);
+        assert!(matches!(items[0].state, AgentState::NeedsAttention { .. }));
+    }
+
+    #[test]
+    fn non_attention_rows_are_mru_by_last_opened() {
+        // State no longer buckets the rest — a just-opened exited agent sits above an
+        // older-opened working one — and unread does not outrank a more recent open.
+        let mut items = vec![
+            item(AgentState::Working, true, 10, 500),
+            item(AgentState::Exited { code: Some(0) }, false, 100, 50),
+            item(AgentState::Idle, false, 50, 900),
+        ];
+        sort_for_sidebar(&mut items);
+        let opened: Vec<DateTime<Utc>> = items.iter().map(|i| i.last_opened).collect();
+        assert_eq!(
+            opened,
+            vec![at(100), at(50), at(10)],
+            "most recently opened first"
+        );
+    }
+
+    #[test]
+    fn within_attention_unread_first_then_recent_blocker() {
+        // Two blocked agents: the unread one wins despite being blocked earlier; among
+        // equally-(un)read blockers, the most recent blocker (last_activity) wins.
+        let mut items = vec![
+            item(needs_attention(), false, 0, 100),
+            item(needs_attention(), true, 0, 10),
+            item(needs_attention(), true, 0, 50),
+        ];
+        sort_for_sidebar(&mut items);
+        assert!(items[0].unread && items[1].unread && !items[2].unread);
+        assert_eq!(items[0].last_activity, at(50));
     }
 
     #[test]

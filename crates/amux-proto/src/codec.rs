@@ -152,6 +152,7 @@ mod tests {
             branch: "feat/auth".into(),
             state: AgentState::Working,
             last_activity: Utc::now(),
+            last_opened: Utc::now(),
             unread: true,
             primary_terminal: TerminalId::new(),
         }
@@ -238,6 +239,7 @@ mod tests {
             state: AgentState::Exited { code: Some(0) },
         });
         roundtrip(DaemonMsg::UnreadChanged { id, unread: true });
+        roundtrip(DaemonMsg::OpenedChanged { id, at: Utc::now() });
         roundtrip(DaemonMsg::TerminalApp {
             terminal: t,
             passthrough: true,

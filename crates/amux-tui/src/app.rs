@@ -517,6 +517,11 @@ impl App {
                     agent.unread = unread;
                 }
             }
+            DaemonMsg::OpenedChanged { id, at } => {
+                if let Some(agent) = self.agents.iter_mut().find(|a| a.id == id) {
+                    agent.last_opened = at;
+                }
+            }
             DaemonMsg::TerminalApp {
                 terminal,
                 passthrough,
@@ -1492,6 +1497,7 @@ impl App {
                 state: a.state.clone(),
                 unread: a.unread,
                 last_activity: a.last_activity,
+                last_opened: a.last_opened,
             })
             .collect();
         sort_for_sidebar(&mut items);
@@ -2417,6 +2423,7 @@ mod tests {
             branch: "b".into(),
             state: AgentState::Working,
             last_activity: Utc::now(),
+            last_opened: Utc::now(),
             unread: false,
             primary_terminal: primary,
         }
@@ -2823,6 +2830,7 @@ mod tests {
             branch: "b".into(),
             state,
             last_activity: Utc::now(),
+            last_opened: Utc::now(),
             unread,
             primary_terminal: TerminalId::new(),
         }
@@ -2841,9 +2849,9 @@ mod tests {
             path: "/r".into(),
         }];
 
-        // Four agents with distinct state priorities so the sidebar order is fixed regardless of
-        // the unread bit (which only tiebreaks *within* a priority): NeedsAttention(0) < Working(1)
-        // < Idle(2) < Exited(3). Mark the 2nd and 4th unread → order is read, unread, read, unread.
+        // s0 is blocked so it pins to the top; the rest order by last_opened (MRU), staggered
+        // here so the order is fixed regardless of the unread bits (which no longer reorder
+        // non-blocked rows). Mark the 2nd and 4th unread → order is read, unread, read, unread.
         let s0 = agent_with(
             AgentState::NeedsAttention {
                 kind: AttentionKind::Question,
@@ -2851,9 +2859,12 @@ mod tests {
             },
             false,
         );
-        let s1 = agent_with(AgentState::Working, true);
-        let s2 = agent_with(AgentState::Idle, false);
-        let s3 = agent_with(AgentState::Exited { code: Some(0) }, true);
+        let mut s1 = agent_with(AgentState::Working, true);
+        let mut s2 = agent_with(AgentState::Idle, false);
+        let mut s3 = agent_with(AgentState::Exited { code: Some(0) }, true);
+        s1.last_opened = Utc::now();
+        s2.last_opened = Utc::now() - chrono::Duration::minutes(1);
+        s3.last_opened = Utc::now() - chrono::Duration::minutes(2);
         let (id0, id1, id2, id3) = (s0.id, s1.id, s2.id, s3.id);
         // Insertion order scrambled to prove the sort — not the push order — fixes the layout.
         app.agents = vec![s2, s0, s3, s1];

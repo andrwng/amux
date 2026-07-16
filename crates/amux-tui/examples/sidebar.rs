@@ -147,6 +147,7 @@ fn main() -> std::io::Result<()> {
             state: a.state.clone(),
             unread: false,
             last_activity: a.last_activity,
+            last_opened: a.last_activity,
         })
         .collect();
     sort_for_sidebar(&mut roster);
