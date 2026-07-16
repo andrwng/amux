@@ -8,7 +8,7 @@ use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 
 use anyhow::Result;
-use chrono::Utc;
+use chrono::{DateTime, Utc};
 use crossterm::event::{
     Event, EventStream, KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseButton, MouseEvent,
     MouseEventKind,
@@ -1972,12 +1972,14 @@ fn render_sidebar(frame: &mut Frame, area: Rect, app: &App) {
                 };
                 let unread_bar = if agent.unread { "\u{258c}" } else { " " };
                 // An open agent gets a leading '*'; the marker sits in its own column so names
-                // stay aligned whether open or not. The name then takes whatever width is left,
-                // truncating only when it doesn't fit. Prefix columns: cursor (1) + unread bar
-                // (1) + " glyph " (3) + open marker (1) = 6.
+                // stay aligned whether open or not. The name pads whatever width is left so the
+                // dim last-opened age hugs the right edge (the name gives way first on narrow
+                // sidebars). Prefix columns: cursor (1) + unread bar (1) + " glyph " (3) + open
+                // marker (1) = 6.
                 let open_marker = if is_open { "*" } else { " " };
-                let name_w = (inner.width as usize).saturating_sub(6);
-                let name = format!("{:.name_w$}", agent.name);
+                let age = age_short(agent.last_opened);
+                let name_w = (inner.width as usize).saturating_sub(6 + age.len() + 1);
+                let name = format!("{:<name_w$.name_w$}", agent.name);
                 lines.push(Line::from(vec![
                     Span::styled(marker.to_string(), Style::default().fg(Color::Cyan)),
                     Span::styled(
@@ -1992,6 +1994,7 @@ fn render_sidebar(frame: &mut Frame, area: Rect, app: &App) {
                     ),
                     Span::styled(open_marker, name_style),
                     Span::styled(name, name_style),
+                    Span::styled(format!(" {age}"), Style::default().fg(Color::DarkGray)),
                 ]));
                 if let AgentState::NeedsAttention {
                     message: Some(msg), ..
@@ -2008,6 +2011,17 @@ fn render_sidebar(frame: &mut Frame, area: Rect, app: &App) {
         }
     }
     frame.render_widget(Paragraph::new(lines), inner);
+}
+
+/// Compact "time since" for the sidebar's last-opened column: 45s, 12m, 3h, 2d.
+fn age_short(ts: DateTime<Utc>) -> String {
+    let secs = (Utc::now() - ts).num_seconds().max(0);
+    match secs {
+        0..=59 => format!("{secs}s"),
+        60..=3599 => format!("{}m", secs / 60),
+        3600..=86399 => format!("{}h", secs / 3600),
+        _ => format!("{}d", secs / 86400),
+    }
 }
 
 fn render_panes(frame: &mut Frame, area: Rect, app: &App) {
@@ -2834,6 +2848,43 @@ mod tests {
             unread,
             primary_terminal: TerminalId::new(),
         }
+    }
+
+    #[test]
+    fn age_short_buckets() {
+        let now = Utc::now();
+        assert_eq!(age_short(now), "0s");
+        assert_eq!(age_short(now - chrono::Duration::seconds(45)), "45s");
+        assert_eq!(age_short(now - chrono::Duration::minutes(12)), "12m");
+        assert_eq!(age_short(now - chrono::Duration::hours(3)), "3h");
+        assert_eq!(age_short(now - chrono::Duration::days(2)), "2d");
+    }
+
+    /// The sidebar renders a right-aligned "time since last opened" per agent row.
+    #[test]
+    fn sidebar_shows_last_opened_age() {
+        use ratatui::{backend::TestBackend, Terminal};
+        let mut app = App::new(100, 40);
+        let repo = RepoId::from_canonical_path(std::path::Path::new("/r"));
+        app.repos = vec![RepoInfo {
+            id: repo,
+            name: "r".into(),
+            path: "/r".into(),
+        }];
+        let mut agent = agent_with(AgentState::Idle, false);
+        agent.last_opened = Utc::now() - chrono::Duration::minutes(5);
+        app.agents = vec![agent];
+
+        let mut term = Terminal::new(TestBackend::new(30, 8)).unwrap();
+        term.draw(|f| render_sidebar(f, f.area(), &app)).unwrap();
+        let content: String = term
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|c| c.symbol())
+            .collect();
+        assert!(content.contains("5m"), "age column renders, got: {content}");
     }
 
     /// `Ctrl+j`/`Ctrl+k` in the sidebar move the selection to the next unread agent below/above,
