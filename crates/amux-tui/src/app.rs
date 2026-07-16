@@ -6,6 +6,7 @@
 
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
+use std::time::Duration;
 
 use anyhow::Result;
 use chrono::{DateTime, Utc};
@@ -35,6 +36,10 @@ const SIDEBAR_W: u16 = 30;
 const RESIZE_STEP: f32 = 0.05;
 /// Max height of the minis row (capped to half the main area).
 const MINI_ROWS: u16 = 14;
+/// How often the loop wakes up on its own, with no input, purely to redraw: the sidebar's
+/// per-agent age (`age_short`) is computed from a live clock, so a quiet screen would otherwise
+/// freeze it (e.g. "45s ago" staying "45s" forever). Coarse enough to be free.
+const AGE_TICK_INTERVAL: Duration = Duration::from_secs(30);
 
 type Sink = SplitSink<Framed<UnixStream, ClientCodec>, ClientMsg>;
 
@@ -175,6 +180,15 @@ where
     // Register this client's repo with the (possibly shared) daemon so its agents show up here.
     sink.send(ClientMsg::AddRepo { path: repo }).await?;
 
+    // Ticks every AGE_TICK_INTERVAL so the sidebar's age column keeps advancing even when the
+    // screen is otherwise quiet (see AGE_TICK_INTERVAL). `interval_at` schedules the first tick
+    // one full interval out, rather than immediately (tokio::time::interval's default), so it
+    // never forces an extra render right after the loop starts.
+    let mut age_tick = tokio::time::interval_at(
+        tokio::time::Instant::now() + AGE_TICK_INTERVAL,
+        AGE_TICK_INTERVAL,
+    );
+
     render(app)?;
     loop {
         // Phase 1 — block until one source is ready.
@@ -182,6 +196,9 @@ where
             tokio::select! {
                 msg = stream.next() => app.handle_daemon(msg.and_then(|r| r.ok()), sink).await?,
                 ev  = events.next() => app.handle_event(ev.and_then(|r| r.ok()), sink).await?,
+                // No state to apply — just fall through to Phase 2/the render below so the age
+                // column redraws with a fresh "now".
+                _ = age_tick.tick() => Flow::Continue,
             },
             Flow::Quit
         );
