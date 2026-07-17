@@ -36,14 +36,17 @@ use crate::pane::{Axis, Dir, Nav, PaneTree};
 const SIDEBAR_W_FULL: u16 = 30;
 /// Minimized sidebar width for narrow terminals: cursor + unread bar + glyph + a few name chars.
 const SIDEBAR_W_MIN: u16 = 12;
-/// Below this total terminal width the sidebar minimizes to reclaim horizontal space for panes.
-const NARROW_COLS: u16 = 60;
+/// Keep at least this many columns of main area: when a full sidebar would squeeze the panes
+/// below this, the sidebar minimizes to the rail instead. The panes are the workspace, the
+/// sidebar is chrome — a CLI in fewer than ~40 columns wraps everything and is barely usable.
+const MAIN_W_MIN: u16 = 40;
 
-/// The sidebar's width for a given total terminal width. The single source of truth shared by
-/// `main_area` (which drives the pane region and mouse hit-testing) and `render`'s layout — the
-/// two must agree or panes and clicks misalign.
+/// The sidebar's width for a given total terminal width: full, unless that would leave the main
+/// area under `MAIN_W_MIN` columns. The single source of truth shared by `main_area` (which
+/// drives the pane region and mouse hit-testing) and `render`'s layout — the two must agree or
+/// panes and clicks misalign.
 fn sidebar_width(total_cols: u16) -> u16 {
-    if total_cols < NARROW_COLS {
+    if total_cols < SIDEBAR_W_FULL + MAIN_W_MIN {
         SIDEBAR_W_MIN
     } else {
         SIDEBAR_W_FULL
@@ -2959,12 +2962,14 @@ mod tests {
         assert!(content.contains("5m"), "age column renders, got: {content}");
     }
 
-    /// The sidebar minimizes below `NARROW_COLS` and stays full at/above it — the width that both
-    /// the layout and pane region key off must switch on exactly that boundary.
+    /// The sidebar minimizes when a full sidebar would leave the main area with fewer than
+    /// `MAIN_W_MIN` columns, and stays full at/above that boundary — the width that both the
+    /// layout and pane region key off must switch on exactly that boundary.
     #[test]
     fn sidebar_width_minimizes_when_narrow() {
-        assert_eq!(sidebar_width(NARROW_COLS - 1), SIDEBAR_W_MIN);
-        assert_eq!(sidebar_width(NARROW_COLS), SIDEBAR_W_FULL);
+        let boundary = SIDEBAR_W_FULL + MAIN_W_MIN;
+        assert_eq!(sidebar_width(boundary - 1), SIDEBAR_W_MIN);
+        assert_eq!(sidebar_width(boundary), SIDEBAR_W_FULL);
         assert_eq!(sidebar_width(200), SIDEBAR_W_FULL);
     }
 
