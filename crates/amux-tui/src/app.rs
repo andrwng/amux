@@ -32,7 +32,23 @@ use amux_proto::{AgentInfo, ClientCodec, ClientMsg, DaemonMsg, ProtoError, RepoI
 use crate::input::{encode_paste, key_to_bytes};
 use crate::pane::{Axis, Dir, Nav, PaneTree};
 
-const SIDEBAR_W: u16 = 30;
+/// Full sidebar width: cursor + unread bar + glyph + open marker + name + age.
+const SIDEBAR_W_FULL: u16 = 30;
+/// Minimized sidebar width for narrow terminals: cursor + unread bar + glyph + a few name chars.
+const SIDEBAR_W_MIN: u16 = 12;
+/// Below this total terminal width the sidebar minimizes to reclaim horizontal space for panes.
+const NARROW_COLS: u16 = 60;
+
+/// The sidebar's width for a given total terminal width. The single source of truth shared by
+/// `main_area` (which drives the pane region and mouse hit-testing) and `render`'s layout — the
+/// two must agree or panes and clicks misalign.
+fn sidebar_width(total_cols: u16) -> u16 {
+    if total_cols < NARROW_COLS {
+        SIDEBAR_W_MIN
+    } else {
+        SIDEBAR_W_FULL
+    }
+}
 const RESIZE_STEP: f32 = 0.05;
 /// Max height of the minis row (capped to half the main area).
 const MINI_ROWS: u16 = 14;
@@ -232,10 +248,11 @@ where
 }
 
 fn main_area(cols: u16, rows: u16) -> Rect {
+    let sw = sidebar_width(cols);
     Rect::new(
-        SIDEBAR_W,
+        sw,
         0,
-        cols.saturating_sub(SIDEBAR_W).max(1),
+        cols.saturating_sub(sw).max(1),
         rows.saturating_sub(1).max(1),
     )
 }
@@ -1818,7 +1835,10 @@ fn render(frame: &mut Frame, app: &App) {
         .split(frame.area());
     let cols = Layout::default()
         .direction(Direction::Horizontal)
-        .constraints([Constraint::Length(SIDEBAR_W), Constraint::Min(1)])
+        .constraints([
+            Constraint::Length(sidebar_width(rows[0].width)),
+            Constraint::Min(1),
+        ])
         .split(rows[0]);
 
     render_sidebar(frame, cols[0], app);
@@ -1910,11 +1930,17 @@ fn render_minis(frame: &mut Frame, area: Rect, app: &App) {
 }
 
 fn render_sidebar(frame: &mut Frame, area: Rect, app: &App) {
+    // On a narrow terminal the sidebar shrinks to an icon-and-initials rail (see `sidebar_width`).
+    // Derived from the rect we're handed so there's no separate state to keep in sync.
+    let minimized = area.width < SIDEBAR_W_FULL;
     let unread = app.agents.iter().filter(|a| a.unread).count();
-    let title = if unread > 0 {
-        format!(" agents · {unread} unread ")
-    } else {
-        " agents ".to_string()
+    // The full title ("agents · N unread") won't fit the minimized rail, so it drops to a bare
+    // unread badge — just the count when something's waiting, otherwise nothing.
+    let title = match (minimized, unread) {
+        (false, 0) => " agents ".to_string(),
+        (false, n) => format!(" agents · {n} unread "),
+        (true, 0) => String::new(),
+        (true, n) => format!(" {n} "),
     };
     let border = if app.focus == Focus::Sidebar {
         Style::default().fg(Color::Cyan)
@@ -1958,19 +1984,31 @@ fn render_sidebar(frame: &mut Frame, area: Rect, app: &App) {
                 if selected {
                     style = style.add_modifier(Modifier::REVERSED);
                 }
-                lines.push(Line::from(vec![
-                    Span::styled(
-                        format!("{marker} \u{25be} "),
-                        Style::default().fg(Color::Cyan),
-                    ),
-                    Span::styled(format!("{name} "), style),
-                    Span::styled(format!("({count})"), Style::default().fg(Color::DarkGray)),
-                ]));
-                if count == 0 {
-                    lines.push(Line::from(Span::styled(
-                        "      no agents — press n",
-                        Style::default().fg(Color::DarkGray),
-                    )));
+                if minimized {
+                    // Just the disclosure caret + truncated repo name; the count and hint don't fit.
+                    let name_w = (inner.width as usize).saturating_sub(4);
+                    lines.push(Line::from(vec![
+                        Span::styled(
+                            format!("{marker}\u{25be} "),
+                            Style::default().fg(Color::Cyan),
+                        ),
+                        Span::styled(format!("{name:.name_w$}"), style),
+                    ]));
+                } else {
+                    lines.push(Line::from(vec![
+                        Span::styled(
+                            format!("{marker} \u{25be} "),
+                            Style::default().fg(Color::Cyan),
+                        ),
+                        Span::styled(format!("{name} "), style),
+                        Span::styled(format!("({count})"), Style::default().fg(Color::DarkGray)),
+                    ]));
+                    if count == 0 {
+                        lines.push(Line::from(Span::styled(
+                            "      no agents — press n",
+                            Style::default().fg(Color::DarkGray),
+                        )));
+                    }
                 }
             }
             Row::Agent(id) => {
@@ -1988,6 +2026,31 @@ fn render_sidebar(frame: &mut Frame, area: Rect, app: &App) {
                     Style::default()
                 };
                 let unread_bar = if agent.unread { "\u{258c}" } else { " " };
+                let glyph_span = Span::styled(
+                    format!(" {} ", agent.state.glyph()),
+                    Style::default().fg(color_for(&agent.state)),
+                );
+                let cursor_span =
+                    Span::styled(marker.to_string(), Style::default().fg(Color::Cyan));
+                let unread_span = Span::styled(
+                    unread_bar,
+                    Style::default()
+                        .fg(Color::Cyan)
+                        .add_modifier(Modifier::BOLD),
+                );
+                if minimized {
+                    // Rail: cursor (1) + unread bar (1) + " glyph " (3) + a few name chars. No open
+                    // marker, age, or attention message — the icon and initials are all that fit.
+                    let name_w = (inner.width as usize).saturating_sub(5);
+                    let name = format!("{:<name_w$.name_w$}", agent.name);
+                    lines.push(Line::from(vec![
+                        cursor_span,
+                        unread_span,
+                        glyph_span,
+                        Span::styled(name, name_style),
+                    ]));
+                    continue;
+                }
                 // An open agent gets a leading '*'; the marker sits in its own column so names
                 // stay aligned whether open or not. The name pads whatever width is left so the
                 // dim last-opened age hugs the right edge (the name gives way first on narrow
@@ -1998,17 +2061,9 @@ fn render_sidebar(frame: &mut Frame, area: Rect, app: &App) {
                 let name_w = (inner.width as usize).saturating_sub(6 + age.len() + 1);
                 let name = format!("{:<name_w$.name_w$}", agent.name);
                 lines.push(Line::from(vec![
-                    Span::styled(marker.to_string(), Style::default().fg(Color::Cyan)),
-                    Span::styled(
-                        unread_bar,
-                        Style::default()
-                            .fg(Color::Cyan)
-                            .add_modifier(Modifier::BOLD),
-                    ),
-                    Span::styled(
-                        format!(" {} ", agent.state.glyph()),
-                        Style::default().fg(color_for(&agent.state)),
-                    ),
+                    cursor_span,
+                    unread_span,
+                    glyph_span,
                     Span::styled(open_marker, name_style),
                     Span::styled(name, name_style),
                     Span::styled(format!(" {age}"), Style::default().fg(Color::DarkGray)),
@@ -2902,6 +2957,55 @@ mod tests {
             .map(|c| c.symbol())
             .collect();
         assert!(content.contains("5m"), "age column renders, got: {content}");
+    }
+
+    /// The sidebar minimizes below `NARROW_COLS` and stays full at/above it — the width that both
+    /// the layout and pane region key off must switch on exactly that boundary.
+    #[test]
+    fn sidebar_width_minimizes_when_narrow() {
+        assert_eq!(sidebar_width(NARROW_COLS - 1), SIDEBAR_W_MIN);
+        assert_eq!(sidebar_width(NARROW_COLS), SIDEBAR_W_FULL);
+        assert_eq!(sidebar_width(200), SIDEBAR_W_FULL);
+    }
+
+    /// On the narrow rail the sidebar shows the state glyph and a few name characters but drops
+    /// the last-opened age column, which has no room.
+    #[test]
+    fn minimized_sidebar_truncates_names_and_drops_age() {
+        use ratatui::{backend::TestBackend, Terminal};
+        let mut app = App::new(100, 40);
+        let repo = RepoId::from_canonical_path(std::path::Path::new("/r"));
+        app.repos = vec![RepoInfo {
+            id: repo,
+            name: "r".into(),
+            path: "/r".into(),
+        }];
+        let mut agent = agent_with(AgentState::Idle, false);
+        agent.name = "apiserver".into();
+        agent.last_opened = Utc::now() - chrono::Duration::minutes(5);
+        app.agents = vec![agent];
+
+        let mut term = Terminal::new(TestBackend::new(SIDEBAR_W_MIN, 8)).unwrap();
+        term.draw(|f| render_sidebar(f, f.area(), &app)).unwrap();
+        let content: String = term
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|c| c.symbol())
+            .collect();
+        assert!(
+            content.contains("apis"),
+            "a few name chars render, got: {content}"
+        );
+        assert!(
+            !content.contains("apiserver"),
+            "the full name must be truncated on the rail, got: {content}"
+        );
+        assert!(
+            !content.contains("5m"),
+            "the age column is dropped on the rail, got: {content}"
+        );
     }
 
     /// `Ctrl+j`/`Ctrl+k` in the sidebar move the selection to the next unread agent below/above,
