@@ -2,10 +2,10 @@
 //! **terminals**; the sidebar lists **agents** (workspaces) grouped by **repo**. Splitting a pane
 //! spawns a `$SHELL` in the same worktree. Focus is spatial — `Ctrl+hjkl` moves between panes and
 //! into/out of the sidebar; `Ctrl+B` is a prefix (`%`/`"` split, `x` close, `r` resize). `n`
-//! creates an agent in the selected repo, `N` in a repo given by path. `Ctrl+Q` quits. Holding
-//! `Cmd` (or the `Ctrl-G` leader, where the terminal can't forward `Cmd`) reveals a numeric
-//! overlay on the sidebar; `Cmd`+digit / leader-then-digit selects that agent (`1`..`9`, `0` =
-//! tenth).
+//! creates an agent in the selected repo, `N` in a repo given by path. `Ctrl+Q` quits. The
+//! `Ctrl-G` leader reveals a numeric overlay on the sidebar; the next digit selects that agent
+//! (`1`..`9`, `0` = tenth). `Cmd`+digit does the same on terminals that natively report the SUPER
+//! modifier (we don't force the Kitty protocol — it would break Shift and slow typing).
 
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
@@ -127,7 +127,6 @@ enum Flow {
 pub async fn run() -> Result<()> {
     use crossterm::event::{
         DisableBracketedPaste, DisableMouseCapture, EnableBracketedPaste, EnableMouseCapture,
-        KeyboardEnhancementFlags, PopKeyboardEnhancementFlags, PushKeyboardEnhancementFlags,
     };
     let (framed, repo) = crate::client::connect().await?;
     let mut terminal = ratatui::init();
@@ -135,23 +134,17 @@ pub async fn run() -> Result<()> {
     // amux's own scrollback). Hold Shift to bypass for native terminal selection.
     // Bracketed paste lets the outer terminal hand us a paste as one `Event::Paste` instead of a
     // storm of per-character key events — one write to the child, one redraw. See `on_paste`.
+    //
+    // We deliberately do NOT push the Kitty keyboard-enhancement flags. Enabling
+    // REPORT_ALL_KEYS_AS_ESCAPE_CODES is the only way to observe a lone Cmd/Super press (for the
+    // numeric-overlay hold), but it reroutes *all* input through `CSI u`: shifted characters then
+    // arrive as base-codepoint + SHIFT (crossterm only substitutes the real glyph with the extra
+    // REPORT_ALTERNATE_KEYS flag), so our PTY bridge would send lowercase; and REPORT_EVENT_TYPES
+    // doubles every keystroke into press+release. The blast radius on typing is not worth a
+    // Cmd-hold that most macOS terminals won't forward anyway. The `Ctrl-G` numeric leader needs
+    // none of this; `Cmd+digit` still works on any terminal that natively reports the SUPER
+    // modifier without us forcing the mode.
     let _ = crossterm::execute!(std::io::stdout(), EnableMouseCapture, EnableBracketedPaste);
-    // The Kitty keyboard protocol reports a lone Cmd/Super press *and* its release — needed for the
-    // numeric-shortcut overlay to appear the instant Cmd is held and vanish when it's let go, and
-    // for `Cmd+digit` to arrive with the SUPER modifier distinguishable from a bare digit. Only
-    // pushed where the terminal supports it (queried over SSH too); elsewhere the feature falls
-    // back to the `Ctrl-G` leader and this is a no-op. Popped on teardown. See the numeric-shortcut
-    // spec. REPORT_ALL_KEYS is what makes modifier-only keys report as their own events.
-    let kbd_enhanced = crossterm::terminal::supports_keyboard_enhancement().unwrap_or(false);
-    if kbd_enhanced {
-        let _ = crossterm::execute!(
-            std::io::stdout(),
-            PushKeyboardEnhancementFlags(
-                KeyboardEnhancementFlags::REPORT_EVENT_TYPES
-                    | KeyboardEnhancementFlags::REPORT_ALL_KEYS_AS_ESCAPE_CODES
-            )
-        );
-    }
 
     let (cols, rows) = crossterm::terminal::size().unwrap_or((80, 24));
     let mut app = App::new(cols, rows);
@@ -168,9 +161,6 @@ pub async fn run() -> Result<()> {
     )
     .await;
 
-    if kbd_enhanced {
-        let _ = crossterm::execute!(std::io::stdout(), PopKeyboardEnhancementFlags);
-    }
     let _ = crossterm::execute!(
         std::io::stdout(),
         DisableMouseCapture,
