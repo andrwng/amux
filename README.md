@@ -15,6 +15,19 @@ Status: **pre-alpha**, Phase 0 (the spine). Unix only (macOS + Linux/Ubuntu).
 cargo run   # the TUI — auto-spawns the daemon on first run
 ```
 
+### Install
+
+To get an `amux` on your `PATH` instead of running from the source tree, install the binary from
+a clone with cargo:
+
+```sh
+cargo install --path .   # builds and installs `amux` into ~/.cargo/bin
+```
+
+Then run `amux` from any repo (make sure `~/.cargo/bin` is on your `PATH`). On Ubuntu you need a C
+toolchain first: `sudo apt-get install -y build-essential pkg-config`. Re-run the same command to
+upgrade after pulling — a cargo-installed binary does not update itself.
+
 ### The three kinds of panels
 
 ```
