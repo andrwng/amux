@@ -1305,6 +1305,19 @@ impl App {
             self.selection = None;
         }
 
+        // A left-click anywhere in the sidebar body focuses the sidebar (keeping its current
+        // selection), mirroring how clicking a pane focuses it. The sidebar occupies every column
+        // left of the main area (`self.area.x` is the sidebar width) down to the status bar
+        // (`self.area.bottom()`), an x-range disjoint from the minis and panes — both live in
+        // `self.area` — so it's safe to resolve first. The sidebar has no scrollback, so only the
+        // click matters; wheel and drag over it do nothing.
+        if let MouseEventKind::Down(MouseButton::Left) = me.kind {
+            if me.column < self.area.x && me.row < self.area.bottom() {
+                self.focus = Focus::Sidebar;
+                return Ok(());
+            }
+        }
+
         // Minis float over the panes, so a click/wheel over one targets the mini, not the pane.
         if let Some((i, inner)) = self.mini_at(me.column, me.row) {
             match me.kind {
@@ -2968,6 +2981,59 @@ mod tests {
         assert!(
             app.selection.is_none(),
             "a fresh left-press must clear a stale selection so its Up can't re-copy"
+        );
+    }
+
+    /// A left-click anywhere in the sidebar column moves focus to the sidebar — its literal ask,
+    /// mirroring how clicking a pane focuses it. Regression guard: the sidebar used to swallow
+    /// clicks entirely, leaving focus wherever it happened to be.
+    #[tokio::test]
+    async fn left_click_in_sidebar_focuses_it() {
+        let (mut sink, _server) = test_sink();
+        let mut app = App::new(100, 40);
+        app.focus = Focus::Panes;
+        let sel = app.sidebar_sel;
+
+        let press = MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column: 5,
+            row: 5,
+            modifiers: KeyModifiers::NONE,
+        };
+        app.on_mouse(press, &mut sink).await.unwrap();
+
+        assert_eq!(
+            app.focus,
+            Focus::Sidebar,
+            "a left-click in the sidebar column must focus the sidebar"
+        );
+        assert_eq!(
+            app.sidebar_sel, sel,
+            "focusing by click must not change the sidebar's selection"
+        );
+    }
+
+    /// The status bar spans the full width, including under the sidebar column. A click there is
+    /// not a sidebar click, so it must not steal focus into the sidebar.
+    #[tokio::test]
+    async fn left_click_on_status_bar_below_sidebar_does_not_focus_it() {
+        let (mut sink, _server) = test_sink();
+        let mut app = App::new(100, 40);
+        app.focus = Focus::Panes;
+
+        // Row 39 is the status bar (height 40, body is rows 0..=38).
+        let press = MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column: 5,
+            row: 39,
+            modifiers: KeyModifiers::NONE,
+        };
+        app.on_mouse(press, &mut sink).await.unwrap();
+
+        assert_eq!(
+            app.focus,
+            Focus::Panes,
+            "a click on the status-bar row must not focus the sidebar"
         );
     }
 
