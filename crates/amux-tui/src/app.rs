@@ -2,7 +2,10 @@
 //! **terminals**; the sidebar lists **agents** (workspaces) grouped by **repo**. Splitting a pane
 //! spawns a `$SHELL` in the same worktree. Focus is spatial — `Ctrl+hjkl` moves between panes and
 //! into/out of the sidebar; `Ctrl+B` is a prefix (`%`/`"` split, `x` close, `r` resize). `n`
-//! creates an agent in the selected repo, `N` in a repo given by path. `Ctrl+Q` quits.
+//! creates an agent in the selected repo, `N` in a repo given by path. `Ctrl+Q` quits. Holding
+//! `Cmd` (or the `Ctrl-G` leader, where the terminal can't forward `Cmd`) reveals a numeric
+//! overlay on the sidebar; `Cmd`+digit / leader-then-digit selects that agent (`1`..`9`, `0` =
+//! tenth).
 
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
@@ -11,8 +14,8 @@ use std::time::Duration;
 use anyhow::Result;
 use chrono::{DateTime, Utc};
 use crossterm::event::{
-    Event, EventStream, KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseButton, MouseEvent,
-    MouseEventKind,
+    Event, EventStream, KeyCode, KeyEvent, KeyEventKind, KeyModifiers, ModifierKeyCode,
+    MouseButton, MouseEvent, MouseEventKind,
 };
 use futures::stream::SplitSink;
 use futures::{SinkExt, StreamExt};
@@ -124,6 +127,7 @@ enum Flow {
 pub async fn run() -> Result<()> {
     use crossterm::event::{
         DisableBracketedPaste, DisableMouseCapture, EnableBracketedPaste, EnableMouseCapture,
+        KeyboardEnhancementFlags, PopKeyboardEnhancementFlags, PushKeyboardEnhancementFlags,
     };
     let (framed, repo) = crate::client::connect().await?;
     let mut terminal = ratatui::init();
@@ -132,6 +136,22 @@ pub async fn run() -> Result<()> {
     // Bracketed paste lets the outer terminal hand us a paste as one `Event::Paste` instead of a
     // storm of per-character key events — one write to the child, one redraw. See `on_paste`.
     let _ = crossterm::execute!(std::io::stdout(), EnableMouseCapture, EnableBracketedPaste);
+    // The Kitty keyboard protocol reports a lone Cmd/Super press *and* its release — needed for the
+    // numeric-shortcut overlay to appear the instant Cmd is held and vanish when it's let go, and
+    // for `Cmd+digit` to arrive with the SUPER modifier distinguishable from a bare digit. Only
+    // pushed where the terminal supports it (queried over SSH too); elsewhere the feature falls
+    // back to the `Ctrl-G` leader and this is a no-op. Popped on teardown. See the numeric-shortcut
+    // spec. REPORT_ALL_KEYS is what makes modifier-only keys report as their own events.
+    let kbd_enhanced = crossterm::terminal::supports_keyboard_enhancement().unwrap_or(false);
+    if kbd_enhanced {
+        let _ = crossterm::execute!(
+            std::io::stdout(),
+            PushKeyboardEnhancementFlags(
+                KeyboardEnhancementFlags::REPORT_EVENT_TYPES
+                    | KeyboardEnhancementFlags::REPORT_ALL_KEYS_AS_ESCAPE_CODES
+            )
+        );
+    }
 
     let (cols, rows) = crossterm::terminal::size().unwrap_or((80, 24));
     let mut app = App::new(cols, rows);
@@ -148,6 +168,9 @@ pub async fn run() -> Result<()> {
     )
     .await;
 
+    if kbd_enhanced {
+        let _ = crossterm::execute!(std::io::stdout(), PopKeyboardEnhancementFlags);
+    }
     let _ = crossterm::execute!(
         std::io::stdout(),
         DisableMouseCapture,
@@ -301,6 +324,13 @@ struct App {
     focus_agent: Option<AgentId>,
     input: InputMode,
     prefix: bool,
+    /// Cmd/Super is currently held (tracked from Kitty key press/release events). Shows the
+    /// numeric-shortcut overlay while down.
+    super_held: bool,
+    /// The `Ctrl-G` numeric leader is armed: the overlay is up and the next digit selects an
+    /// agent. Cleared by that digit, `Esc`, or any other key. The universal fallback for
+    /// terminals that don't forward Cmd.
+    numeric_leader: bool,
     resize_mode: bool,
     /// Scroll (copy) mode: the terminal being scrolled and how many rows back into its
     /// scrollback the view is. `None` = live at the bottom.
@@ -345,6 +375,8 @@ impl App {
             focus_agent: None,
             input: InputMode::Normal,
             prefix: false,
+            super_held: false,
+            numeric_leader: false,
             resize_mode: false,
             scroll_mode: None,
             scroll_offset: 0,
@@ -440,6 +472,18 @@ impl App {
     /// Apply one terminal event. `None` means the event stream ended or errored → stop the loop.
     async fn handle_event(&mut self, ev: Option<Event>, sink: &mut Sink) -> Result<Flow> {
         match ev {
+            // A lone Cmd/Super key (reported only under the Kitty protocol) toggles the
+            // numeric-overlay hold on both its press and release edges — it is never PTY input,
+            // so it never reaches `on_key`. Repeat counts as still-held.
+            Some(Event::Key(key))
+                if matches!(
+                    key.code,
+                    KeyCode::Modifier(ModifierKeyCode::LeftSuper | ModifierKeyCode::RightSuper)
+                ) =>
+            {
+                self.super_held = key.kind != KeyEventKind::Release;
+                Ok(Flow::Continue)
+            }
             Some(Event::Key(key)) if key.kind == KeyEventKind::Press => {
                 self.on_key(key, sink).await
             }
@@ -637,6 +681,31 @@ impl App {
         if self.prefix {
             self.prefix = false;
             return self.key_prefix(key, sink).await;
+        }
+        // Numeric sidebar shortcut. The `Ctrl-G` leader is a one-key mode: it consumes the next
+        // key, selecting the labelled agent on a digit and simply dismissing on anything else.
+        // Checked before the `Ctrl+B` prefix so a stray key cancels rather than starting a split.
+        if self.numeric_leader {
+            self.numeric_leader = false;
+            if let KeyCode::Char(c) = key.code {
+                self.select_numbered_agent(c);
+            }
+            return Ok(Flow::Continue);
+        }
+        if is_ctrl(key, 'g') {
+            self.numeric_leader = true;
+            return Ok(Flow::Continue);
+        }
+        // `Cmd+digit` (Super held, reported under the Kitty protocol) selects directly. We own
+        // every Cmd+digit — even one past the last agent — so it never leaks a digit to the PTY;
+        // other Cmd combos fall through untouched.
+        if key.modifiers.contains(KeyModifiers::SUPER) {
+            if let KeyCode::Char(c) = key.code {
+                if c.is_ascii_digit() {
+                    self.select_numbered_agent(c);
+                    return Ok(Flow::Continue);
+                }
+            }
         }
         if is_ctrl(key, 'b') {
             self.prefix = true;
@@ -1572,6 +1641,40 @@ impl App {
         }
     }
 
+    /// Agent ids in sidebar order (agent rows only, repo headers dropped) — the numbering the
+    /// numeric overlay draws and the numeric shortcut selects from.
+    fn ordered_agent_ids(&self) -> Vec<AgentId> {
+        self.sidebar_rows()
+            .into_iter()
+            .filter_map(|row| match row {
+                Row::Agent(id) => Some(id),
+                Row::Repo(_) => None,
+            })
+            .collect()
+    }
+
+    /// Whether the numeric overlay should be drawn: Cmd/Super is held, or the `Ctrl-G` leader is
+    /// armed.
+    fn numeric_overlay_active(&self) -> bool {
+        self.super_held || self.numeric_leader
+    }
+
+    /// Select the agent the numeric overlay labels with digit `c`, moving focus to the sidebar so
+    /// the user can act on it (`Enter`/`l`). The target is read from the *current* sidebar order,
+    /// so a layout change while the overlay was up is honored. No-op (returns `false`) if `c`
+    /// isn't a digit or maps past the last agent.
+    fn select_numbered_agent(&mut self, c: char) -> bool {
+        let Some(idx) = digit_index(c) else {
+            return false;
+        };
+        let Some(&id) = self.ordered_agent_ids().get(idx) else {
+            return false;
+        };
+        self.sidebar_sel = Some(Row::Agent(id));
+        self.focus = Focus::Sidebar;
+        true
+    }
+
     /// The agent the user is currently viewing: the one owning the focused terminal (when focus
     /// is in the panes), else `None`. This is what "seen" is anchored to.
     fn current_focus_agent(&self) -> Option<AgentId> {
@@ -1706,6 +1809,26 @@ fn expand_path(input: &str) -> PathBuf {
 
 fn is_ctrl(key: KeyEvent, c: char) -> bool {
     key.code == KeyCode::Char(c) && key.modifiers.contains(KeyModifiers::CONTROL)
+}
+
+/// The digit that labels the agent row at 0-based `index` in the numeric overlay: rows 0..=8 →
+/// `'1'..='9'`, row 9 (the tenth) → `'0'`. Rows past the tenth get no label (`None`).
+fn overlay_digit(index: usize) -> Option<char> {
+    match index {
+        0..=8 => char::from_digit(index as u32 + 1, 10),
+        9 => Some('0'),
+        _ => None,
+    }
+}
+
+/// The 0-based agent-row index a pressed digit selects — the inverse of [`overlay_digit`].
+/// `'1'..='9'` → `0..=8`, `'0'` → `9`. Non-digits yield `None`.
+fn digit_index(c: char) -> Option<usize> {
+    match c {
+        '1'..='9' => Some(c as usize - '1' as usize),
+        '0' => Some(9),
+        _ => None,
+    }
 }
 
 fn ctrl_dir(key: KeyEvent) -> Option<Dir> {
@@ -1966,6 +2089,18 @@ fn render_sidebar(frame: &mut Frame, area: Rect, app: &App) {
         .into_iter()
         .chain(app.minis.iter().copied())
         .collect();
+    // Numeric-shortcut overlay: while Cmd is held (or the `Ctrl-G` leader is armed), the first ten
+    // agent rows show their shortcut digit in place of the status glyph — same 3-cell width, so the
+    // sidebar shape doesn't shift. Built from the current sidebar order, so it tracks live layout.
+    let overlay_digits: HashMap<AgentId, char> = if app.numeric_overlay_active() {
+        app.ordered_agent_ids()
+            .into_iter()
+            .enumerate()
+            .filter_map(|(i, id)| overlay_digit(i).map(|d| (id, d)))
+            .collect()
+    } else {
+        HashMap::new()
+    };
     let mut lines = Vec::new();
     if app.repos.is_empty() {
         lines.push(Line::from(Span::styled(
@@ -2029,10 +2164,21 @@ fn render_sidebar(frame: &mut Frame, area: Rect, app: &App) {
                     Style::default()
                 };
                 let unread_bar = if agent.unread { "\u{258c}" } else { " " };
-                let glyph_span = Span::styled(
-                    format!(" {} ", agent.state.glyph()),
-                    Style::default().fg(color_for(&agent.state)),
-                );
+                // The digit overlay covers the status glyph (same width) when active; otherwise the
+                // usual state glyph in its state colour.
+                let glyph_span = match overlay_digits.get(&id) {
+                    Some(&digit) => Span::styled(
+                        format!(" {digit} "),
+                        Style::default()
+                            .fg(Color::Black)
+                            .bg(Color::Cyan)
+                            .add_modifier(Modifier::BOLD),
+                    ),
+                    None => Span::styled(
+                        format!(" {} ", agent.state.glyph()),
+                        Style::default().fg(color_for(&agent.state)),
+                    ),
+                };
                 let cursor_span =
                     Span::styled(marker.to_string(), Style::default().fg(Color::Cyan));
                 let unread_span = Span::styled(
@@ -3121,5 +3267,148 @@ mod tests {
         let ended = drain_ready(&mut s, &mut out).await;
         assert!(out.is_empty());
         assert!(!ended);
+    }
+
+    /// An app with `n` idle agents in one repo, staggered so the sidebar order is deterministic
+    /// (MRU — newest `last_opened` first). Returns the app plus the agent ids in sidebar order.
+    fn app_with_agents(n: usize) -> (App, Vec<AgentId>) {
+        let mut app = App::new(100, 40);
+        let repo = RepoId::from_canonical_path(std::path::Path::new("/r"));
+        app.repos = vec![RepoInfo {
+            id: repo,
+            name: "r".into(),
+            path: "/r".into(),
+        }];
+        app.agents = (0..n)
+            .map(|i| {
+                let mut a = agent_with(AgentState::Idle, false);
+                a.last_opened = Utc::now() - chrono::Duration::seconds(i as i64);
+                a
+            })
+            .collect();
+        let ids = app.ordered_agent_ids();
+        (app, ids)
+    }
+
+    /// The overlay digit and its inverse round-trip: rows 0..=8 → `'1'..='9'`, the tenth (index
+    /// 9) → `'0'`, and nothing past the tenth.
+    #[test]
+    fn overlay_digit_and_digit_index_round_trip() {
+        assert_eq!(overlay_digit(0), Some('1'));
+        assert_eq!(overlay_digit(8), Some('9'));
+        assert_eq!(overlay_digit(9), Some('0'));
+        assert_eq!(overlay_digit(10), None);
+        for i in 0..10 {
+            let d = overlay_digit(i).unwrap();
+            assert_eq!(digit_index(d), Some(i), "digit {d} maps back to index {i}");
+        }
+        assert_eq!(digit_index('a'), None);
+    }
+
+    /// `Cmd+digit` selects the labelled agent and pulls focus to the sidebar, from any focus.
+    #[tokio::test]
+    async fn cmd_digit_selects_the_labelled_agent() {
+        let (mut app, ids) = app_with_agents(3);
+        let (mut sink, _server) = test_sink();
+        app.focus = Focus::Panes;
+        let cmd2 = KeyEvent::new(KeyCode::Char('2'), KeyModifiers::SUPER);
+        app.on_key(cmd2, &mut sink).await.unwrap();
+        assert_eq!(app.sidebar_sel, Some(Row::Agent(ids[1])));
+        assert!(matches!(app.focus, Focus::Sidebar));
+    }
+
+    /// `Cmd+digit` past the last agent is still consumed (never leaks a digit to the PTY) and
+    /// leaves the selection untouched.
+    #[tokio::test]
+    async fn cmd_digit_past_last_agent_is_a_consumed_noop() {
+        let (mut app, ids) = app_with_agents(2);
+        let (mut sink, _server) = test_sink();
+        app.sidebar_sel = Some(Row::Agent(ids[0]));
+        let cmd9 = KeyEvent::new(KeyCode::Char('9'), KeyModifiers::SUPER);
+        let flow = app.on_key(cmd9, &mut sink).await.unwrap();
+        assert!(matches!(flow, Flow::Continue));
+        assert_eq!(
+            app.sidebar_sel,
+            Some(Row::Agent(ids[0])),
+            "out-of-range digit selected nothing"
+        );
+    }
+
+    /// The `Ctrl-G` leader arms the one-key mode; the next digit selects and disarms it.
+    #[tokio::test]
+    async fn ctrl_g_leader_then_digit_selects() {
+        let (mut app, ids) = app_with_agents(3);
+        let (mut sink, _server) = test_sink();
+        app.on_key(ctrl('g'), &mut sink).await.unwrap();
+        assert!(app.numeric_leader, "Ctrl-G arms the leader");
+        app.on_key(key(KeyCode::Char('3')), &mut sink)
+            .await
+            .unwrap();
+        assert!(!app.numeric_leader, "the digit disarms the leader");
+        assert_eq!(app.sidebar_sel, Some(Row::Agent(ids[2])));
+        assert!(matches!(app.focus, Focus::Sidebar));
+    }
+
+    /// A non-digit after the leader just dismisses it — no selection change.
+    #[tokio::test]
+    async fn ctrl_g_leader_cancels_on_non_digit() {
+        let (mut app, ids) = app_with_agents(3);
+        let (mut sink, _server) = test_sink();
+        app.sidebar_sel = Some(Row::Agent(ids[1]));
+        app.on_key(ctrl('g'), &mut sink).await.unwrap();
+        app.on_key(key(KeyCode::Esc), &mut sink).await.unwrap();
+        assert!(!app.numeric_leader);
+        assert_eq!(app.sidebar_sel, Some(Row::Agent(ids[1])));
+    }
+
+    /// THE regression guard: a bare digit (no Cmd, no leader) is not a shortcut — it must fall
+    /// through untouched so the focused agent's PTY still receives it.
+    #[tokio::test]
+    async fn bare_digit_is_not_a_shortcut() {
+        let (mut app, ids) = app_with_agents(3);
+        let (mut sink, _server) = test_sink();
+        app.sidebar_sel = Some(Row::Agent(ids[2]));
+        app.on_key(key(KeyCode::Char('1')), &mut sink)
+            .await
+            .unwrap();
+        assert_eq!(
+            app.sidebar_sel,
+            Some(Row::Agent(ids[2])),
+            "a bare digit left the selection alone"
+        );
+    }
+
+    /// While the overlay is active, the shortcut digit is drawn over the status glyph — same
+    /// width, so the sidebar shape is unchanged.
+    #[test]
+    fn overlay_covers_status_glyph_with_digit() {
+        use ratatui::{backend::TestBackend, Terminal};
+        let (mut app, _ids) = app_with_agents(1);
+        let glyph = AgentState::Idle.glyph();
+
+        let content = |app: &App| -> String {
+            let mut term = Terminal::new(TestBackend::new(30, 8)).unwrap();
+            term.draw(|f| render_sidebar(f, f.area(), app)).unwrap();
+            term.backend()
+                .buffer()
+                .content()
+                .iter()
+                .map(|c| c.symbol())
+                .collect()
+        };
+
+        let off = content(&app);
+        assert!(off.contains(glyph), "glyph shows when the overlay is off");
+
+        app.super_held = true;
+        let on = content(&app);
+        assert!(
+            !on.contains(glyph),
+            "the digit covers the status glyph while the overlay is active"
+        );
+        assert!(
+            on.matches('1').count() > off.matches('1').count(),
+            "the shortcut digit renders in the overlay"
+        );
     }
 }
