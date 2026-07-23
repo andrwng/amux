@@ -2,11 +2,12 @@
 //! **terminals**; the sidebar lists **agents** (workspaces) grouped by **repo**. Splitting a pane
 //! spawns a `$SHELL` in the same worktree. Focus is spatial — `Ctrl+hjkl` moves between panes and
 //! into/out of the sidebar; `Ctrl+B` is a prefix (`%`/`"` split, `x` close, `r` resize, digit
-//! jumps to that sidebar agent). `n` creates an agent in the selected repo, `N` in a repo given by
-//! path. `Ctrl+Q` quits. Arming the `Ctrl+B` prefix reveals a numeric overlay on the sidebar; the
-//! next digit selects that agent (`1`..`9`, `0` = tenth), mirroring tmux's `prefix` + N. `Cmd`+digit
-//! does the same on terminals that natively report the SUPER modifier (we don't force the Kitty
-//! protocol — it would break Shift and slow typing).
+//! jumps to that sidebar agent, `-` jumps to the previous agent). `n` creates an agent in the
+//! selected repo, `N` in a repo given by path. `Ctrl+Q` quits. Arming the `Ctrl+B` prefix reveals a
+//! numeric overlay on the sidebar; the next digit selects that agent (`1`..`9`, `0` = tenth),
+//! mirroring tmux's `prefix` + N, and the previous agent's row is marked `-` (tmux's last-window).
+//! `Cmd`+digit does the same on terminals that natively report the SUPER modifier (we don't force
+//! the Kitty protocol — it would break Shift and slow typing).
 
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
@@ -295,6 +296,10 @@ struct App {
     saved_layouts: HashMap<AgentId, amux_proto::Layout>,
     /// The agent whose workspace is currently on screen (`None` = nothing opened yet).
     active_agent: Option<AgentId>,
+    /// The agent that was in the main area before [`active_agent`] — the target of the
+    /// `Ctrl+B -` "jump to previous" shortcut (tmux's last-window). `None` until a second agent
+    /// has been opened. Toggles back and forth as you swap, and is cleared if that agent is removed.
+    prev_active_agent: Option<AgentId>,
     terminals: HashMap<TerminalId, AgentId>,
     parsers: HashMap<TerminalId, vt100::Parser>,
     attached: HashMap<TerminalId, Size>,
@@ -350,6 +355,7 @@ impl App {
             trees: HashMap::new(),
             saved_layouts: HashMap::new(),
             active_agent: None,
+            prev_active_agent: None,
             terminals: HashMap::new(),
             parsers: HashMap::new(),
             attached: HashMap::new(),
@@ -551,6 +557,10 @@ impl App {
                 self.minimized.remove(&id);
                 if self.active_agent == Some(id) {
                     self.active_agent = None;
+                }
+                // Don't let the "jump to previous" target point at a ghost.
+                if self.prev_active_agent == Some(id) {
+                    self.prev_active_agent = None;
                 }
                 // A removed mini may have shifted indices out from under the focus.
                 if let Focus::Mini(i) = self.focus {
@@ -934,6 +944,9 @@ impl App {
         if self.active_agent != Some(id) {
             if let Some(prev) = self.active_agent {
                 self.trees.insert(prev, std::mem::take(&mut self.tree));
+                // The agent we're leaving becomes the "jump to previous" target. Recorded only on
+                // a real change, so re-opening the current agent leaves the target untouched.
+                self.prev_active_agent = Some(prev);
             }
             // This session's live tree, else a layout the daemon persisted from a past session.
             self.tree = self
@@ -1007,6 +1020,11 @@ impl App {
                         self.reconcile(sink).await?;
                     }
                 }
+            }
+            // `Ctrl+B -` anywhere else: jump to the previous agent (tmux's last-window). The
+            // overlay marks its row with `-` while the prefix is armed. No-op if there isn't one.
+            KeyCode::Char('-') => {
+                self.jump_previous_agent();
             }
             // `Ctrl+B Enter`: promote the focused mini into the main area.
             KeyCode::Enter if matches!(self.focus, Focus::Mini(_)) => {
@@ -1666,6 +1684,21 @@ impl App {
         true
     }
 
+    /// Select the agent that was in the main area before the current one (tmux's last-window),
+    /// mirroring [`select_numbered_agent`]'s select-only behaviour. No-op (returns `false`) when
+    /// there is no previous agent yet or it has since been removed.
+    fn jump_previous_agent(&mut self) -> bool {
+        let Some(prev) = self.prev_active_agent else {
+            return false;
+        };
+        if !self.agents.iter().any(|a| a.id == prev) {
+            return false;
+        }
+        self.sidebar_sel = Some(Row::Agent(prev));
+        self.focus = Focus::Sidebar;
+        true
+    }
+
     /// The agent the user is currently viewing: the one owning the focused terminal (when focus
     /// is in the panes), else `None`. This is what "seen" is anchored to.
     fn current_focus_agent(&self) -> Option<AgentId> {
@@ -2083,7 +2116,7 @@ fn render_sidebar(frame: &mut Frame, area: Rect, app: &App) {
     // Numeric-shortcut overlay: while Cmd is held (or the `Ctrl+B` prefix is armed), the first ten
     // agent rows show their shortcut digit in place of the status glyph — same 3-cell width, so the
     // sidebar shape doesn't shift. Built from the current sidebar order, so it tracks live layout.
-    let overlay_digits: HashMap<AgentId, char> = if app.numeric_overlay_active() {
+    let mut overlay_digits: HashMap<AgentId, char> = if app.numeric_overlay_active() {
         app.ordered_agent_ids()
             .into_iter()
             .enumerate()
@@ -2092,6 +2125,15 @@ fn render_sidebar(frame: &mut Frame, area: Rect, app: &App) {
     } else {
         HashMap::new()
     };
+    // The "jump to previous" target (Ctrl+B -) is marked with `-` in place of its digit, so the
+    // overlay reads as "type a number, or - to bounce back." Marked even past the tenth agent.
+    if app.numeric_overlay_active() {
+        if let Some(prev) = app.prev_active_agent {
+            if app.agents.iter().any(|a| a.id == prev) {
+                overlay_digits.insert(prev, '-');
+            }
+        }
+    }
     let mut lines = Vec::new();
     if app.repos.is_empty() {
         lines.push(Line::from(Span::styled(
@@ -2354,7 +2396,7 @@ fn render_status(frame: &mut Frame, area: Rect, app: &App) {
         )
     } else if app.prefix {
         (
-            " Ctrl+B — % / \" split \u{b7} x close \u{b7} HJKL/r resize \u{b7} [ scroll \u{b7} tab unread \u{b7} # jump"
+            " Ctrl+B — % / \" split \u{b7} x close \u{b7} HJKL/r resize \u{b7} [ scroll \u{b7} tab unread \u{b7} # jump \u{b7} - prev"
                 .to_string(),
             Style::default().fg(Color::Black).bg(Color::Cyan),
         )
@@ -3424,6 +3466,113 @@ mod tests {
             app.sidebar_sel,
             Some(Row::Agent(ids[2])),
             "a bare digit left the selection alone"
+        );
+    }
+
+    /// The "jump to previous" target follows the main area: it is the agent left behind on each
+    /// real swap, untouched when the active agent is re-opened, and toggles for ping-pong.
+    #[test]
+    fn prev_agent_tracks_last_active_and_pingpongs() {
+        let (mut app, ids) = app_with_agents(3);
+        assert_eq!(
+            app.prev_active_agent, None,
+            "no previous until a second agent"
+        );
+        app.swap_to_agent(ids[0]);
+        assert_eq!(
+            app.prev_active_agent, None,
+            "the first activation leaves no previous"
+        );
+        app.swap_to_agent(ids[1]);
+        assert_eq!(
+            app.prev_active_agent,
+            Some(ids[0]),
+            "leaving agent 0 makes it the previous"
+        );
+        app.swap_to_agent(ids[2]);
+        assert_eq!(app.prev_active_agent, Some(ids[1]));
+        app.swap_to_agent(ids[2]);
+        assert_eq!(
+            app.prev_active_agent,
+            Some(ids[1]),
+            "re-opening the active agent leaves the target alone"
+        );
+        app.swap_to_agent(ids[1]);
+        assert_eq!(app.prev_active_agent, Some(ids[2]), "ping-pong back");
+    }
+
+    /// `Ctrl+B -` selects the previous agent and pulls focus to the sidebar (select-only, like the
+    /// numeric shortcut).
+    #[tokio::test]
+    async fn ctrl_b_dash_jumps_to_previous_agent() {
+        let (mut app, ids) = app_with_agents(3);
+        let (mut sink, _server) = test_sink();
+        app.swap_to_agent(ids[0]);
+        app.swap_to_agent(ids[1]); // prev = ids[0]
+        app.sidebar_sel = Some(Row::Agent(ids[2]));
+        app.on_key(ctrl('b'), &mut sink).await.unwrap();
+        app.on_key(key(KeyCode::Char('-')), &mut sink)
+            .await
+            .unwrap();
+        assert_eq!(app.sidebar_sel, Some(Row::Agent(ids[0])));
+        assert!(matches!(app.focus, Focus::Sidebar));
+    }
+
+    /// With no previous agent, `Ctrl+B -` is a no-op — the selection is left alone.
+    #[tokio::test]
+    async fn ctrl_b_dash_is_noop_without_previous() {
+        let (mut app, ids) = app_with_agents(2);
+        let (mut sink, _server) = test_sink();
+        app.swap_to_agent(ids[0]); // only ever one active → no previous
+        app.sidebar_sel = Some(Row::Agent(ids[1]));
+        app.on_key(ctrl('b'), &mut sink).await.unwrap();
+        app.on_key(key(KeyCode::Char('-')), &mut sink)
+            .await
+            .unwrap();
+        assert_eq!(app.sidebar_sel, Some(Row::Agent(ids[1])));
+    }
+
+    /// Removing the previous agent clears the jump target, so `Ctrl+B -` never points at a ghost.
+    #[tokio::test]
+    async fn agent_removal_clears_previous_target() {
+        let (mut app, ids) = app_with_agents(2);
+        let (mut sink, _server) = test_sink();
+        app.swap_to_agent(ids[0]);
+        app.swap_to_agent(ids[1]); // prev = ids[0]
+        app.on_daemon(DaemonMsg::AgentRemoved { id: ids[0] }, &mut sink)
+            .await
+            .unwrap();
+        assert_eq!(app.prev_active_agent, None);
+        assert!(!app.jump_previous_agent(), "no target left to jump to");
+    }
+
+    /// While the overlay is active, the previous agent's row is marked `-` in place of its digit.
+    #[test]
+    fn overlay_marks_previous_agent_with_dash() {
+        use ratatui::{backend::TestBackend, Terminal};
+        let (mut app, ids) = app_with_agents(3);
+
+        let content = |app: &App| -> String {
+            let mut term = Terminal::new(TestBackend::new(30, 8)).unwrap();
+            term.draw(|f| render_sidebar(f, f.area(), app)).unwrap();
+            term.backend()
+                .buffer()
+                .content()
+                .iter()
+                .map(|c| c.symbol())
+                .collect()
+        };
+
+        app.swap_to_agent(ids[0]);
+        app.swap_to_agent(ids[1]); // prev = ids[0]
+        assert!(
+            !content(&app).contains(" - "),
+            "no marker while the overlay is off"
+        );
+        app.super_held = true;
+        assert!(
+            content(&app).contains(" - "),
+            "the previous agent's row is marked with - while the overlay is active"
         );
     }
 

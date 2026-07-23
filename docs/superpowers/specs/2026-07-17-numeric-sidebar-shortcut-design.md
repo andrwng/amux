@@ -6,6 +6,12 @@
 > dedicated one burned a second key). The overlay is now shown while the `Ctrl+B` prefix is armed.
 > The `numeric_leader` field is gone; `super_held` remains. Sections below describing the `Ctrl-G`
 > leader are superseded by this note.
+>
+> **Update (2026-07-23):** `Ctrl+B -` jumps to the *previous* agent (tmux's last-window) — the
+> agent that was in the main area before the current one, tracked on each `swap_to_agent` and
+> cleared if that agent is removed. It is select-only like the digits. While the overlay is up, the
+> previous agent's row is marked `-` in place of its digit. `Ctrl+B -` keeps its prior
+> mini-minimize meaning when a mini is focused; the jump applies everywhere else.
 
 ## Goal
 
