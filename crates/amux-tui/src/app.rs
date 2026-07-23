@@ -1,11 +1,12 @@
 //! The TUI: a repo-grouped agent sidebar beside a tmux-style tiled pane area. Panes stream
 //! **terminals**; the sidebar lists **agents** (workspaces) grouped by **repo**. Splitting a pane
 //! spawns a `$SHELL` in the same worktree. Focus is spatial — `Ctrl+hjkl` moves between panes and
-//! into/out of the sidebar; `Ctrl+B` is a prefix (`%`/`"` split, `x` close, `r` resize). `n`
-//! creates an agent in the selected repo, `N` in a repo given by path. `Ctrl+Q` quits. The
-//! `Ctrl-G` leader reveals a numeric overlay on the sidebar; the next digit selects that agent
-//! (`1`..`9`, `0` = tenth). `Cmd`+digit does the same on terminals that natively report the SUPER
-//! modifier (we don't force the Kitty protocol — it would break Shift and slow typing).
+//! into/out of the sidebar; `Ctrl+B` is a prefix (`%`/`"` split, `x` close, `r` resize, digit
+//! jumps to that sidebar agent). `n` creates an agent in the selected repo, `N` in a repo given by
+//! path. `Ctrl+Q` quits. Arming the `Ctrl+B` prefix reveals a numeric overlay on the sidebar; the
+//! next digit selects that agent (`1`..`9`, `0` = tenth), mirroring tmux's `prefix` + N. `Cmd`+digit
+//! does the same on terminals that natively report the SUPER modifier (we don't force the Kitty
+//! protocol — it would break Shift and slow typing).
 
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
@@ -141,7 +142,7 @@ pub async fn run() -> Result<()> {
     // arrive as base-codepoint + SHIFT (crossterm only substitutes the real glyph with the extra
     // REPORT_ALTERNATE_KEYS flag), so our PTY bridge would send lowercase; and REPORT_EVENT_TYPES
     // doubles every keystroke into press+release. The blast radius on typing is not worth a
-    // Cmd-hold that most macOS terminals won't forward anyway. The `Ctrl-G` numeric leader needs
+    // Cmd-hold that most macOS terminals won't forward anyway. The `Ctrl+B <digit>` jump needs
     // none of this; `Cmd+digit` still works on any terminal that natively reports the SUPER
     // modifier without us forcing the mode.
     let _ = crossterm::execute!(std::io::stdout(), EnableMouseCapture, EnableBracketedPaste);
@@ -317,10 +318,6 @@ struct App {
     /// Cmd/Super is currently held (tracked from Kitty key press/release events). Shows the
     /// numeric-shortcut overlay while down.
     super_held: bool,
-    /// The `Ctrl-G` numeric leader is armed: the overlay is up and the next digit selects an
-    /// agent. Cleared by that digit, `Esc`, or any other key. The universal fallback for
-    /// terminals that don't forward Cmd.
-    numeric_leader: bool,
     resize_mode: bool,
     /// Scroll (copy) mode: the terminal being scrolled and how many rows back into its
     /// scrollback the view is. `None` = live at the bottom.
@@ -366,7 +363,6 @@ impl App {
             input: InputMode::Normal,
             prefix: false,
             super_held: false,
-            numeric_leader: false,
             resize_mode: false,
             scroll_mode: None,
             scroll_offset: 0,
@@ -671,20 +667,6 @@ impl App {
         if self.prefix {
             self.prefix = false;
             return self.key_prefix(key, sink).await;
-        }
-        // Numeric sidebar shortcut. The `Ctrl-G` leader is a one-key mode: it consumes the next
-        // key, selecting the labelled agent on a digit and simply dismissing on anything else.
-        // Checked before the `Ctrl+B` prefix so a stray key cancels rather than starting a split.
-        if self.numeric_leader {
-            self.numeric_leader = false;
-            if let KeyCode::Char(c) = key.code {
-                self.select_numbered_agent(c);
-            }
-            return Ok(Flow::Continue);
-        }
-        if is_ctrl(key, 'g') {
-            self.numeric_leader = true;
-            return Ok(Flow::Continue);
         }
         // `Cmd+digit` (Super held, reported under the Kitty protocol) selects directly. We own
         // every Cmd+digit — even one past the last agent — so it never leaks a digit to the PTY;
@@ -1084,6 +1066,12 @@ impl App {
             }
             // Jump to the next unread agent (inbox navigation).
             KeyCode::Tab => self.jump_next_unread(sink).await?,
+            // `Ctrl+B <digit>`: jump to the numbered sidebar agent, mirroring tmux's
+            // `prefix` + N (select window N). The overlay that labels the rows is shown for
+            // the whole time the prefix is armed, so the numbers are visible when you press one.
+            KeyCode::Char(c) if c.is_ascii_digit() => {
+                self.select_numbered_agent(c);
+            }
             KeyCode::Char(c) if key.modifiers.contains(KeyModifiers::CONTROL) => {
                 if let (Some(terminal), Some(byte)) = (self.tree.focused_payload(), ctrl_byte(c)) {
                     sink.send(ClientMsg::Input {
@@ -1656,10 +1644,10 @@ impl App {
             .collect()
     }
 
-    /// Whether the numeric overlay should be drawn: Cmd/Super is held, or the `Ctrl-G` leader is
-    /// armed.
+    /// Whether the numeric overlay should be drawn: Cmd/Super is held, or the `Ctrl+B` prefix is
+    /// armed (so the labels are visible while you decide which agent to jump to with a digit).
     fn numeric_overlay_active(&self) -> bool {
-        self.super_held || self.numeric_leader
+        self.super_held || self.prefix
     }
 
     /// Select the agent the numeric overlay labels with digit `c`, moving focus to the sidebar so
@@ -2092,7 +2080,7 @@ fn render_sidebar(frame: &mut Frame, area: Rect, app: &App) {
         .into_iter()
         .chain(app.minis.iter().copied())
         .collect();
-    // Numeric-shortcut overlay: while Cmd is held (or the `Ctrl-G` leader is armed), the first ten
+    // Numeric-shortcut overlay: while Cmd is held (or the `Ctrl+B` prefix is armed), the first ten
     // agent rows show their shortcut digit in place of the status glyph — same 3-cell width, so the
     // sidebar shape doesn't shift. Built from the current sidebar order, so it tracks live layout.
     let overlay_digits: HashMap<AgentId, char> = if app.numeric_overlay_active() {
@@ -2366,7 +2354,7 @@ fn render_status(frame: &mut Frame, area: Rect, app: &App) {
         )
     } else if app.prefix {
         (
-            " Ctrl+B — % / \" split \u{b7} x close \u{b7} HJKL/r resize \u{b7} [ scroll \u{b7} tab unread"
+            " Ctrl+B — % / \" split \u{b7} x close \u{b7} HJKL/r resize \u{b7} [ scroll \u{b7} tab unread \u{b7} # jump"
                 .to_string(),
             Style::default().fg(Color::Black).bg(Color::Cyan),
         )
@@ -3390,30 +3378,35 @@ mod tests {
         );
     }
 
-    /// The `Ctrl-G` leader arms the one-key mode; the next digit selects and disarms it.
+    /// `Ctrl+B` arms the prefix (lighting the overlay); the next digit jumps to that agent and
+    /// disarms it, mirroring tmux's `prefix` + N.
     #[tokio::test]
-    async fn ctrl_g_leader_then_digit_selects() {
+    async fn ctrl_b_prefix_then_digit_selects() {
         let (mut app, ids) = app_with_agents(3);
         let (mut sink, _server) = test_sink();
-        app.on_key(ctrl('g'), &mut sink).await.unwrap();
-        assert!(app.numeric_leader, "Ctrl-G arms the leader");
+        app.on_key(ctrl('b'), &mut sink).await.unwrap();
+        assert!(app.prefix, "Ctrl+B arms the prefix");
+        assert!(
+            app.numeric_overlay_active(),
+            "the overlay is up while the prefix is armed"
+        );
         app.on_key(key(KeyCode::Char('3')), &mut sink)
             .await
             .unwrap();
-        assert!(!app.numeric_leader, "the digit disarms the leader");
+        assert!(!app.prefix, "the digit disarms the prefix");
         assert_eq!(app.sidebar_sel, Some(Row::Agent(ids[2])));
         assert!(matches!(app.focus, Focus::Sidebar));
     }
 
-    /// A non-digit after the leader just dismisses it — no selection change.
+    /// A non-digit after the prefix runs its own binding (or nothing) and disarms — no jump.
     #[tokio::test]
-    async fn ctrl_g_leader_cancels_on_non_digit() {
+    async fn ctrl_b_prefix_non_digit_does_not_jump() {
         let (mut app, ids) = app_with_agents(3);
         let (mut sink, _server) = test_sink();
         app.sidebar_sel = Some(Row::Agent(ids[1]));
-        app.on_key(ctrl('g'), &mut sink).await.unwrap();
+        app.on_key(ctrl('b'), &mut sink).await.unwrap();
         app.on_key(key(KeyCode::Esc), &mut sink).await.unwrap();
-        assert!(!app.numeric_leader);
+        assert!(!app.prefix);
         assert_eq!(app.sidebar_sel, Some(Row::Agent(ids[1])));
     }
 

@@ -1,5 +1,12 @@
 # Numeric sidebar shortcut — design
 
+> **Update (2026-07-23):** the leader was folded into the existing `Ctrl+B` prefix rather than a
+> dedicated `Ctrl-G` — `Ctrl+B <digit>` jumps to that agent, mirroring tmux's `prefix` + N. This
+> reclaims `Ctrl-G` for programs running inside a pane (amux swallows its leaders globally, so a
+> dedicated one burned a second key). The overlay is now shown while the `Ctrl+B` prefix is armed.
+> The `numeric_leader` field is gone; `super_held` remains. Sections below describing the `Ctrl-G`
+> leader are superseded by this note.
+
 ## Goal
 
 A fast keyboard jump that moves the sidebar selection to the *N*-th agent, with a
