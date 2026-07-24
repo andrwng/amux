@@ -114,6 +114,93 @@ async fn create_agent(client: &mut Client, repo: RepoId, branch: &str) -> AgentI
     .expect("timed out waiting for AgentAdded")
 }
 
+async fn create_head_agent(client: &mut Client, repo: RepoId) -> AgentInfo {
+    client
+        .send(ClientMsg::CreateHeadAgent { repo })
+        .await
+        .unwrap();
+    tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            match client.next().await {
+                Some(Ok(DaemonMsg::AgentAdded(info))) => return info,
+                Some(Ok(_)) => {}
+                other => panic!("stream ended before AgentAdded: {other:?}"),
+            }
+        }
+    })
+    .await
+    .expect("timed out waiting for AgentAdded")
+}
+
+async fn wait_for_removed(client: &mut Client, id: AgentId) -> bool {
+    tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            match client.next().await {
+                Some(Ok(DaemonMsg::AgentRemoved { id: rid })) => return rid == id,
+                Some(Ok(_)) => {}
+                _ => return false,
+            }
+        }
+    })
+    .await
+    .unwrap_or(false)
+}
+
+#[tokio::test]
+async fn head_session_runs_in_repo_root_and_makes_no_worktree() {
+    let (mut client, repo, tmp) = setup().await;
+    let info = create_head_agent(&mut client, repo).await;
+    // A branchless session, labeled HEAD.
+    assert_eq!(info.branch, None);
+    assert_eq!(info.name, "HEAD");
+    // No amux worktree was created under the worktree base.
+    let wt_entries = std::fs::read_dir(tmp.path().join("wt"))
+        .map(|d| d.count())
+        .unwrap_or(0);
+    assert_eq!(wt_entries, 0, "a HEAD session must not create a worktree");
+}
+
+#[tokio::test]
+async fn head_session_is_a_singleton_per_repo() {
+    let (mut client, repo, _tmp) = setup().await;
+    let first = create_head_agent(&mut client, repo).await;
+    // A second request must not mint a second HEAD session.
+    client
+        .send(ClientMsg::CreateHeadAgent { repo })
+        .await
+        .unwrap();
+    let duplicate = tokio::time::timeout(Duration::from_millis(500), async {
+        loop {
+            match client.next().await {
+                Some(Ok(DaemonMsg::AgentAdded(info))) if info.id != first.id => return true,
+                Some(Ok(_)) => {}
+                _ => return false,
+            }
+        }
+    })
+    .await
+    .unwrap_or(false);
+    assert!(!duplicate, "a second HEAD session must not be created");
+}
+
+#[tokio::test]
+async fn deleting_a_head_session_prunes_no_worktree() {
+    let (mut client, repo, tmp) = setup().await;
+    let info = create_head_agent(&mut client, repo).await;
+    client
+        .send(ClientMsg::DeleteAgent {
+            id: info.id,
+            force: true,
+        })
+        .await
+        .unwrap();
+    assert!(wait_for_removed(&mut client, info.id).await);
+    // The repo is untouched: no amux branch was ever created, and delete pruned nothing.
+    let git = Repository::open(tmp.path().join("repo")).unwrap();
+    let branches = git.branches(Some(git2::BranchType::Local)).unwrap().count();
+    assert_eq!(branches, 1, "delete must not add or remove branches");
+}
+
 async fn wait_for_output(client: &mut Client, needle: &str) -> bool {
     let mut acc = Vec::new();
     tokio::time::timeout(Duration::from_secs(5), async {
@@ -953,7 +1040,7 @@ async fn durable_state_survives_a_daemon_restart() {
         .iter()
         .find(|a| a.id == info.id)
         .expect("feature agent");
-    assert_eq!(loaded.branch, "feature");
+    assert_eq!(loaded.branch.as_deref(), Some("feature"));
     assert_eq!(
         loaded.primary_terminal, info.primary_terminal,
         "stable primary id"

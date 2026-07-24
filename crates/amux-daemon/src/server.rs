@@ -144,6 +144,7 @@ fn handle_command(
         ClientMsg::CreateAgentAt { path, branch } => {
             report_err(registry.create_at(&path, &branch).map(|_| ()))
         }
+        ClientMsg::CreateHeadAgent { repo } => report_err(registry.create_head(repo).map(|_| ())),
         ClientMsg::DeleteAgent { id, force } => match registry.delete(id, force) {
             Ok(DeleteOutcome::Deleted) => {}
             Ok(DeleteOutcome::NeedsConfirm(message)) => {

@@ -50,7 +50,8 @@ pub struct AgentInfo {
     /// The repository this agent belongs to.
     pub repo: RepoId,
     pub name: String,
-    pub branch: String,
+    /// The agent's branch, or `None` for a branchless HEAD session (rendered as "HEAD").
+    pub branch: Option<String>,
     pub state: AgentState,
     pub last_activity: DateTime<Utc>,
     /// When the user last opened (viewed) this agent — the sidebar's MRU sort key.
@@ -76,6 +77,10 @@ pub enum ClientMsg {
     /// Register the repo at `path` (idempotent) and create an agent on `branch` in it — the
     /// two-field "new agent in a new repo" flow.
     CreateAgentAt { path: PathBuf, branch: String },
+    /// Create the singleton branchless HEAD session in an already-registered repo: an agent
+    /// running in the repo root on `HEAD`, with no amux-managed worktree or branch. If one
+    /// already exists for the repo, the daemon returns it rather than creating a duplicate.
+    CreateHeadAgent { repo: RepoId },
     /// Delete an agent — kills all its terminals and removes its worktree. Only destructive op.
     DeleteAgent { id: AgentId, force: bool },
     /// Resume a suspended agent's primary terminal in its existing worktree.

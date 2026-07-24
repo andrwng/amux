@@ -1,5 +1,6 @@
 //! The agent registry. The daemon manages many **repos**; each **Agent** is a durable workspace
-//! (worktree + branch) belonging to one repo, and owns a **primary terminal** (its CLI) plus any
+//! belonging to one repo — usually a worktree on its own branch, or (for a singleton HEAD session)
+//! the repo root on `HEAD` with no managed worktree — and owns a **primary terminal** (its CLI) plus any
 //! **shell terminals** split off in the same worktree. Terminals are the streaming unit; agents
 //! are what the sidebar lists (grouped by repo). A session exiting suspends the agent (primary)
 //! or removes the terminal (shell); only delete destroys a worktree. See `docs/DESIGN.md` §5,
@@ -97,7 +98,7 @@ impl Agent {
             id: self.id,
             repo: self.repo,
             name: self.workspace.name(),
-            branch: self.workspace.branch().unwrap_or("").to_string(),
+            branch: self.workspace.branch().map(str::to_string),
             state: self.state.clone(),
             last_activity: self.last_activity,
             last_opened: self.last_opened,
@@ -627,6 +628,80 @@ impl Registry {
                 // A freshly launched CLI is sitting at its prompt — idle/waiting, not working.
                 // Real work is signalled by hooks (UserPromptSubmit/… → Working); starting in
                 // Working would show a false "⋯" and, when the heartbeat settled it, a false unread.
+                state: AgentState::Idle,
+                unread: false,
+                primary: terminal_id,
+            };
+            let info = agent.info();
+            state.agents.insert(agent_id, agent);
+            info
+        };
+        self.spawn_primary_monitor(agent_id, terminal_id, session);
+        self.save();
+        let _ = self.events.send(DaemonMsg::AgentAdded(info.clone()));
+        Ok(info)
+    }
+
+    /// Create (or return the existing) singleton branchless **HEAD session** in `repo`: an agent
+    /// running in the repo root on `HEAD`, with no amux-managed worktree and no amux-created
+    /// branch. Deliberately breaks the isolation invariant (it shares the user's live tree); the
+    /// blast radius is contained by the singleton, the explicit `Workspace::Head` type, and (from
+    /// the next commit) hook settings written out of tree. See `docs/DESIGN.md` §2.
+    pub fn create_head(self: &Arc<Self>, repo: RepoId) -> Result<AgentInfo> {
+        let worktrees = self.worktrees_for(repo).context("no such repo")?;
+        // Singleton: one HEAD session per repo. Return the existing one rather than duplicating.
+        {
+            let state = self.state.lock().unwrap();
+            if let Some(existing) = state
+                .agents
+                .values()
+                .find(|a| a.repo == repo && matches!(a.workspace, Workspace::Head))
+            {
+                return Ok(existing.info());
+            }
+        }
+        // Runs in the repo root itself — no worktree is created, so the "branch already checked
+        // out" guard is never reached.
+        let repo_root = worktrees.repo().to_path_buf();
+        let agent_id = AgentId::new();
+        let terminal_id = TerminalId::new();
+        let agent_full = agent_id.to_full_string();
+        let ctx = LaunchContext {
+            worktree: &repo_root,
+            branch: "",
+            resume: None,
+            agent_id: &agent_full,
+            hooks: self.hook_setup(),
+        };
+        self.adapter.prepare_worktree(&ctx)?;
+        let mut spec = self.adapter.spawn_spec(&ctx);
+        spec.env
+            .push(("AMUX_TERMINAL_ID".to_string(), terminal_id.to_full_string()));
+        let session = Session::spawn(&spec.command, &spec.cwd, &spec.env, DEFAULT_SIZE)?;
+
+        let now = Utc::now();
+        let info = {
+            let mut state = self.state.lock().unwrap();
+            state.terminals.insert(
+                terminal_id,
+                Terminal {
+                    agent: agent_id,
+                    worktree: repo_root.clone(),
+                    primary: true,
+                    session: Some(Arc::clone(&session)),
+                    passthrough: false,
+                },
+            );
+            let agent = Agent {
+                id: agent_id,
+                repo,
+                workspace: Workspace::Head,
+                worktree: repo_root,
+                ai_session_id: None,
+                created_at: now,
+                last_activity: now,
+                last_opened: now,
+                // Same reasoning as `create`: launch Idle and let hooks drive Working.
                 state: AgentState::Idle,
                 unread: false,
                 primary: terminal_id,

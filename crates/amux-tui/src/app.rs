@@ -2032,7 +2032,13 @@ fn render_minis(frame: &mut Frame, area: Rect, app: &App) {
         let focused = app.focus == Focus::Mini(i);
         let (glyph, color, branch) = by_id
             .get(agent_id)
-            .map(|a| (a.state.glyph(), color_for(&a.state), a.branch.as_str()))
+            .map(|a| {
+                (
+                    a.state.glyph(),
+                    color_for(&a.state),
+                    a.branch.as_deref().unwrap_or("HEAD"),
+                )
+            })
             .unwrap_or(('?', Color::DarkGray, "?"));
         let title = format!(" {glyph} {branch} ");
         let border = if focused {
@@ -2302,10 +2308,17 @@ fn render_panes(frame: &mut Frame, area: Rect, app: &App) {
         let (mut title, color) = match place.payload {
             Some(terminal) => match app.terminals.get(&terminal).and_then(|id| by_id.get(id)) {
                 Some(agent) if agent.primary_terminal == terminal => (
-                    format!(" {} {} ", agent.state.glyph(), agent.branch),
+                    format!(
+                        " {} {} ",
+                        agent.state.glyph(),
+                        agent.branch.as_deref().unwrap_or("HEAD")
+                    ),
                     color_for(&agent.state),
                 ),
-                Some(agent) => (format!(" sh \u{b7} {} ", agent.branch), Color::Blue),
+                Some(agent) => (
+                    format!(" sh \u{b7} {} ", agent.branch.as_deref().unwrap_or("HEAD")),
+                    Color::Blue,
+                ),
                 None => (" terminal ".to_string(), Color::DarkGray),
             },
             None => (" empty ".to_string(), Color::DarkGray),
@@ -2685,7 +2698,7 @@ mod tests {
             id: AgentId::new(),
             repo: amux_core::agent::RepoId::from_canonical_path(std::path::Path::new("/r")),
             name: "a".into(),
-            branch: "b".into(),
+            branch: Some("b".into()),
             state: AgentState::Working,
             last_activity: Utc::now(),
             last_opened: Utc::now(),
@@ -3145,7 +3158,7 @@ mod tests {
             id: AgentId::new(),
             repo: RepoId::from_canonical_path(std::path::Path::new("/r")),
             name: "a".into(),
-            branch: "b".into(),
+            branch: Some("b".into()),
             state,
             last_activity: Utc::now(),
             last_opened: Utc::now(),

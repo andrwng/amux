@@ -149,7 +149,7 @@ mod tests {
             id: AgentId::new(),
             repo: RepoId::from_canonical_path(&PathBuf::from("/repos/amux")),
             name: "auth".into(),
-            branch: "feat/auth".into(),
+            branch: Some("feat/auth".into()),
             state: AgentState::Working,
             last_activity: Utc::now(),
             last_opened: Utc::now(),
@@ -176,6 +176,9 @@ mod tests {
         roundtrip(ClientMsg::CreateAgentAt {
             path: "/repos/other".into(),
             branch: "feat/y".into(),
+        });
+        roundtrip(ClientMsg::CreateHeadAgent {
+            repo: RepoId::from_canonical_path(&PathBuf::from("/repos/amux")),
         });
         roundtrip(ClientMsg::DeleteAgent { id, force: true });
         roundtrip(ClientMsg::ResumeAgent { id });
@@ -272,6 +275,14 @@ mod tests {
         roundtrip(DaemonMsg::Error {
             message: "boom".into(),
         });
+    }
+
+    #[test]
+    fn agent_info_headless_branch_roundtrips() {
+        // A branchless HEAD session carries `branch: None` over the wire.
+        let mut info = sample_info();
+        info.branch = None;
+        roundtrip(DaemonMsg::AgentAdded(info));
     }
 
     #[test]

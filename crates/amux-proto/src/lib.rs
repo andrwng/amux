@@ -18,5 +18,6 @@ pub use message::{AgentInfo, ClientMsg, DaemonMsg, Layout, RepoInfo, Size};
 /// pane TERM (bumped so a running daemon auto-refreshes to spawn panes with the new TERM, though
 /// the control wire is unchanged); v14 agents launch/resume Idle not Working (bumped to refresh a
 /// daemon still starting agents in the false Working state); v15 MRU sidebar
-/// (AgentInfo.last_opened, OpenedChanged — sidebar orders by last-opened).
-pub const PROTO_VERSION: u32 = 15;
+/// (AgentInfo.last_opened, OpenedChanged — sidebar orders by last-opened); v16 branchless HEAD
+/// sessions (CreateHeadAgent, AgentInfo.branch is now optional — `None` = a HEAD session).
+pub const PROTO_VERSION: u32 = 16;
