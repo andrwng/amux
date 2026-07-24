@@ -46,11 +46,38 @@ pub struct DoctorReport {
     pub skipped: Vec<(String, usize)>,
 }
 
+/// A session's workspace: either an amux-managed worktree on its own branch, or the repo root
+/// on `HEAD` (a branchless "HEAD session" — no managed worktree, no amux-created branch). Making
+/// "has a managed worktree" an explicit variant forces every branch-assuming path (delete/prune,
+/// uniqueness, labels) to handle the branchless case.
+#[derive(Clone)]
+enum Workspace {
+    Worktree { branch: String },
+    Head,
+}
+
+impl Workspace {
+    /// The agent's branch, or `None` for a HEAD session.
+    fn branch(&self) -> Option<&str> {
+        match self {
+            Workspace::Worktree { branch } => Some(branch),
+            Workspace::Head => None,
+        }
+    }
+
+    /// Sidebar/pane label: the branch basename for a worktree, or `"HEAD"` for a HEAD session.
+    fn name(&self) -> String {
+        match self {
+            Workspace::Worktree { branch } => agent_name(branch),
+            Workspace::Head => "HEAD".to_string(),
+        }
+    }
+}
+
 struct Agent {
     id: AgentId,
     repo: RepoId,
-    name: String,
-    branch: String,
+    workspace: Workspace,
     worktree: PathBuf,
     ai_session_id: Option<String>,
     created_at: DateTime<Utc>,
@@ -69,8 +96,8 @@ impl Agent {
         AgentInfo {
             id: self.id,
             repo: self.repo,
-            name: self.name.clone(),
-            branch: self.branch.clone(),
+            name: self.workspace.name(),
+            branch: self.workspace.branch().unwrap_or("").to_string(),
             state: self.state.clone(),
             last_activity: self.last_activity,
             last_opened: self.last_opened,
@@ -141,8 +168,11 @@ struct PersistedRepo {
 struct PersistedAgent {
     id: AgentId,
     repo: RepoId,
-    name: String,
-    branch: String,
+    /// The agent's branch, or `None` for a branchless HEAD session. Flat (rather than a nested
+    /// `Workspace`) so older `state.json` files with a plain `branch` string still load, and a
+    /// now-unused `name` field is simply ignored. `Some` ⇒ `Workspace::Worktree`, `None` ⇒ `Head`.
+    #[serde(default)]
+    branch: Option<String>,
     worktree: PathBuf,
     ai_session_id: Option<String>,
     created_at: DateTime<Utc>,
@@ -363,8 +393,7 @@ impl Registry {
                     .map(|a| PersistedAgent {
                         id: a.id,
                         repo: a.repo,
-                        name: a.name.clone(),
-                        branch: a.branch.clone(),
+                        branch: a.workspace.branch().map(str::to_string),
                         worktree: a.worktree.clone(),
                         ai_session_id: a.ai_session_id.clone(),
                         created_at: a.created_at,
@@ -444,13 +473,16 @@ impl Registry {
                     passthrough: false,
                 },
             );
+            let workspace = match a.branch {
+                Some(branch) => Workspace::Worktree { branch },
+                None => Workspace::Head,
+            };
             state.agents.insert(
                 a.id,
                 Agent {
                     id: a.id,
                     repo: a.repo,
-                    name: a.name,
-                    branch: a.branch,
+                    workspace,
                     worktree: a.worktree,
                     ai_session_id: a.ai_session_id,
                     created_at: a.created_at,
@@ -544,7 +576,7 @@ impl Registry {
             if state
                 .agents
                 .values()
-                .any(|a| a.repo == repo && a.branch == branch)
+                .any(|a| a.repo == repo && a.workspace.branch() == Some(branch))
             {
                 anyhow::bail!("an agent for branch '{branch}' already exists");
             }
@@ -584,8 +616,9 @@ impl Registry {
             let agent = Agent {
                 id: agent_id,
                 repo,
-                name: agent_name(branch),
-                branch: branch.to_string(),
+                workspace: Workspace::Worktree {
+                    branch: branch.to_string(),
+                },
                 worktree,
                 ai_session_id: None,
                 created_at: now,
@@ -781,7 +814,7 @@ impl Registry {
                 .is_some_and(|t| t.session.is_some());
             (
                 agent.worktree.clone(),
-                agent.branch.clone(),
+                agent.workspace.branch().unwrap_or("").to_string(),
                 agent.ai_session_id.clone(),
                 agent.primary,
                 live,
@@ -835,14 +868,15 @@ impl Registry {
     /// (branch and commits are kept). Refuses a dirty worktree unless `force`.
     pub fn delete(&self, id: AgentId, force: bool) -> Result<DeleteOutcome> {
         let (branch, repo) = match self.state.lock().unwrap().agents.get(&id) {
-            Some(agent) => (agent.branch.clone(), agent.repo),
+            Some(agent) => (agent.workspace.branch().map(str::to_string), agent.repo),
             None => return Ok(DeleteOutcome::Deleted),
         };
         let worktrees = self.worktrees_for(repo);
         if !force {
-            let dirty = worktrees
-                .as_ref()
-                .and_then(|w| w.dirty_count(&branch).ok())
+            // Only a worktree session can be dirty; a HEAD session owns no managed worktree.
+            let dirty = branch
+                .as_deref()
+                .and_then(|b| worktrees.as_ref().and_then(|w| w.dirty_count(b).ok()))
                 .unwrap_or(0);
             if dirty > 0 {
                 let plural = if dirty == 1 { "" } else { "s" };
@@ -874,8 +908,10 @@ impl Registry {
         for session in sessions {
             session.kill();
         }
-        if let Some(worktrees) = worktrees {
-            worktrees.remove(&branch).ok();
+        // Remove the managed worktree/branch only for a worktree session; a HEAD session has none
+        // and must never prune anything in the user's live tree.
+        if let (Some(worktrees), Some(branch)) = (worktrees, branch.as_deref()) {
+            worktrees.remove(branch).ok();
         }
         self.save();
         let _ = self.events.send(DaemonMsg::AgentRemoved { id });
@@ -892,7 +928,7 @@ impl Registry {
                 .agents
                 .values()
                 .filter(|a| a.repo == repo)
-                .map(|a| a.branch.clone())
+                .filter_map(|a| a.workspace.branch().map(str::to_string))
                 .collect()
         };
         let mut pruned = Vec::new();
