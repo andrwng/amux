@@ -2,9 +2,9 @@
 //! **terminals**; the sidebar lists **agents** (workspaces) grouped by **repo**. Splitting a pane
 //! spawns a `$SHELL` in the same worktree. Focus is spatial — `Ctrl+hjkl` moves between panes and
 //! into/out of the sidebar; `Ctrl+B` is a prefix (`%`/`"` split, `x` close, `r` resize, digit
-//! jumps to that sidebar agent, `-` jumps to the previous agent). `n` creates an agent in the
-//! selected repo, `N` in a repo given by path. `Ctrl+Q` quits. Arming the `Ctrl+B` prefix reveals a
-//! numeric overlay on the sidebar; the next digit selects that agent (`1`..`9`, `0` = tenth),
+//! opens that sidebar agent, `-` opens the previous agent). `n` creates an agent in the selected
+//! repo, `N` in a repo given by path. `Ctrl+Q` quits. Arming the `Ctrl+B` prefix reveals a numeric
+//! overlay on the sidebar; the next digit opens that agent's session (`1`..`9`, `0` = tenth),
 //! mirroring tmux's `prefix` + N, and the previous agent's row is marked `-` (tmux's last-window).
 //! `Cmd`+digit does the same on terminals that natively report the SUPER modifier (we don't force
 //! the Kitty protocol — it would break Shift and slow typing).
@@ -678,13 +678,15 @@ impl App {
             self.prefix = false;
             return self.key_prefix(key, sink).await;
         }
-        // `Cmd+digit` (Super held, reported under the Kitty protocol) selects directly. We own
-        // every Cmd+digit — even one past the last agent — so it never leaks a digit to the PTY;
-        // other Cmd combos fall through untouched.
+        // `Cmd+digit` (Super held, reported under the Kitty protocol) opens the agent directly. We
+        // own every Cmd+digit — even one past the last agent — so it never leaks a digit to the
+        // PTY; other Cmd combos fall through untouched.
         if key.modifiers.contains(KeyModifiers::SUPER) {
             if let KeyCode::Char(c) = key.code {
                 if c.is_ascii_digit() {
-                    self.select_numbered_agent(c);
+                    if let Some(id) = self.numbered_agent(c) {
+                        self.open_agent(id, sink).await?;
+                    }
                     return Ok(Flow::Continue);
                 }
             }
@@ -1021,10 +1023,12 @@ impl App {
                     }
                 }
             }
-            // `Ctrl+B -` anywhere else: jump to the previous agent (tmux's last-window). The
-            // overlay marks its row with `-` while the prefix is armed. No-op if there isn't one.
+            // `Ctrl+B -` anywhere else: open the previous agent (tmux's last-window). The overlay
+            // marks its row with `-` while the prefix is armed. No-op if there isn't one.
             KeyCode::Char('-') => {
-                self.jump_previous_agent();
+                if let Some(id) = self.previous_agent() {
+                    self.open_agent(id, sink).await?;
+                }
             }
             // `Ctrl+B Enter`: promote the focused mini into the main area.
             KeyCode::Enter if matches!(self.focus, Focus::Mini(_)) => {
@@ -1084,11 +1088,13 @@ impl App {
             }
             // Jump to the next unread agent (inbox navigation).
             KeyCode::Tab => self.jump_next_unread(sink).await?,
-            // `Ctrl+B <digit>`: jump to the numbered sidebar agent, mirroring tmux's
-            // `prefix` + N (select window N). The overlay that labels the rows is shown for
-            // the whole time the prefix is armed, so the numbers are visible when you press one.
+            // `Ctrl+B <digit>`: open the numbered agent's session, mirroring tmux's `prefix` + N
+            // (select window N). The overlay that labels the rows is shown for the whole time the
+            // prefix is armed, so the numbers are visible when you press one.
             KeyCode::Char(c) if c.is_ascii_digit() => {
-                self.select_numbered_agent(c);
+                if let Some(id) = self.numbered_agent(c) {
+                    self.open_agent(id, sink).await?;
+                }
             }
             KeyCode::Char(c) if key.modifiers.contains(KeyModifiers::CONTROL) => {
                 if let (Some(terminal), Some(byte)) = (self.tree.focused_payload(), ctrl_byte(c)) {
@@ -1668,35 +1674,26 @@ impl App {
         self.super_held || self.prefix
     }
 
-    /// Select the agent the numeric overlay labels with digit `c`, moving focus to the sidebar so
-    /// the user can act on it (`Enter`/`l`). The target is read from the *current* sidebar order,
-    /// so a layout change while the overlay was up is honored. No-op (returns `false`) if `c`
-    /// isn't a digit or maps past the last agent.
-    fn select_numbered_agent(&mut self, c: char) -> bool {
-        let Some(idx) = digit_index(c) else {
-            return false;
-        };
-        let Some(&id) = self.ordered_agent_ids().get(idx) else {
-            return false;
-        };
-        self.sidebar_sel = Some(Row::Agent(id));
-        self.focus = Focus::Sidebar;
-        true
+    /// The agent the numeric overlay labels with digit `c`, if any. Read from the *current* sidebar
+    /// order, so a layout change while the overlay was up is honored. `None` if `c` isn't a digit
+    /// or maps past the last agent.
+    fn numbered_agent(&self, c: char) -> Option<AgentId> {
+        let idx = digit_index(c)?;
+        self.ordered_agent_ids().get(idx).copied()
     }
 
-    /// Select the agent that was in the main area before the current one (tmux's last-window),
-    /// mirroring [`select_numbered_agent`]'s select-only behaviour. No-op (returns `false`) when
-    /// there is no previous agent yet or it has since been removed.
-    fn jump_previous_agent(&mut self) -> bool {
-        let Some(prev) = self.prev_active_agent else {
-            return false;
-        };
-        if !self.agents.iter().any(|a| a.id == prev) {
-            return false;
-        }
-        self.sidebar_sel = Some(Row::Agent(prev));
-        self.focus = Focus::Sidebar;
-        true
+    /// The agent that was in the main area before the current one (tmux's last-window) — the target
+    /// of `Ctrl+B -`. `None` when there is no previous agent yet or it has since been removed.
+    fn previous_agent(&self) -> Option<AgentId> {
+        let prev = self.prev_active_agent?;
+        self.agents.iter().any(|a| a.id == prev).then_some(prev)
+    }
+
+    /// Jump to an agent's session: select its sidebar row and open it in the main area. This is
+    /// what the numeric (`Ctrl+B <digit>` / `Cmd+digit`) and previous (`Ctrl+B -`) shortcuts do.
+    async fn open_agent(&mut self, id: AgentId, sink: &mut Sink) -> Result<()> {
+        self.sidebar_sel = Some(Row::Agent(id));
+        self.activate(id, sink).await
     }
 
     /// The agent the user is currently viewing: the one owning the focused terminal (when focus
@@ -3393,37 +3390,38 @@ mod tests {
 
     /// `Cmd+digit` selects the labelled agent and pulls focus to the sidebar, from any focus.
     #[tokio::test]
-    async fn cmd_digit_selects_the_labelled_agent() {
+    async fn cmd_digit_opens_the_labelled_agent() {
         let (mut app, ids) = app_with_agents(3);
         let (mut sink, _server) = test_sink();
-        app.focus = Focus::Panes;
         let cmd2 = KeyEvent::new(KeyCode::Char('2'), KeyModifiers::SUPER);
         app.on_key(cmd2, &mut sink).await.unwrap();
-        assert_eq!(app.sidebar_sel, Some(Row::Agent(ids[1])));
-        assert!(matches!(app.focus, Focus::Sidebar));
-    }
-
-    /// `Cmd+digit` past the last agent is still consumed (never leaks a digit to the PTY) and
-    /// leaves the selection untouched.
-    #[tokio::test]
-    async fn cmd_digit_past_last_agent_is_a_consumed_noop() {
-        let (mut app, ids) = app_with_agents(2);
-        let (mut sink, _server) = test_sink();
-        app.sidebar_sel = Some(Row::Agent(ids[0]));
-        let cmd9 = KeyEvent::new(KeyCode::Char('9'), KeyModifiers::SUPER);
-        let flow = app.on_key(cmd9, &mut sink).await.unwrap();
-        assert!(matches!(flow, Flow::Continue));
         assert_eq!(
-            app.sidebar_sel,
-            Some(Row::Agent(ids[0])),
-            "out-of-range digit selected nothing"
+            app.active_agent,
+            Some(ids[1]),
+            "the agent opens in the main area"
+        );
+        assert!(
+            matches!(app.focus, Focus::Panes),
+            "focus moves into the session"
         );
     }
 
-    /// `Ctrl+B` arms the prefix (lighting the overlay); the next digit jumps to that agent and
-    /// disarms it, mirroring tmux's `prefix` + N.
+    /// `Cmd+digit` past the last agent is still consumed (never leaks a digit to the PTY) and
+    /// opens nothing.
     #[tokio::test]
-    async fn ctrl_b_prefix_then_digit_selects() {
+    async fn cmd_digit_past_last_agent_is_a_consumed_noop() {
+        let (mut app, _ids) = app_with_agents(2);
+        let (mut sink, _server) = test_sink();
+        let cmd9 = KeyEvent::new(KeyCode::Char('9'), KeyModifiers::SUPER);
+        let flow = app.on_key(cmd9, &mut sink).await.unwrap();
+        assert!(matches!(flow, Flow::Continue));
+        assert_eq!(app.active_agent, None, "out-of-range digit opened nothing");
+    }
+
+    /// `Ctrl+B` arms the prefix (lighting the overlay); the next digit opens that agent's session
+    /// and disarms it, mirroring tmux's `prefix` + N.
+    #[tokio::test]
+    async fn ctrl_b_prefix_then_digit_opens() {
         let (mut app, ids) = app_with_agents(3);
         let (mut sink, _server) = test_sink();
         app.on_key(ctrl('b'), &mut sink).await.unwrap();
@@ -3436,36 +3434,40 @@ mod tests {
             .await
             .unwrap();
         assert!(!app.prefix, "the digit disarms the prefix");
-        assert_eq!(app.sidebar_sel, Some(Row::Agent(ids[2])));
-        assert!(matches!(app.focus, Focus::Sidebar));
+        assert_eq!(
+            app.active_agent,
+            Some(ids[2]),
+            "the agent opens in the main area"
+        );
+        assert!(matches!(app.focus, Focus::Panes));
     }
 
-    /// A non-digit after the prefix runs its own binding (or nothing) and disarms — no jump.
+    /// A non-digit after the prefix runs its own binding (or nothing) and disarms — nothing opens.
     #[tokio::test]
-    async fn ctrl_b_prefix_non_digit_does_not_jump() {
-        let (mut app, ids) = app_with_agents(3);
+    async fn ctrl_b_prefix_non_digit_does_not_open() {
+        let (mut app, _ids) = app_with_agents(3);
         let (mut sink, _server) = test_sink();
-        app.sidebar_sel = Some(Row::Agent(ids[1]));
         app.on_key(ctrl('b'), &mut sink).await.unwrap();
         app.on_key(key(KeyCode::Esc), &mut sink).await.unwrap();
         assert!(!app.prefix);
-        assert_eq!(app.sidebar_sel, Some(Row::Agent(ids[1])));
+        assert_eq!(
+            app.active_agent, None,
+            "Esc after the prefix opened nothing"
+        );
     }
 
-    /// THE regression guard: a bare digit (no Cmd, no leader) is not a shortcut — it must fall
+    /// THE regression guard: a bare digit (no Cmd, no prefix) is not a shortcut — it must fall
     /// through untouched so the focused agent's PTY still receives it.
     #[tokio::test]
     async fn bare_digit_is_not_a_shortcut() {
-        let (mut app, ids) = app_with_agents(3);
+        let (mut app, _ids) = app_with_agents(3);
         let (mut sink, _server) = test_sink();
-        app.sidebar_sel = Some(Row::Agent(ids[2]));
         app.on_key(key(KeyCode::Char('1')), &mut sink)
             .await
             .unwrap();
         assert_eq!(
-            app.sidebar_sel,
-            Some(Row::Agent(ids[2])),
-            "a bare digit left the selection alone"
+            app.active_agent, None,
+            "a bare digit opened nothing — it is not a shortcut"
         );
     }
 
@@ -3501,35 +3503,51 @@ mod tests {
         assert_eq!(app.prev_active_agent, Some(ids[2]), "ping-pong back");
     }
 
-    /// `Ctrl+B -` selects the previous agent and pulls focus to the sidebar (select-only, like the
-    /// numeric shortcut).
+    /// `Ctrl+B -` opens the previous agent's session, and pressing it again bounces back — a true
+    /// last-window toggle, because opening the previous agent makes the one you left the new target.
     #[tokio::test]
-    async fn ctrl_b_dash_jumps_to_previous_agent() {
+    async fn ctrl_b_dash_opens_previous_agent_and_toggles() {
         let (mut app, ids) = app_with_agents(3);
         let (mut sink, _server) = test_sink();
         app.swap_to_agent(ids[0]);
-        app.swap_to_agent(ids[1]); // prev = ids[0]
-        app.sidebar_sel = Some(Row::Agent(ids[2]));
+        app.swap_to_agent(ids[1]); // active = ids[1], prev = ids[0]
         app.on_key(ctrl('b'), &mut sink).await.unwrap();
         app.on_key(key(KeyCode::Char('-')), &mut sink)
             .await
             .unwrap();
-        assert_eq!(app.sidebar_sel, Some(Row::Agent(ids[0])));
-        assert!(matches!(app.focus, Focus::Sidebar));
+        assert_eq!(app.active_agent, Some(ids[0]), "opens the previous agent");
+        assert!(matches!(app.focus, Focus::Panes), "focus is in the session");
+        assert_eq!(
+            app.prev_active_agent,
+            Some(ids[1]),
+            "the one we left becomes the target"
+        );
+        app.on_key(ctrl('b'), &mut sink).await.unwrap();
+        app.on_key(key(KeyCode::Char('-')), &mut sink)
+            .await
+            .unwrap();
+        assert_eq!(
+            app.active_agent,
+            Some(ids[1]),
+            "a second press bounces back"
+        );
     }
 
-    /// With no previous agent, `Ctrl+B -` is a no-op — the selection is left alone.
+    /// With no previous agent, `Ctrl+B -` is a no-op — nothing opens.
     #[tokio::test]
     async fn ctrl_b_dash_is_noop_without_previous() {
         let (mut app, ids) = app_with_agents(2);
         let (mut sink, _server) = test_sink();
         app.swap_to_agent(ids[0]); // only ever one active → no previous
-        app.sidebar_sel = Some(Row::Agent(ids[1]));
         app.on_key(ctrl('b'), &mut sink).await.unwrap();
         app.on_key(key(KeyCode::Char('-')), &mut sink)
             .await
             .unwrap();
-        assert_eq!(app.sidebar_sel, Some(Row::Agent(ids[1])));
+        assert_eq!(
+            app.active_agent,
+            Some(ids[0]),
+            "still on the only agent opened"
+        );
     }
 
     /// Removing the previous agent clears the jump target, so `Ctrl+B -` never points at a ghost.
@@ -3543,7 +3561,7 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(app.prev_active_agent, None);
-        assert!(!app.jump_previous_agent(), "no target left to jump to");
+        assert_eq!(app.previous_agent(), None, "no target left to jump to");
     }
 
     /// While the overlay is active, the previous agent's row is marked `-` in place of its digit.

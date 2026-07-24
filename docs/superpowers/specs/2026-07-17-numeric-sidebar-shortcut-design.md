@@ -9,9 +9,16 @@
 >
 > **Update (2026-07-23):** `Ctrl+B -` jumps to the *previous* agent (tmux's last-window) — the
 > agent that was in the main area before the current one, tracked on each `swap_to_agent` and
-> cleared if that agent is removed. It is select-only like the digits. While the overlay is up, the
-> previous agent's row is marked `-` in place of its digit. `Ctrl+B -` keeps its prior
-> mini-minimize meaning when a mini is focused; the jump applies everywhere else.
+> cleared if that agent is removed. While the overlay is up, the previous agent's row is marked `-`
+> in place of its digit. `Ctrl+B -` keeps its prior mini-minimize meaning when a mini is focused;
+> the jump applies everywhere else.
+>
+> **Update (2026-07-23):** the "select-only, not open" decision is reversed for the jump shortcuts.
+> `Ctrl+B <digit>`, `Cmd+digit`, and `Ctrl+B -` now *open* the target agent's session in the main
+> area (via `activate`), rather than only moving the sidebar cursor — matching `Ctrl+B Tab`
+> (next-unread), which already opened. This also makes `Ctrl+B -` a real toggle: opening the
+> previous agent makes the one you left the new target. The `Ctrl+hjkl` spatial navigation is
+> unchanged — it still just moves focus/highlight between surfaces.
 
 ## Goal
 
