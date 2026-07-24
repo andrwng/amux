@@ -86,6 +86,15 @@ These are non-negotiable and shape every module:
 7. **Structured concurrency & cancellation.** Every per-agent and per-client task has a
    clear owner and is cancelled deterministically on disconnect/exit. No orphan tasks.
 
+**One deliberate exception — HEAD sessions.** The product's isolation guarantee (each agent in
+its own worktree, §1) is intentionally waived for a single opt-in session type: a *HEAD session*
+runs an agent in the repo root on `HEAD` with no managed worktree or branch, sharing the user's
+live tree. The blast radius is contained by three things: it's a **singleton** per repo; the
+"no managed worktree" fact is an **explicit `Workspace::Head`** variant (so worktree logic —
+delete/prune, uniqueness — can't silently misfire on it); and its Claude hook settings are written
+**out of tree** (via `claude --settings`), so amux writes *nothing* into the live repo. Guarding
+against the user's own concurrent edits to that tree is the user's responsibility, not amux's.
+
 Error handling: typed errors (`thiserror`) in `amux-core`/`amux-proto`; `anyhow` at binary
 edges. Logging: `tracing` throughout, JSON logs to `~/.amux/log/`.
 

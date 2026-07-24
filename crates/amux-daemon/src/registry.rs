@@ -646,8 +646,8 @@ impl Registry {
     /// Create (or return the existing) singleton branchless **HEAD session** in `repo`: an agent
     /// running in the repo root on `HEAD`, with no amux-managed worktree and no amux-created
     /// branch. Deliberately breaks the isolation invariant (it shares the user's live tree); the
-    /// blast radius is contained by the singleton, the explicit `Workspace::Head` type, and (from
-    /// the next commit) hook settings written out of tree. See `docs/DESIGN.md` §2.
+    /// blast radius is contained by the singleton, the explicit `Workspace::Head` type, and hook
+    /// settings written out of tree (so nothing is written into the repo). See `docs/DESIGN.md` §2.
     pub fn create_head(self: &Arc<Self>, repo: RepoId) -> Result<AgentInfo> {
         let worktrees = self.worktrees_for(repo).context("no such repo")?;
         // Singleton: one HEAD session per repo. Return the existing one rather than duplicating.

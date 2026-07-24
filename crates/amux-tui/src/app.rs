@@ -850,6 +850,13 @@ impl App {
                 self.create_field = Field::Dir;
                 self.input = InputMode::CreatingRepo;
             }
+            // `H`: new branchless HEAD session in the repo under the cursor — runs an agent in the
+            // repo root on HEAD (no worktree, no branch). Singleton per repo; no prompt.
+            KeyCode::Char('H') => {
+                if let Some(repo) = self.selected_repo() {
+                    sink.send(ClientMsg::CreateHeadAgent { repo }).await?;
+                }
+            }
             KeyCode::Char('d') => {
                 if let Some(id) = self.selected_agent() {
                     sink.send(ClientMsg::DeleteAgent { id, force: false })
@@ -3202,6 +3209,37 @@ mod tests {
             .map(|c| c.symbol())
             .collect();
         assert!(content.contains("5m"), "age column renders, got: {content}");
+    }
+
+    #[test]
+    fn sidebar_shows_head_session_label() {
+        use ratatui::{backend::TestBackend, Terminal};
+        let mut app = App::new(100, 40);
+        let repo = RepoId::from_canonical_path(std::path::Path::new("/r"));
+        app.repos = vec![RepoInfo {
+            id: repo,
+            name: "r".into(),
+            path: "/r".into(),
+        }];
+        // A branchless HEAD session: no branch, labeled "HEAD".
+        let mut agent = agent_with(AgentState::Idle, false);
+        agent.name = "HEAD".into();
+        agent.branch = None;
+        app.agents = vec![agent];
+
+        let mut term = Terminal::new(TestBackend::new(30, 8)).unwrap();
+        term.draw(|f| render_sidebar(f, f.area(), &app)).unwrap();
+        let content: String = term
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|c| c.symbol())
+            .collect();
+        assert!(
+            content.contains("HEAD"),
+            "HEAD session label renders, got: {content}"
+        );
     }
 
     /// The sidebar minimizes when a full sidebar would leave the main area with fewer than
