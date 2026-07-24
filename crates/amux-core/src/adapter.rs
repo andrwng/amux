@@ -17,16 +17,22 @@ pub struct HookSetup<'a> {
     pub amux_exe: &'a Path,
 }
 
-/// What an adapter needs to know to launch (or resume) an agent in a worktree.
+/// What an adapter needs to know to launch (or resume) an agent in its working directory.
 pub struct LaunchContext<'a> {
     pub worktree: &'a Path,
-    pub branch: &'a str,
+    /// The agent's branch, or `None` for a branchless HEAD session (runs in the repo root).
+    pub branch: Option<&'a str>,
     /// A prior session id to resume, if the adapter supports it.
     pub resume: Option<&'a str>,
     /// The agent's full id (round-trippable), exported so its hooks tag reports with it.
     pub agent_id: &'a str,
     /// Hook mailbox wiring; `None` disables hook integration (tests, hookless CLIs).
     pub hooks: Option<HookSetup<'a>>,
+    /// Where to write hook settings when the working directory must not be touched (a HEAD
+    /// session's cwd is the user's live repo root). When `Some`, [`AgentAdapter::prepare_worktree`]
+    /// writes hooks here instead of into `worktree/.claude`, and the launch command points the CLI
+    /// at this file. `None` = the normal per-worktree `.claude/settings.local.json`.
+    pub settings_path: Option<&'a Path>,
 }
 
 /// A concrete recipe for spawning the agent process.
@@ -103,6 +109,13 @@ impl AgentAdapter for ClaudeAdapter {
                 command.push(id.to_string());
             }
         }
+        // Point Claude at an out-of-tree settings file (HEAD sessions) so its hooks fire without
+        // writing into the user's live repo. `--settings` merges below managed settings and above
+        // the project's `.claude/` files.
+        if let Some(path) = ctx.settings_path {
+            command.push("--settings".to_string());
+            command.push(path.to_string_lossy().into_owned());
+        }
         // TERM/COLORTERM are owned by the daemon's PTY layer (it advertises a screen-family
         // terminal so apps fill backgrounds), so they're deliberately not set here.
         let mut env: Vec<(String, String)> = Vec::new();
@@ -129,11 +142,24 @@ impl AgentAdapter for ClaudeAdapter {
         let Some(hooks) = ctx.hooks else {
             return Ok(());
         };
-        let dir = ctx.worktree.join(".claude");
-        std::fs::create_dir_all(&dir).context("create .claude dir")?;
         let settings = claude_hook_settings(hooks.amux_exe);
         let json = serde_json::to_string_pretty(&settings).context("serialize hook settings")?;
-        std::fs::write(dir.join("settings.local.json"), json).context("write hook settings")?;
+        match ctx.settings_path {
+            // HEAD session: write out of tree and leave the live repo untouched.
+            Some(path) => {
+                if let Some(dir) = path.parent() {
+                    std::fs::create_dir_all(dir).context("create settings dir")?;
+                }
+                std::fs::write(path, json).context("write external hook settings")?;
+            }
+            // Worktree session: the per-worktree, gitignored settings file.
+            None => {
+                let dir = ctx.worktree.join(".claude");
+                std::fs::create_dir_all(&dir).context("create .claude dir")?;
+                std::fs::write(dir.join("settings.local.json"), json)
+                    .context("write hook settings")?;
+            }
+        }
         Ok(())
     }
 }
@@ -171,10 +197,11 @@ mod tests {
     fn ctx<'a>(worktree: &'a Path, branch: &'a str, resume: Option<&'a str>) -> LaunchContext<'a> {
         LaunchContext {
             worktree,
-            branch,
+            branch: Some(branch),
             resume,
             agent_id: "agent-1",
             hooks: None,
+            settings_path: None,
         }
     }
 
@@ -221,13 +248,14 @@ mod tests {
         let adapter = ClaudeAdapter::default();
         let lc = LaunchContext {
             worktree,
-            branch: "feat/x",
+            branch: Some("feat/x"),
             resume: None,
             agent_id: "agent-xyz",
             hooks: Some(HookSetup {
                 socket: sock,
                 amux_exe: exe,
             }),
+            settings_path: None,
         };
 
         // Env carries the mailbox + agent id.
@@ -253,6 +281,51 @@ mod tests {
                 .unwrap();
             assert!(cmd.contains("amux") && cmd.ends_with("hook"), "cmd: {cmd}");
         }
+    }
+
+    #[test]
+    fn head_session_uses_external_settings_and_writes_nothing_into_tree() {
+        let tree = tempfile::tempdir().unwrap();
+        let ext = tempfile::tempdir().unwrap();
+        let settings = ext.path().join("head-settings.json");
+        let exe = Path::new("/opt/amux/bin/amux");
+        let sock = Path::new("/run/amux/amuxd-hooks.sock");
+        let adapter = ClaudeAdapter::default();
+        let lc = LaunchContext {
+            worktree: tree.path(),
+            branch: None,
+            resume: None,
+            agent_id: "agent-head",
+            hooks: Some(HookSetup {
+                socket: sock,
+                amux_exe: exe,
+            }),
+            settings_path: Some(&settings),
+        };
+
+        // Hooks land at the external path, and nothing is written into the (live) tree.
+        adapter.prepare_worktree(&lc).unwrap();
+        assert!(settings.exists());
+        assert!(!tree.path().join(".claude").exists());
+        let v: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&settings).unwrap()).unwrap();
+        for event in HOOK_EVENTS {
+            let cmd = v["hooks"][event][0]["hooks"][0]["command"]
+                .as_str()
+                .unwrap();
+            assert!(cmd.contains("amux") && cmd.ends_with("hook"), "cmd: {cmd}");
+        }
+
+        // The launch command points Claude at that external settings file.
+        let spec = adapter.spawn_spec(&lc);
+        let want = settings.to_string_lossy().to_string();
+        assert!(
+            spec.command
+                .windows(2)
+                .any(|w| w[0] == "--settings" && w[1] == want),
+            "command: {:?}",
+            spec.command
+        );
     }
 
     #[test]

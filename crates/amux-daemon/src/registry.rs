@@ -590,10 +590,11 @@ impl Registry {
         let agent_full = agent_id.to_full_string();
         let ctx = LaunchContext {
             worktree: &worktree,
-            branch,
+            branch: Some(branch),
             resume: None,
             agent_id: &agent_full,
             hooks: self.hook_setup(),
+            settings_path: None,
         };
         self.adapter.prepare_worktree(&ctx)?;
         let mut spec = self.adapter.spawn_spec(&ctx);
@@ -668,10 +669,11 @@ impl Registry {
         let agent_full = agent_id.to_full_string();
         let ctx = LaunchContext {
             worktree: &repo_root,
-            branch: "",
+            branch: None,
             resume: None,
             agent_id: &agent_full,
             hooks: self.hook_setup(),
+            settings_path: None,
         };
         self.adapter.prepare_worktree(&ctx)?;
         let mut spec = self.adapter.spawn_spec(&ctx);
@@ -901,10 +903,11 @@ impl Registry {
         let agent_full = id.to_full_string();
         let ctx = LaunchContext {
             worktree: &worktree,
-            branch: &branch,
+            branch: Some(&branch),
             resume: resume_id.as_deref(),
             agent_id: &agent_full,
             hooks: self.hook_setup(),
+            settings_path: None,
         };
         self.adapter.prepare_worktree(&ctx)?;
         let mut spec = self.adapter.spawn_spec(&ctx);
