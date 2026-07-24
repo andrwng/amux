@@ -60,6 +60,15 @@ pub fn state_file() -> Result<PathBuf> {
     Ok(amux_home()?.join("state.json"))
 }
 
+/// Where a branchless HEAD session's Claude hook settings live
+/// (`<amux_home>/head-settings/<agent-id>.json`) — deliberately outside any repo, so a HEAD
+/// session running in the user's live tree never has settings written into that tree.
+pub fn head_settings_path(agent_id: &crate::agent::AgentId) -> Result<PathBuf> {
+    Ok(amux_home()?
+        .join("head-settings")
+        .join(format!("{}.json", agent_id.to_full_string())))
+}
+
 /// Expand a leading `~` or `~/` against `home`; otherwise return the path unchanged.
 fn expand_tilde(input: &str, home: &Path) -> PathBuf {
     if input == "~" {

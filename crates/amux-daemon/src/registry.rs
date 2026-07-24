@@ -667,13 +667,20 @@ impl Registry {
         let agent_id = AgentId::new();
         let terminal_id = TerminalId::new();
         let agent_full = agent_id.to_full_string();
+        let hooks = self.hook_setup();
+        // Only compute the out-of-tree settings path when hooks are on; without them there's
+        // nothing to write and we must not touch the live tree.
+        let settings = hooks
+            .as_ref()
+            .map(|_| amux_core::paths::head_settings_path(&agent_id))
+            .transpose()?;
         let ctx = LaunchContext {
             worktree: &repo_root,
             branch: None,
             resume: None,
             agent_id: &agent_full,
-            hooks: self.hook_setup(),
-            settings_path: None,
+            hooks,
+            settings_path: settings.as_deref(),
         };
         self.adapter.prepare_worktree(&ctx)?;
         let mut spec = self.adapter.spawn_spec(&ctx);
@@ -891,7 +898,7 @@ impl Registry {
                 .is_some_and(|t| t.session.is_some());
             (
                 agent.worktree.clone(),
-                agent.workspace.branch().unwrap_or("").to_string(),
+                agent.workspace.branch().map(str::to_string),
                 agent.ai_session_id.clone(),
                 agent.primary,
                 live,
@@ -901,13 +908,20 @@ impl Registry {
             return Ok(());
         }
         let agent_full = id.to_full_string();
+        let hooks = self.hook_setup();
+        // A HEAD session (no branch) resumes in the repo root with out-of-tree hook settings, just
+        // as it was first launched — never writing into the user's live tree.
+        let settings = match (&branch, &hooks) {
+            (None, Some(_)) => Some(amux_core::paths::head_settings_path(&id)?),
+            _ => None,
+        };
         let ctx = LaunchContext {
             worktree: &worktree,
-            branch: Some(&branch),
+            branch: branch.as_deref(),
             resume: resume_id.as_deref(),
             agent_id: &agent_full,
-            hooks: self.hook_setup(),
-            settings_path: None,
+            hooks,
+            settings_path: settings.as_deref(),
         };
         self.adapter.prepare_worktree(&ctx)?;
         let mut spec = self.adapter.spawn_spec(&ctx);
@@ -987,9 +1001,19 @@ impl Registry {
             session.kill();
         }
         // Remove the managed worktree/branch only for a worktree session; a HEAD session has none
-        // and must never prune anything in the user's live tree.
-        if let (Some(worktrees), Some(branch)) = (worktrees, branch.as_deref()) {
-            worktrees.remove(branch).ok();
+        // and must never prune anything in the user's live tree. Clean up its out-of-tree hook
+        // settings file instead (branchless ⇒ HEAD session).
+        match branch.as_deref() {
+            Some(branch) => {
+                if let Some(worktrees) = worktrees {
+                    worktrees.remove(branch).ok();
+                }
+            }
+            None => {
+                if let Ok(path) = amux_core::paths::head_settings_path(&id) {
+                    let _ = std::fs::remove_file(path);
+                }
+            }
         }
         self.save();
         let _ = self.events.send(DaemonMsg::AgentRemoved { id });
