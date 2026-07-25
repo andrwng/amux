@@ -53,7 +53,8 @@ upgrade after pulling — a cargo-installed binary does not update itself.
 - **Main area** (center): the **active agent's workspace** — a tmux-style tree of tiled panes.
   It starts as the agent's terminal; splits spawn a `$SHELL` in the same worktree. Each agent
   owns its own layout: opening another agent swaps the whole main area, and layouts are saved
-  and restored (even across TUI restarts).
+  and restored — across restarts of the TUI, of amux itself, and of upgrades. Split shells are
+  respawned fresh in the same worktree, since their processes don't survive a restart.
 - **Minis** (floating, bottom-right): small live terminals overlaid on the main area, one per
   agent, each showing that agent's primary terminal — answer another agent's prompt without
   losing your place. A mini can be minimized to a status-only strip, and the whole row can be

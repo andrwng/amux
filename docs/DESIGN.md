@@ -352,9 +352,16 @@ Why this is good:
   disconnect looks like — the daemon is double-forked and `setsid`, so the client's `SIGHUP`
   never reaches it, and agents keep working until you reconnect.
 - **Daemon restart / crash**: child processes die with it (they are its children). We persist
-  agent metadata + `ai_session_id` to `~/.amux/state.json`, so on restart the daemon offers
-  **resume** (`claude --resume <id>`) rather than silently losing work. Full crash-survival
-  (re-parentable agents) is explicitly **out of scope v1**; noted as future work.
+  agent metadata + `ai_session_id` + **each agent's pane layout** to `~/.amux/state.json`, so on
+  restart the daemon offers **resume** (`claude --resume <id>`) rather than silently losing work,
+  and the tiled split you left comes back instead of collapsing to a single pane. Full
+  crash-survival (re-parentable agents) is explicitly **out of scope v1**; noted as future work.
+- **Restart honesty about panes**: a layout is geometry plus terminal ids, and only the *primary*
+  terminal id is durable (it is persisted and reused by `resume`). Shell terminals are processes
+  that die with the daemon, so their leaves are blanked on load (`blank_dead_terminals`) and the
+  client refills each with a freshly spawned `$SHELL` in the same worktree (`PaneTree::fill_blanks`).
+  You get your layout back, not your shell history — claiming otherwise would be a lie the code
+  can't keep.
 - **Upgrade / reinstall**: the daemon that binds the control socket arbitrates. `bind_or_detect`
   probes an already-bound socket with a real `Hello`: a **compatible** daemon means this one is
   redundant and refuses to start; an **incompatible** one (a `PROTO_VERSION` bump, or a wedged

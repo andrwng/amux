@@ -121,6 +121,21 @@ impl<P: Copy + PartialEq> PaneTree<P> {
         }
     }
 
+    /// Give every empty pane a payload from `next`, returning them in assignment order.
+    ///
+    /// Used when restoring a layout the daemon persisted across a restart: the shell terminals
+    /// died with the old daemon, so their leaves arrive blank and each needs a freshly spawned
+    /// one. A blank leaf already means "a pane waiting for its terminal" — it is exactly the state
+    /// [`split`](Self::split) leaves behind until its `SpawnShell` lands — so this reuses that
+    /// meaning rather than inventing a second kind of empty pane.
+    pub fn fill_blanks(&mut self, mut next: impl FnMut() -> P) -> Vec<P> {
+        let mut filled = Vec::new();
+        if let Some(root) = &mut self.root {
+            fill_blank_leaves(root, &mut next, &mut filled);
+        }
+        filled
+    }
+
     /// Split the focused pane; the new (empty) pane becomes focused. No-op on an empty tree.
     pub fn split(&mut self, axis: Axis) {
         if self.root.is_none() {
@@ -363,6 +378,24 @@ fn set_payload<P>(node: &mut Node<P>, id: PaneId, payload: Option<P>) {
     }
 }
 
+/// Depth-first, first-pane-first: assign a payload to each empty leaf, collecting what was
+/// assigned so the caller can spawn exactly one terminal per pane.
+fn fill_blank_leaves<P: Copy>(node: &mut Node<P>, next: &mut impl FnMut() -> P, out: &mut Vec<P>) {
+    match node {
+        Node::Leaf { payload, .. } => {
+            if payload.is_none() {
+                let value = next();
+                out.push(value);
+                *payload = Some(value);
+            }
+        }
+        Node::Split { first, second, .. } => {
+            fill_blank_leaves(first, next, out);
+            fill_blank_leaves(second, next, out);
+        }
+    }
+}
+
 fn contains<P>(node: &Node<P>, id: PaneId) -> bool {
     match node {
         Node::Leaf { id: lid, .. } => *lid == id,
@@ -587,6 +620,78 @@ mod tests {
 
     fn area() -> Rect {
         Rect::new(0, 0, 100, 40)
+    }
+
+    /// Restoring a daemon-persisted layout hands us a tree whose shell leaves are blank (their
+    /// PTYs died with the old daemon). Every one gets a fresh terminal; occupied leaves — notably
+    /// the agent's primary, whose id is durable — must be left exactly as they are.
+    #[test]
+    fn fill_blanks_populates_only_empty_leaves() {
+        let mut t = PaneTree::new();
+        let primary = TerminalId::new();
+        t.open(primary);
+        t.split(Axis::LeftRight); // a blank pane
+        t.split(Axis::TopBottom); // and another
+
+        let filled = t.fill_blanks(TerminalId::new);
+        assert_eq!(filled.len(), 2, "one terminal per blank pane");
+        assert_ne!(filled[0], filled[1], "each pane gets its own terminal");
+
+        let payloads = t.payloads();
+        assert_eq!(payloads.len(), 3);
+        assert!(
+            payloads.contains(&primary),
+            "the primary keeps its terminal: {payloads:?}"
+        );
+        for t in &filled {
+            assert!(payloads.contains(t), "filled terminal {t:?} is in a pane");
+        }
+    }
+
+    /// A tree with nothing blank is untouched, and a tree with no panes at all is not a crash.
+    #[test]
+    fn fill_blanks_is_a_no_op_when_nothing_is_empty() {
+        let mut t = PaneTree::new();
+        assert!(t.fill_blanks(TerminalId::new).is_empty(), "empty tree");
+
+        let a = TerminalId::new();
+        t.open(a);
+        assert!(t.fill_blanks(TerminalId::new).is_empty(), "nothing blank");
+        assert_eq!(t.payloads(), vec![a]);
+    }
+
+    /// The round trip that matters: save a split layout, restore it with the shell leaf blanked
+    /// (what the daemon does across a restart), refill, and get the same geometry back.
+    #[test]
+    fn a_restored_layout_refills_its_shell_pane() {
+        let mut original = PaneTree::new();
+        let primary = TerminalId::new();
+        original.open(primary);
+        original.split(Axis::LeftRight);
+        original.open(TerminalId::new()); // the shell
+        let saved = original.to_layout().expect("non-empty");
+
+        // The daemon blanks every non-primary leaf on reload.
+        let blanked = match saved {
+            Layout::Split {
+                axis,
+                ratio,
+                first,
+                second: _,
+            } => Layout::Split {
+                axis,
+                ratio,
+                first,
+                second: Box::new(Layout::Leaf { terminal: None }),
+            },
+            other => other,
+        };
+
+        let mut restored = PaneTree::<TerminalId>::from_layout(&blanked);
+        let filled = restored.fill_blanks(TerminalId::new);
+        assert_eq!(filled.len(), 1, "the shell pane needs one new terminal");
+        assert_eq!(restored.layout(area()).len(), 2, "still two panes");
+        assert!(restored.payloads().contains(&primary));
     }
 
     #[test]

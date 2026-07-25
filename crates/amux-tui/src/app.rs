@@ -534,7 +534,8 @@ impl App {
                 // so swap_to_agent can rebuild its tree from a saved layout.
                 if let Some(id) = active {
                     if self.active_agent != Some(id) && self.agents.iter().any(|a| a.id == id) {
-                        self.swap_to_agent(id);
+                        let restored = self.swap_to_agent(id);
+                        self.spawn_restored_shells(id, restored, sink).await?;
                         self.reconcile(sink).await?;
                     }
                 }
@@ -948,13 +949,50 @@ impl App {
     /// Make `id` the active agent: save the current agent's layout, restore (or create) `id`'s.
     /// Each agent's workspace is its own tiled tree — switching swaps the whole main area.
     async fn activate(&mut self, id: AgentId, sink: &mut Sink) -> Result<()> {
-        self.swap_to_agent(id);
+        let restored = self.swap_to_agent(id);
+        self.spawn_restored_shells(id, restored, sink).await?;
         self.reconcile(sink).await
+    }
+
+    /// Spawn a `$SHELL` for each pane that came back blank from a persisted layout, in the agent's
+    /// worktree. Called once per restore; the daemon knows the primary terminal even while it is
+    /// dormant, so `like` resolves the worktree without the agent having to be live yet.
+    async fn spawn_restored_shells(
+        &mut self,
+        agent: AgentId,
+        blanks: Vec<TerminalId>,
+        sink: &mut Sink,
+    ) -> Result<()> {
+        if blanks.is_empty() {
+            return Ok(());
+        }
+        let Some(primary) = self
+            .agents
+            .iter()
+            .find(|a| a.id == agent)
+            .map(|a| a.primary_terminal)
+        else {
+            return Ok(());
+        };
+        for terminal in blanks {
+            sink.send(ClientMsg::SpawnShell {
+                terminal,
+                like: primary,
+            })
+            .await?;
+        }
+        Ok(())
     }
 
     /// The pure state change behind [`activate`]: save the current agent's layout, restore (or
     /// create) `id`'s, and ensure its primary terminal is shown.
-    fn swap_to_agent(&mut self, id: AgentId) {
+    ///
+    /// Returns the terminals minted for panes that a **persisted** layout brought back blank —
+    /// their shells died with the previous daemon, so the caller must spawn one each (see
+    /// [`Self::spawn_restored_shells`]).
+    #[must_use = "restored blank panes need their shells spawned"]
+    fn swap_to_agent(&mut self, id: AgentId) -> Vec<TerminalId> {
+        let mut restored = Vec::new();
         // An agent shown in the main area isn't also a mini (its terminal can't be two sizes).
         self.minis.retain(|a| *a != id);
         self.minimized.remove(&id);
@@ -966,15 +1004,21 @@ impl App {
                 self.prev_active_agent = Some(prev);
             }
             // This session's live tree, else a layout the daemon persisted from a past session.
-            self.tree = self
-                .trees
-                .remove(&id)
-                .or_else(|| {
-                    self.saved_layouts
+            match self.trees.remove(&id) {
+                Some(live) => self.tree = live,
+                None => {
+                    self.tree = self
+                        .saved_layouts
                         .remove(&id)
                         .map(|l| PaneTree::from_layout(&l))
-                })
-                .unwrap_or_default();
+                        .unwrap_or_default();
+                    // Only a *persisted* layout can contain dead panes: the daemon blanks every
+                    // leaf whose PTY died with it. A blank pane in this session's live tree is a
+                    // split whose SpawnShell is still in flight, and refilling it would spawn a
+                    // second shell for one pane.
+                    restored = self.tree.fill_blanks(TerminalId::new);
+                }
+            }
             self.active_agent = Some(id);
             // A restored layout's terminals belong to this agent (for rendering + splits).
             for t in self.tree.payloads() {
@@ -994,6 +1038,7 @@ impl App {
             }
         }
         self.focus = Focus::Panes;
+        restored
     }
 
     async fn key_pane(&mut self, key: KeyEvent, sink: &mut Sink) -> Result<Flow> {
@@ -2759,7 +2804,7 @@ mod tests {
         app.agents = vec![a, b];
 
         // Open A → its primary shows; split off a shell in A's workspace.
-        app.swap_to_agent(ida);
+        let _ = app.swap_to_agent(ida);
         assert_eq!(app.tree.payloads(), vec![pa]);
         let sh = TerminalId::new();
         app.terminals.insert(sh, ida);
@@ -2768,12 +2813,12 @@ mod tests {
         assert_eq!(app.tree.payloads().len(), 2);
 
         // Switch to B → the main area is B's primary only; A's terminals are not present.
-        app.swap_to_agent(idb);
+        let _ = app.swap_to_agent(idb);
         assert_eq!(app.tree.payloads(), vec![pb]);
         assert!(!app.tree.payloads().contains(&pa));
 
         // Switch back to A → its two-pane split (primary + shell) is restored.
-        app.swap_to_agent(ida);
+        let _ = app.swap_to_agent(ida);
         let payloads = app.tree.payloads();
         assert_eq!(payloads.len(), 2);
         assert!(payloads.contains(&pa) && payloads.contains(&sh));
@@ -3544,6 +3589,147 @@ mod tests {
 
     /// Drive the `n` create form: type into the focused field, `Tab` to switch, `Enter` submit.
     /// Returns the `ClientMsg` the app sent, or `None` if it sent nothing.
+    /// Restoring a layout the daemon persisted across a restart must bring the split back *live*.
+    /// The daemon blanks every leaf whose PTY died with it, so without a refill the user would get
+    /// their geometry back as a dead " empty " pane — worse than the collapse it replaced.
+    #[tokio::test]
+    async fn restoring_a_saved_layout_respawns_its_shells() {
+        use amux_proto::ServerCodec;
+        let (client_end, server_end) = UnixStream::pair().unwrap();
+        let (mut sink, _rx) = Framed::new(client_end, ClientCodec::default()).split();
+        let mut server = Framed::new(server_end, ServerCodec::default());
+
+        let (mut app, ids) = app_with_agents(1);
+        let id = ids[0];
+        let primary = app
+            .agents
+            .iter()
+            .find(|a| a.id == id)
+            .unwrap()
+            .primary_terminal;
+
+        // Exactly what the daemon replays after a restart: the geometry, shell leaf blanked.
+        app.saved_layouts.insert(
+            id,
+            amux_proto::Layout::Split {
+                axis: Axis::LeftRight,
+                ratio: 0.5,
+                first: Box::new(amux_proto::Layout::Leaf {
+                    terminal: Some(primary),
+                }),
+                second: Box::new(amux_proto::Layout::Leaf { terminal: None }),
+            },
+        );
+
+        app.activate(id, &mut sink).await.unwrap();
+
+        // The split is back, with both panes holding a terminal.
+        let payloads = app.tree.payloads();
+        assert_eq!(payloads.len(), 2, "the split geometry is restored");
+        assert!(payloads.contains(&primary), "the primary kept its terminal");
+        let refilled = *payloads.iter().find(|t| **t != primary).unwrap();
+        assert_eq!(
+            app.terminals.get(&refilled),
+            Some(&id),
+            "the new terminal is registered to this agent"
+        );
+
+        // And a shell was actually requested for it, in the agent's worktree (`like` = primary).
+        let mut spawn = None;
+        while let Ok(Some(Ok(msg))) =
+            tokio::time::timeout(Duration::from_millis(200), server.next()).await
+        {
+            if let ClientMsg::SpawnShell { terminal, like } = msg {
+                spawn = Some((terminal, like));
+                break;
+            }
+        }
+        assert_eq!(
+            spawn,
+            Some((refilled, primary)),
+            "a SpawnShell must go out for the refilled pane"
+        );
+    }
+
+    /// The restored split renders as two live panes — the agent's primary and a shell — with no
+    /// " empty " placeholder left over. This is what the user actually sees after a reinstall.
+    #[tokio::test]
+    async fn a_restored_split_renders_as_two_live_panes() {
+        use ratatui::{backend::TestBackend, Terminal};
+        let (client_end, _server_end) = UnixStream::pair().unwrap();
+        let (mut sink, _rx) = Framed::new(client_end, ClientCodec::default()).split();
+
+        let (mut app, ids) = app_with_agents(1);
+        let id = ids[0];
+        let primary = app
+            .agents
+            .iter()
+            .find(|a| a.id == id)
+            .unwrap()
+            .primary_terminal;
+        app.saved_layouts.insert(
+            id,
+            amux_proto::Layout::Split {
+                axis: Axis::LeftRight,
+                ratio: 0.5,
+                first: Box::new(amux_proto::Layout::Leaf {
+                    terminal: Some(primary),
+                }),
+                second: Box::new(amux_proto::Layout::Leaf { terminal: None }),
+            },
+        );
+        app.activate(id, &mut sink).await.unwrap();
+
+        let mut term = Terminal::new(TestBackend::new(60, 10)).unwrap();
+        term.draw(|f| render_panes(f, f.area(), &app)).unwrap();
+        let content: String = term
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|c| c.symbol())
+            .collect();
+
+        assert!(
+            !content.contains("empty"),
+            "no dead placeholder pane should survive the restore, got: {content}"
+        );
+        assert!(
+            content.contains("sh \u{b7}"),
+            "the refilled pane renders as a shell, got: {content}"
+        );
+    }
+
+    /// The counterpart guard: a blank pane in *this session's* live tree is a split whose
+    /// `SpawnShell` is still in flight. Refilling it would spawn a second shell for one pane.
+    #[tokio::test]
+    async fn switching_back_to_a_live_tree_does_not_respawn_its_pending_pane() {
+        use amux_proto::ServerCodec;
+        let (client_end, server_end) = UnixStream::pair().unwrap();
+        let (mut sink, _rx) = Framed::new(client_end, ClientCodec::default()).split();
+        let mut server = Framed::new(server_end, ServerCodec::default());
+
+        let (mut app, ids) = app_with_agents(2);
+        app.activate(ids[0], &mut sink).await.unwrap();
+        // Split without letting the shell arrive: the new pane is blank and pending.
+        app.tree.split(Axis::LeftRight);
+        assert!(app.tree.focused_payload().is_none(), "pane is pending");
+
+        // Switch away and back — the live tree is stashed and restored verbatim.
+        app.activate(ids[1], &mut sink).await.unwrap();
+        app.activate(ids[0], &mut sink).await.unwrap();
+
+        let mut spawns = 0;
+        while let Ok(Some(Ok(msg))) =
+            tokio::time::timeout(Duration::from_millis(200), server.next()).await
+        {
+            if matches!(msg, ClientMsg::SpawnShell { .. }) {
+                spawns += 1;
+            }
+        }
+        assert_eq!(spawns, 0, "a pending pane must not be refilled");
+    }
+
     async fn run_create_form(keys: &str, tab_at: Option<usize>) -> Option<ClientMsg> {
         use amux_proto::ServerCodec;
         let (client_end, server_end) = UnixStream::pair().unwrap();
@@ -3667,26 +3853,26 @@ mod tests {
             app.prev_active_agent, None,
             "no previous until a second agent"
         );
-        app.swap_to_agent(ids[0]);
+        let _ = app.swap_to_agent(ids[0]);
         assert_eq!(
             app.prev_active_agent, None,
             "the first activation leaves no previous"
         );
-        app.swap_to_agent(ids[1]);
+        let _ = app.swap_to_agent(ids[1]);
         assert_eq!(
             app.prev_active_agent,
             Some(ids[0]),
             "leaving agent 0 makes it the previous"
         );
-        app.swap_to_agent(ids[2]);
+        let _ = app.swap_to_agent(ids[2]);
         assert_eq!(app.prev_active_agent, Some(ids[1]));
-        app.swap_to_agent(ids[2]);
+        let _ = app.swap_to_agent(ids[2]);
         assert_eq!(
             app.prev_active_agent,
             Some(ids[1]),
             "re-opening the active agent leaves the target alone"
         );
-        app.swap_to_agent(ids[1]);
+        let _ = app.swap_to_agent(ids[1]);
         assert_eq!(app.prev_active_agent, Some(ids[2]), "ping-pong back");
     }
 
@@ -3696,8 +3882,8 @@ mod tests {
     async fn ctrl_b_dash_opens_previous_agent_and_toggles() {
         let (mut app, ids) = app_with_agents(3);
         let (mut sink, _server) = test_sink();
-        app.swap_to_agent(ids[0]);
-        app.swap_to_agent(ids[1]); // active = ids[1], prev = ids[0]
+        let _ = app.swap_to_agent(ids[0]);
+        let _ = app.swap_to_agent(ids[1]); // active = ids[1], prev = ids[0]
         app.on_key(ctrl('b'), &mut sink).await.unwrap();
         app.on_key(key(KeyCode::Char('-')), &mut sink)
             .await
@@ -3725,7 +3911,7 @@ mod tests {
     async fn ctrl_b_dash_is_noop_without_previous() {
         let (mut app, ids) = app_with_agents(2);
         let (mut sink, _server) = test_sink();
-        app.swap_to_agent(ids[0]); // only ever one active → no previous
+        let _ = app.swap_to_agent(ids[0]); // only ever one active → no previous
         app.on_key(ctrl('b'), &mut sink).await.unwrap();
         app.on_key(key(KeyCode::Char('-')), &mut sink)
             .await
@@ -3742,8 +3928,8 @@ mod tests {
     async fn agent_removal_clears_previous_target() {
         let (mut app, ids) = app_with_agents(2);
         let (mut sink, _server) = test_sink();
-        app.swap_to_agent(ids[0]);
-        app.swap_to_agent(ids[1]); // prev = ids[0]
+        let _ = app.swap_to_agent(ids[0]);
+        let _ = app.swap_to_agent(ids[1]); // prev = ids[0]
         app.on_daemon(DaemonMsg::AgentRemoved { id: ids[0] }, &mut sink)
             .await
             .unwrap();
@@ -3768,8 +3954,8 @@ mod tests {
                 .collect()
         };
 
-        app.swap_to_agent(ids[0]);
-        app.swap_to_agent(ids[1]); // prev = ids[0]
+        let _ = app.swap_to_agent(ids[0]);
+        let _ = app.swap_to_agent(ids[1]); // prev = ids[0]
         assert!(
             !content(&app).contains(" - "),
             "no marker while the overlay is off"

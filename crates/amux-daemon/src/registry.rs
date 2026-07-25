@@ -138,7 +138,7 @@ struct State {
     /// mark it unread (you're watching it); everyone else's does.
     focused: Option<AgentId>,
     /// Saved pane layouts per agent, replayed to a re-attaching client so splits survive the TUI
-    /// closing. In-memory (survives client restart, not a daemon restart — that's state.json).
+    /// closing — and, since they are part of [`PersistedState`], a daemon restart or an upgrade too.
     layouts: HashMap<AgentId, amux_proto::Layout>,
     /// Which agents are open as minis (left-to-right) — replayed to a re-attaching client.
     minis: Vec<AgentId>,
@@ -159,6 +159,11 @@ struct PersistedState {
     /// Which agent occupied the main area (restored into the client's main pane on reconnect).
     #[serde(default)]
     active: Option<AgentId>,
+    /// Each agent's pane layout, so tiled splits survive a daemon restart rather than collapsing
+    /// back to a single pane. A `Vec` of pairs because `AgentId` is not a JSON object key;
+    /// `default` so a `state.json` written before this field still loads.
+    #[serde(default)]
+    layouts: Vec<(AgentId, amux_proto::Layout)>,
 }
 
 /// A repo as `repo` + `base` paths, enough to rebuild its [`WorktreeService`] verbatim.
@@ -319,16 +324,24 @@ impl Registry {
         Ok(self.register(worktrees))
     }
 
-    /// Save (or clear, on `None`) an agent's pane layout for replay to re-attaching clients.
+    /// Save (or clear, on `None`) an agent's pane layout for replay to re-attaching clients, and
+    /// persist it. Saves only on a real change: the client re-sends its layout on every reconcile
+    /// (a resize, a focus move), so writing unconditionally would hammer the disk — the same
+    /// anti-churn reasoning as [`Self::set_minis`].
     pub fn set_layout(&self, agent: AgentId, layout: Option<amux_proto::Layout>) {
-        let mut state = self.state.lock().unwrap();
-        match layout {
-            Some(l) => {
-                state.layouts.insert(agent, l);
+        let changed = {
+            let mut state = self.state.lock().unwrap();
+            match layout {
+                Some(l) if state.layouts.get(&agent) == Some(&l) => false,
+                Some(l) => {
+                    state.layouts.insert(agent, l);
+                    true
+                }
+                None => state.layouts.remove(&agent).is_some(),
             }
-            None => {
-                state.layouts.remove(&agent);
-            }
+        };
+        if changed {
+            self.save();
         }
     }
 
@@ -415,6 +428,11 @@ impl Registry {
                     .collect(),
                 minis: state.minis.clone(),
                 active: state.active,
+                layouts: state
+                    .layouts
+                    .iter()
+                    .map(|(id, l)| (*id, l.clone()))
+                    .collect(),
             }
         };
         if let Err(e) = write_atomic(path, &snapshot) {
@@ -515,6 +533,18 @@ impl Registry {
         state.active = persisted
             .active
             .filter(|id| state.agents.contains_key(id) && !state.minis.contains(id));
+        // Restore each surviving agent's layout, blanking the leaves whose PTYs died with the
+        // previous daemon. Built separately because it reads `state.agents` while writing
+        // `state.layouts`.
+        let layouts: HashMap<AgentId, amux_proto::Layout> = persisted
+            .layouts
+            .into_iter()
+            .filter_map(|(id, layout)| {
+                let agent = state.agents.get(&id)?;
+                Some((id, blank_dead_terminals(&layout, agent.primary)))
+            })
+            .collect();
+        state.layouts = layouts;
     }
 
     /// Ensure `terminal`'s agent is live, resuming a suspended primary if needed. Called when a
@@ -1167,6 +1197,33 @@ fn agent_name(branch: &str) -> String {
     branch.rsplit('/').next().unwrap_or(branch).to_string()
 }
 
+/// Strip terminal ids that no longer exist from a reloaded layout, keeping the geometry.
+///
+/// PTYs die with the daemon. The agent's **primary** id is durable (it is persisted and reused by
+/// `resume`), so its leaf survives untouched; every other leaf held a shell terminal whose process
+/// is gone, and handing that id back to a client would have it `Attach` to nothing. Those leaves
+/// become blank — the same state a fresh split occupies before its shell arrives — so the client
+/// can refill them (see `PaneTree::fill_blanks`). Splits keep their axis and ratio, which is what
+/// makes the restored screen look like the one you left.
+fn blank_dead_terminals(layout: &amux_proto::Layout, keep: TerminalId) -> amux_proto::Layout {
+    match layout {
+        amux_proto::Layout::Leaf { terminal } => amux_proto::Layout::Leaf {
+            terminal: terminal.filter(|t| *t == keep),
+        },
+        amux_proto::Layout::Split {
+            axis,
+            ratio,
+            first,
+            second,
+        } => amux_proto::Layout::Split {
+            axis: *axis,
+            ratio: *ratio,
+            first: Box::new(blank_dead_terminals(first, keep)),
+            second: Box::new(blank_dead_terminals(second, keep)),
+        },
+    }
+}
+
 /// Write `state` to `path` atomically: serialize to a sibling temp file, then rename over `path`
 /// so a reader never sees a half-written file.
 fn write_atomic(path: &Path, state: &PersistedState) -> Result<()> {
@@ -1207,4 +1264,63 @@ fn set_state(
         None
     };
     (Some(next), unread_change)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use amux_core::nav::Axis;
+    use amux_proto::Layout;
+
+    fn leaf(t: Option<TerminalId>) -> Layout {
+        Layout::Leaf { terminal: t }
+    }
+
+    fn split(first: Layout, second: Layout) -> Layout {
+        Layout::Split {
+            axis: Axis::LeftRight,
+            ratio: 0.35,
+            first: Box::new(first),
+            second: Box::new(second),
+        }
+    }
+
+    /// The primary's leaf survives (its id is durable across a restart); shell leaves are blanked
+    /// because their PTYs died with the daemon — and the geometry is preserved exactly, which is
+    /// the whole point of persisting the layout.
+    #[test]
+    fn blanking_keeps_the_primary_and_the_geometry() {
+        let primary = TerminalId::new();
+        let shell = TerminalId::new();
+        let other_shell = TerminalId::new();
+
+        let saved = split(
+            leaf(Some(primary)),
+            split(leaf(Some(shell)), leaf(Some(other_shell))),
+        );
+        let restored = blank_dead_terminals(&saved, primary);
+
+        assert_eq!(
+            restored,
+            split(leaf(Some(primary)), split(leaf(None), leaf(None))),
+            "only the primary keeps its terminal; axes and ratios are untouched"
+        );
+    }
+
+    /// A layout that is a bare primary pane comes back completely unchanged.
+    #[test]
+    fn blanking_a_single_primary_pane_is_a_no_op() {
+        let primary = TerminalId::new();
+        let saved = leaf(Some(primary));
+        assert_eq!(blank_dead_terminals(&saved, primary), saved);
+    }
+
+    /// An already-blank leaf (a split whose shell had not arrived yet) stays blank rather than
+    /// being confused for a live terminal.
+    #[test]
+    fn blanking_leaves_an_empty_pane_empty() {
+        let primary = TerminalId::new();
+        let saved = split(leaf(Some(primary)), leaf(None));
+        assert_eq!(blank_dead_terminals(&saved, primary), saved);
+    }
 }

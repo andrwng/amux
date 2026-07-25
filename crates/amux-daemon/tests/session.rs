@@ -1074,6 +1074,160 @@ async fn durable_state_survives_a_daemon_restart() {
     );
 }
 
+/// Splits survive a daemon restart. Previously layouts lived only in daemon memory, so
+/// reinstalling amux (or any daemon restart) silently collapsed every tiled pane back to one —
+/// the geometry is now persisted, with dead shell leaves blanked for the client to refill.
+#[tokio::test]
+async fn layouts_survive_a_daemon_restart() {
+    let tmp = tempfile::tempdir().unwrap();
+    let repo = tmp.path().join("repo");
+    std::fs::create_dir(&repo).unwrap();
+    init_repo(&repo);
+    let wt_base = tmp.path().join("wt");
+    let state_path = tmp.path().join("state.json");
+
+    let shell = TerminalId::new();
+    let (agent_id, primary) = {
+        let worktrees = WorktreeService::with_base(&repo, &wt_base).unwrap();
+        let adapter = Box::new(ClaudeAdapter::with_command(vec!["cat".into()]));
+        let registry = Registry::with_state(adapter, state_path.clone());
+        let repo_id = registry.register(worktrees).id;
+        let info = registry.create(repo_id, "feature", None).unwrap();
+        // A vertical split: the agent's primary beside a shell.
+        registry.set_layout(
+            info.id,
+            Some(Layout::Split {
+                axis: amux_core::nav::Axis::LeftRight,
+                ratio: 0.6,
+                first: Box::new(Layout::Leaf {
+                    terminal: Some(info.primary_terminal),
+                }),
+                second: Box::new(Layout::Leaf {
+                    terminal: Some(shell),
+                }),
+            }),
+        );
+        (info.id, info.primary_terminal)
+    };
+
+    // A fresh daemon over the same state.json.
+    let adapter = Box::new(ClaudeAdapter::with_command(vec!["cat".into()]));
+    let registry = Registry::with_state(adapter, state_path.clone());
+    registry.load_state();
+
+    let layouts = registry.layouts();
+    let (_, restored) = layouts
+        .iter()
+        .find(|(id, _)| *id == agent_id)
+        .expect("the agent's layout reloaded");
+    match restored {
+        Layout::Split {
+            axis,
+            ratio,
+            first,
+            second,
+        } => {
+            assert_eq!(*axis, amux_core::nav::Axis::LeftRight, "axis preserved");
+            assert!((*ratio - 0.6).abs() < f32::EPSILON, "ratio preserved");
+            assert_eq!(
+                **first,
+                Layout::Leaf {
+                    terminal: Some(primary)
+                },
+                "the primary's leaf keeps its (durable) terminal id"
+            );
+            assert_eq!(
+                **second,
+                Layout::Leaf { terminal: None },
+                "the shell's PTY died with the daemon, so its leaf comes back blank"
+            );
+        }
+        other => panic!("expected the split to survive, got {other:?}"),
+    }
+}
+
+/// A layout whose agent did not survive the load must not be resurrected — it would be a pane
+/// tree for an agent the sidebar never shows.
+#[tokio::test]
+async fn layouts_for_dead_agents_are_dropped() {
+    let tmp = tempfile::tempdir().unwrap();
+    let repo = tmp.path().join("repo");
+    std::fs::create_dir(&repo).unwrap();
+    init_repo(&repo);
+    let state_path = tmp.path().join("state.json");
+
+    {
+        let worktrees = WorktreeService::with_base(&repo, tmp.path().join("wt")).unwrap();
+        let adapter = Box::new(ClaudeAdapter::with_command(vec!["cat".into()]));
+        let registry = Registry::with_state(adapter, state_path.clone());
+        let repo_id = registry.register(worktrees).id;
+        let info = registry.create(repo_id, "feature", None).unwrap();
+        registry.set_layout(
+            info.id,
+            Some(Layout::Leaf {
+                terminal: Some(info.primary_terminal),
+            }),
+        );
+    }
+
+    // Splice in a layout for an agent that is not in the file.
+    let ghost = AgentId::new();
+    let mut state: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(&state_path).unwrap()).unwrap();
+    let entry = serde_json::json!([ghost.to_full_string(), { "Leaf": { "terminal": null } }]);
+    state["layouts"].as_array_mut().unwrap().push(entry);
+    std::fs::write(&state_path, serde_json::to_string_pretty(&state).unwrap()).unwrap();
+
+    let adapter = Box::new(ClaudeAdapter::with_command(vec!["cat".into()]));
+    let registry = Registry::with_state(adapter, state_path.clone());
+    registry.load_state();
+
+    assert!(
+        !registry.layouts().iter().any(|(id, _)| *id == ghost),
+        "a layout for an unknown agent must be dropped"
+    );
+    assert_eq!(
+        registry.layouts().len(),
+        1,
+        "the real agent's layout still loads"
+    );
+}
+
+/// Anti-churn: the client re-sends its layout on every reconcile, so an unconditional save would
+/// write `state.json` on every resize and focus move. Only a real change touches the disk.
+#[tokio::test]
+async fn resending_an_unchanged_layout_does_not_rewrite_state() {
+    let tmp = tempfile::tempdir().unwrap();
+    let repo = tmp.path().join("repo");
+    std::fs::create_dir(&repo).unwrap();
+    init_repo(&repo);
+    let state_path = tmp.path().join("state.json");
+
+    let worktrees = WorktreeService::with_base(&repo, tmp.path().join("wt")).unwrap();
+    let adapter = Box::new(ClaudeAdapter::with_command(vec!["cat".into()]));
+    let registry = Registry::with_state(adapter, state_path.clone());
+    let repo_id = registry.register(worktrees).id;
+    let info = registry.create(repo_id, "feature", None).unwrap();
+
+    let layout = Layout::Leaf {
+        terminal: Some(info.primary_terminal),
+    };
+    registry.set_layout(info.id, Some(layout.clone()));
+    assert!(state_path.exists(), "the first layout is persisted");
+
+    // Removing the file makes a subsequent write unmissable.
+    std::fs::remove_file(&state_path).unwrap();
+    registry.set_layout(info.id, Some(layout));
+    assert!(
+        !state_path.exists(),
+        "re-sending the same layout must not rewrite state.json"
+    );
+
+    // A genuine change still persists.
+    registry.set_layout(info.id, Some(Layout::Leaf { terminal: None }));
+    assert!(state_path.exists(), "a changed layout is written");
+}
+
 /// End-to-end: a dispatched task reaches the **real spawned process's argv**, last, after any
 /// flags. The other tests substitute `cat` for the CLI, and the adapter deliberately only passes a
 /// task to a literal `claude` (a positional task handed to `$SHELL` would be run as a script) — so
