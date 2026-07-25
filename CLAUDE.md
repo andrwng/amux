@@ -60,7 +60,7 @@ These come from `DESIGN.md` §2. Each is tagged with the crate that owns it.
    New runtime state lives in the daemon and reaches clients only as a `DaemonMsg`.
 3. **The daemon↔client boundary is `amux-proto` — and only that.** Never leak internal types across
    the wire. Any change to a wire message bumps `PROTO_VERSION` (`amux-proto/src/lib.rs`, currently
-   14) and updates the codec round-trip tests. *(Review-enforced: a missing bump compiles and
+   16) and updates the codec round-trip tests. *(Review-enforced: a missing bump compiles and
    passes CI but breaks a real client↔daemon pair — watch for it.)*
 4. **CLI-specifics live behind one seam.** Everything is agent-CLI-agnostic except `AgentAdapter`
    and `StatusSource` (`amux-core/src/adapter.rs`). Special-casing `"claude"` anywhere outside an
@@ -77,7 +77,7 @@ These come from `DESIGN.md` §2. Each is tagged with the crate that owns it.
 The map, then the recipes. Recipes name the **seam and the exemplar to copy**, not line numbers.
 
 ```
-src/main.rs              binary dispatch (TUI / daemon / hook / doctor)
+src/main.rs              binary dispatch (TUI / daemon / hook / doctor / nav / passthrough)
 crates/amux-proto/       wire only: message.rs (ClientMsg/DaemonMsg), codec.rs (framing +
                          version handshake), lib.rs (PROTO_VERSION). No logic.
 crates/amux-core/        domain: agent.rs (Agent + AgentState + next_state), adapter.rs
@@ -99,10 +99,36 @@ crates/amux-tui/         ratatui client: app.rs (view model), client.rs (proto c
 - **Add a daemon capability.** Follow the per-agent task ownership + cancellation model in
   `registry.rs` (`DESIGN.md` §5.2); persist any new durable state to `~/.amux/state.json`.
 - **Add a TUI surface or keybinding.** The view model in `app.rs` is a projection — mutate it only
-  from `DaemonMsg`s. Keymaps are config-driven, not hard-coded. Add a `ratatui` `TestBackend` +
-  `insta` snapshot for new rendering. See `DESIGN.md` §7.
+  from `DaemonMsg`s. Keys are handled in `app.rs` (`key_sidebar` / `key_prefix` / the global chords
+  in `on_key`); add a `ratatui` `TestBackend` snapshot for new rendering, and add the key to the
+  matching README table. See `DESIGN.md` §7.
+- **Add a CLI subcommand.** `src/main.rs` is thin dispatch — the work lives in a crate. If a user
+  would ever type it, it goes in the README's "Command line"; internal helpers (`nav`,
+  `passthrough`) are marked `(internal)` in the clap help and stay out.
 - **Add a config knob (resist this — YAGNI).** Two-level merge, global + per-repo, via `config.rs`
-  / `paths.rs`. Add a parse/merge test. Fewer knobs than grove is a goal, not an accident.
+  / `paths.rs`. Add a parse/merge test, and document the knob in the README's "Configuration".
+  Fewer knobs than grove is a goal, not an accident.
+
+## The README is the user's front door
+
+`README.md` answers exactly one question — *how do I use this?* — for someone who has never run
+amux. Keep it that way; it drifts fast, and a stale shortcut table is worse than no table.
+
+- **Describe what amux *is*, never what it's planned to be.** No phases, no roadmap, no build-plan
+  links, no milestone status. `DESIGN.md` and `docs/PHASE-*.md` are ours, not the user's — the
+  README carries at most one pointer to `DESIGN.md`, at the bottom, under Development.
+- **Getting-familiar, not exhaustive.** A feature earns its key or command, one line of what it
+  does, and the section it belongs to. Mechanism, edge cases, invariants and rationale stay in
+  `DESIGN.md` or the code. `H` gets the row *"new HEAD session in the selected repo (no worktree,
+  no branch)"* — and not a word about singleton-per-repo, out-of-tree hook settings, or the §2
+  isolation waiver.
+- **Fold in, don't accrete.** New capability belongs inside an existing section (the three panels ·
+  agents and worktrees · navigation · shortcuts · command line · configuration). Reaching for a new
+  top-level section means you're either adding a genuinely new *kind* of thing (rare) or writing
+  design notes in the wrong file.
+- **The tables are a spec, so verify them against the code**, not against the previous table —
+  they have silently fallen behind before. Read the key handlers in `app.rs` and the clap enum in
+  `src/main.rs`; if a row no longer matches, fix it while you're there.
 
 ## Conventions
 
@@ -140,6 +166,10 @@ cargo test --workspace
 - **Every bug earns a regression test** — especially in status detection. The test must fail
   before your fix and pass after.
 - **Tests ride the change.** Never defer them to "a later phase." See `DESIGN.md` §12.
+- **The README rides the change too.** If you added or changed anything the user touches — a key,
+  a `Ctrl+B` binding, a subcommand, a panel, a config knob — the README says so *in the same
+  commit*, at the altitude described above. Same standing as the tests: a user-visible change with
+  a stale README is not done.
 - If you changed runtime behavior, drive it end-to-end and confirm the observable result — a green
   test suite is necessary, not sufficient (`verification-before-completion`).
 
