@@ -163,6 +163,16 @@ cargo test --workspace
 
 - The pre-commit hook (`./.githooks/setup`) runs the first two locally; CI runs all four on
   **Ubuntu and macOS**. Cross-platform breakage fails the build.
+- **A finished feature exits on green CI, not on green local.** Local runs cover one OS, and CI
+  sets `RUSTFLAGS: -D warnings` for *every* step — so a warning that merely prints locally fails
+  there. Watch the run and fix what it reports before you call the feature done:
+  - CI fires on **pull requests** and on pushes to `main` (`.github/workflows/ci.yml`). A feature
+    branch pushed with no PR open gets **no run at all** — pushing is not the same as verifying.
+  - `gh run list --branch <branch> --limit 1` finds it; `gh run watch` follows it to completion;
+    `gh run view --log-failed` gets the failing output. If `gh` isn't authenticated, say the run is
+    **unverified** and ask the user to check — never infer a pass from a green local run.
+  - Pushing and opening a PR need the user's go-ahead (see "Always stop and confirm"). If they
+    haven't asked for one, stop at local green and say plainly that CI has not run yet.
 - **Every bug earns a regression test** — especially in status detection. The test must fail
   before your fix and pass after.
 - **Tests ride the change.** Never defer them to "a later phase." See `DESIGN.md` §12.
