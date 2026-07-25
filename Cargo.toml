@@ -60,12 +60,3 @@ amux-daemon = { workspace = true }
 amux-tui = { workspace = true }
 anyhow = { workspace = true }
 clap = { workspace = true }
-
-# The Phase 0.1 spike (examples/spike.rs) is a throwaway that owns the render stack here
-# so the shipped `amux` binary stays lean until amux-tui takes over (Phase 0.5).
-[dev-dependencies]
-anyhow = { workspace = true }
-portable-pty = { workspace = true }
-vt100 = { workspace = true }
-tui-term = { workspace = true }
-ratatui = { workspace = true }

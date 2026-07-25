@@ -14,7 +14,6 @@ those as the ones most likely to bite.
 
 ```sh
 cargo run                                              # the amux TUI (auto-spawns the daemon)
-cargo run --example spike                              # Phase 0.1 PTY↔render spike (Ctrl-Q quits)
 ./.githooks/setup                                      # once per clone: enable the pre-commit hook
 
 cargo fmt --all -- --check                             # \ 

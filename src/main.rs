@@ -1,8 +1,6 @@
 //! `amux` — the single shipped binary (like `git`), dispatching to the TUI client, the
-//! background daemon, and the hook bridge. See `docs/DESIGN.md` §3.
-//!
-//! Phase 0.1: subcommands are scaffolded but not yet implemented. The working artifact for
-//! this milestone is the throwaway spike — run `cargo run --example spike`.
+//! background daemon, the hook bridge, and the editor-integration helpers. Thin: every
+//! subcommand's work lives in a crate. See `docs/DESIGN.md` §3.
 
 use std::path::PathBuf;
 

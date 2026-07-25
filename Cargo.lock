@@ -25,10 +25,6 @@ dependencies = [
  "amux-tui",
  "anyhow",
  "clap",
- "portable-pty",
- "ratatui",
- "tui-term",
- "vt100",
 ]
 
 [[package]]
