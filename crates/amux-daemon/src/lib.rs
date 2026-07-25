@@ -71,7 +71,9 @@ pub fn run_blocking(repo: PathBuf) -> Result<()> {
 
     let runtime = tokio::runtime::Runtime::new().context("build tokio runtime")?;
     runtime.block_on(async move {
-        let listener = server::bind_or_detect(&socket)?;
+        // Arbitrates against a daemon already on the socket: refuses to start behind a compatible
+        // one, evicts an incompatible one (the reinstall case) so it cannot linger with its PTYs.
+        let listener = server::bind_or_detect(&socket, &pidfile).await?;
         std::fs::set_permissions(&socket, std::fs::Permissions::from_mode(0o600)).ok();
         let hook_listener = mailbox::bind_mailbox(&mailbox)?;
         std::fs::set_permissions(&mailbox, std::fs::Permissions::from_mode(0o600)).ok();

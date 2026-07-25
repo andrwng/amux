@@ -1,7 +1,12 @@
 //! Connecting to the repo's daemon: discover the git repo from the cwd, connect to the control
 //! socket, and handshake. If no usable daemon answers — absent, stale, or an incompatible
-//! protocol version — clear the socket and auto-spawn a fresh `amux daemon --repo <root>`, so a
-//! leftover daemon from an older build never wedges the client.
+//! protocol version — auto-spawn a fresh `amux daemon --repo <root>`, so a leftover daemon from
+//! an older build never wedges the client.
+//!
+//! **The client never clears the socket itself.** Unlinking it here is what used to orphan the
+//! previous daemon: the name became free, a new daemon bound it, and the old process kept running
+//! unreachably with its PTYs and agent processes. Arbitration belongs to the daemon that binds —
+//! see `amux-daemon`'s `bind_or_detect`, which probes and evicts.
 
 use std::path::{Path, PathBuf};
 use std::time::Duration;
@@ -28,9 +33,9 @@ pub async fn connect() -> Result<(Connection, PathBuf)> {
         return Ok((connection, repo));
     }
 
-    // Otherwise the daemon is absent, stale, or speaks a different protocol version. Clear the
-    // socket so a fresh daemon can bind it, then spawn one and wait for it to come up.
-    std::fs::remove_file(&socket).ok();
+    // Otherwise the daemon is absent, stale, or speaks a different protocol version. Spawn one and
+    // wait for it to come up; it arbitrates over the socket (evicting an incompatible predecessor)
+    // rather than us unlinking the socket out from under a process that would then be unreachable.
     spawn_daemon(&repo).await?;
     for _ in 0..100 {
         tokio::time::sleep(Duration::from_millis(20)).await;

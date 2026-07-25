@@ -348,11 +348,21 @@ Why this is good:
 ### 5.5 Persistence & restart honesty
 
 - **Client restart**: free. The daemon keeps running; reattach restores everything including
-  layout (which agent is in main, which minis are open).
+  layout (which agent is in main, which minis are open). This is also what an ungraceful SSH
+  disconnect looks like — the daemon is double-forked and `setsid`, so the client's `SIGHUP`
+  never reaches it, and agents keep working until you reconnect.
 - **Daemon restart / crash**: child processes die with it (they are its children). We persist
   agent metadata + `ai_session_id` to `~/.amux/state.json`, so on restart the daemon offers
   **resume** (`claude --resume <id>`) rather than silently losing work. Full crash-survival
   (re-parentable agents) is explicitly **out of scope v1**; noted as future work.
+- **Upgrade / reinstall**: the daemon that binds the control socket arbitrates. `bind_or_detect`
+  probes an already-bound socket with a real `Hello`: a **compatible** daemon means this one is
+  redundant and refuses to start; an **incompatible** one (a `PROTO_VERSION` bump, or a wedged
+  process that won't answer) is SIGTERM'd via its pidfile, awaited, then SIGKILL'd, and we take
+  the socket. The client must **never** unlink the socket itself — doing so was how a reinstall
+  orphaned the previous daemon, which then kept its PTYs and agent processes alive and unreachable
+  forever. Eviction sanity-checks that the pid is an amux process first, because ungraceful
+  teardown (an SSH drop, a reboot) leaves stale pidfiles and pids get reused.
 
 ---
 

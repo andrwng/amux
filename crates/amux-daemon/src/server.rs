@@ -5,12 +5,14 @@
 
 use std::collections::HashMap;
 use std::io::ErrorKind;
-use std::os::unix::net::UnixStream as StdUnixStream;
 use std::path::Path;
 use std::sync::Arc;
+use std::time::Duration;
 
 use anyhow::{bail, Context, Result};
 use futures::{SinkExt, StreamExt};
+use nix::sys::signal::{kill, Signal};
+use nix::unistd::Pid;
 use tokio::net::{UnixListener, UnixStream};
 use tokio::sync::broadcast::error::RecvError;
 use tokio::sync::mpsc;
@@ -18,26 +20,185 @@ use tokio::task::JoinHandle;
 use tokio_util::codec::Framed;
 
 use amux_core::agent::TerminalId;
-use amux_proto::{check_version, ClientMsg, DaemonMsg, ServerCodec, Size, PROTO_VERSION};
+use amux_proto::{
+    check_version, ClientCodec, ClientMsg, DaemonMsg, ServerCodec, Size, PROTO_VERSION,
+};
 
 use crate::registry::{DeleteOutcome, Registry};
 
-/// Bind the control socket, detecting whether a live daemon already owns it.
-pub fn bind_or_detect(path: &Path) -> Result<UnixListener> {
-    match UnixListener::bind(path) {
+/// How long to wait for a daemon to answer the probe handshake. It only has to serialize a
+/// `Hello` it has already built, so anything slower is wedged, not busy.
+const PROBE_TIMEOUT: Duration = Duration::from_secs(2);
+/// How long an evicted daemon gets to shut down cleanly (save state, terminate its agents) after
+/// SIGTERM, before we escalate to SIGKILL.
+const EVICT_GRACE: Duration = Duration::from_secs(5);
+/// How often to re-check whether the evicted daemon has exited.
+const EVICT_POLL: Duration = Duration::from_millis(50);
+
+/// What answered (or failed to answer) on an already-bound control socket.
+enum Probe {
+    /// A daemon speaking our exact protocol version — the socket is legitimately taken.
+    Compatible,
+    /// Something is listening, but we cannot talk to it: a different `PROTO_VERSION` (the reinstall
+    /// case), an undecodable frame, or no answer at all.
+    Incompatible,
+    /// Nothing is behind the socket file — a crash left it on disk.
+    Dead,
+}
+
+/// Bind the control socket, arbitrating against whatever already owns it.
+///
+/// A *compatible* daemon means this one is redundant and refuses to start. An *incompatible* one —
+/// the reinstall case, where the new binary bumped `PROTO_VERSION` — is terminated via `pidfile`
+/// before we take the socket. That eviction is the whole point: unlinking the socket and walking
+/// away (what the client used to do) leaves the old daemon running unreachably, holding its PTYs
+/// and agent processes forever.
+pub async fn bind_or_detect(socket: &Path, pidfile: &Path) -> Result<UnixListener> {
+    match UnixListener::bind(socket) {
         Ok(listener) => Ok(listener),
-        Err(e) if e.kind() == ErrorKind::AddrInUse => match StdUnixStream::connect(path) {
-            Ok(_) => bail!(
+        Err(e) if e.kind() == ErrorKind::AddrInUse => match probe(socket).await {
+            Probe::Compatible => bail!(
                 "an amux daemon is already running (socket {})",
-                path.display()
+                socket.display()
             ),
-            Err(_) => {
-                std::fs::remove_file(path).ok();
-                UnixListener::bind(path).context("rebind after removing stale socket")
+            Probe::Incompatible => {
+                evict(pidfile).await;
+                rebind(socket).context("rebind after evicting the previous daemon")
             }
+            Probe::Dead => rebind(socket).context("rebind after removing stale socket"),
         },
         Err(e) => Err(e).context("bind control socket"),
     }
+}
+
+/// Unlink the socket path and bind a fresh one. Safe even while a doomed process still holds the
+/// old inode: the name is what clients resolve, and the old inode dies with its listener.
+fn rebind(socket: &Path) -> Result<UnixListener> {
+    std::fs::remove_file(socket).ok();
+    UnixListener::bind(socket).map_err(Into::into)
+}
+
+/// Ask whoever owns the socket whether we can talk to them, using the real handshake.
+///
+/// Deliberately duplicates `amux-tui`'s `try_handshake` rather than sharing it: the dependency
+/// direction is `amux-tui → amux-proto ← amux-daemon` (DESIGN §2.7), and the daemon must not grow
+/// an edge to the client to save twenty lines.
+async fn probe(socket: &Path) -> Probe {
+    let Ok(stream) = UnixStream::connect(socket).await else {
+        return Probe::Dead;
+    };
+    let mut framed = Framed::new(stream, ClientCodec::new());
+    let exchange = async {
+        framed
+            .send(ClientMsg::Hello {
+                proto_version: PROTO_VERSION,
+            })
+            .await
+            .ok()?;
+        framed.next().await
+    };
+    match tokio::time::timeout(PROBE_TIMEOUT, exchange).await {
+        Ok(Some(Ok(DaemonMsg::Hello { proto_version }))) if proto_version == PROTO_VERSION => {
+            Probe::Compatible
+        }
+        // A mismatched `Hello`, a rejection `Error`, a frame our codec cannot decode (postcard is
+        // positional, so an older enum layout decodes as garbage), a closed connection, or silence.
+        _ => Probe::Incompatible,
+    }
+}
+
+/// Terminate the daemon named by `pidfile`: SIGTERM, wait out [`EVICT_GRACE`] so it can save state
+/// and shut its agents down, then SIGKILL. Best-effort — a missing or stale pidfile is logged and
+/// we bind anyway, which is no worse than the behavior this replaces.
+///
+/// Signalling by pid is only as trustworthy as the pidfile. We know *something* is listening (the
+/// caller saw `AddrInUse` and connected), and the pidfile is written by the process that binds and
+/// removed when it exits cleanly, so a mismatch needs two failures at once. We still refuse to
+/// signal ourselves.
+async fn evict(pidfile: &Path) {
+    let pid = match std::fs::read_to_string(pidfile) {
+        Ok(contents) => match contents.trim().parse::<i32>() {
+            Ok(pid) => pid,
+            Err(e) => {
+                tracing::warn!("unreadable pidfile {}: {e}", pidfile.display());
+                return;
+            }
+        },
+        Err(e) => {
+            tracing::warn!(
+                "no pidfile at {} — cannot evict the previous daemon: {e}",
+                pidfile.display()
+            );
+            return;
+        }
+    };
+    if pid == std::process::id() as i32 {
+        tracing::warn!("pidfile names this process ({pid}); not evicting");
+        return;
+    }
+    if !looks_like_amux(pid) {
+        tracing::warn!("pid {pid} in {} is not an amux process; not evicting (stale pidfile with a reused pid)", pidfile.display());
+        return;
+    }
+
+    tracing::info!("evicting incompatible daemon (pid {pid})");
+    if kill(Pid::from_raw(pid), Signal::SIGTERM).is_err() {
+        return; // already gone
+    }
+
+    let deadline = tokio::time::Instant::now() + EVICT_GRACE;
+    while tokio::time::Instant::now() < deadline {
+        if !alive(pid) {
+            tracing::info!("previous daemon (pid {pid}) exited");
+            return;
+        }
+        tokio::time::sleep(EVICT_POLL).await;
+    }
+
+    tracing::warn!("daemon {pid} ignored SIGTERM for {EVICT_GRACE:?}; sending SIGKILL");
+    let _ = kill(Pid::from_raw(pid), Signal::SIGKILL);
+    // Give the kernel a moment to tear it down so the socket is free before we rebind.
+    for _ in 0..20 {
+        if !alive(pid) {
+            return;
+        }
+        tokio::time::sleep(EVICT_POLL).await;
+    }
+    tracing::warn!("daemon {pid} still present after SIGKILL");
+}
+
+/// Whether `pid` still exists. Signal 0 checks for the process without delivering anything.
+fn alive(pid: i32) -> bool {
+    kill(Pid::from_raw(pid), None).is_ok()
+}
+
+/// Whether `pid` is running an `amux` binary — a sanity check before signalling.
+///
+/// The pidfile is only as good as the last shutdown, and amux is routinely used over SSH, where
+/// disconnects are not graceful: a daemon killed outright leaves its pidfile behind, and the pid
+/// can later be reused by something else entirely. Eviction only ever triggers when a *listener*
+/// we can't talk to owns the socket, so a wrong pid needs two failures at once — but SIGTERMing an
+/// unrelated process is bad enough to be worth one `ps`.
+///
+/// Fails **open**: if `ps` is missing or unreadable we proceed with the eviction, since leaving an
+/// unreachable daemon running is the bug we came here to fix. `comm` is the executable name on
+/// Linux and its path on macOS, so match on the final path component.
+fn looks_like_amux(pid: i32) -> bool {
+    let Ok(out) = std::process::Command::new("ps")
+        .args(["-o", "comm=", "-p", &pid.to_string()])
+        .output()
+    else {
+        return true;
+    };
+    if !out.status.success() {
+        return true;
+    }
+    let comm = String::from_utf8_lossy(&out.stdout);
+    let comm = comm.trim();
+    if comm.is_empty() {
+        return true;
+    }
+    comm.rsplit('/').next().unwrap_or(comm).contains("amux")
 }
 
 /// Accept clients forever, each on its own task.
