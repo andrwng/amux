@@ -98,6 +98,7 @@ async fn create_agent(client: &mut Client, repo: RepoId, branch: &str) -> AgentI
         .send(ClientMsg::CreateAgent {
             repo,
             branch: branch.into(),
+            prompt: None,
         })
         .await
         .unwrap();
@@ -821,8 +822,8 @@ async fn two_repos_keep_their_agents_separate() {
     let b = registry.register(make("beta"));
     assert_ne!(a.id, b.id, "distinct repos get distinct ids");
 
-    let agent_a = registry.create(a.id, "feat/a").unwrap();
-    let agent_b = registry.create(b.id, "feat/b").unwrap();
+    let agent_a = registry.create(a.id, "feat/a", None).unwrap();
+    let agent_b = registry.create(b.id, "feat/b", None).unwrap();
     assert_eq!(agent_a.repo, a.id);
     assert_eq!(agent_b.repo, b.id);
 
@@ -837,7 +838,7 @@ async fn two_repos_keep_their_agents_separate() {
     assert!(tmp.path().join("beta-wt").join("feat-b").exists());
 
     // A duplicate agent on the same (repo, branch) is refused with a clear message.
-    let dup = registry.create(a.id, "feat/a").unwrap_err();
+    let dup = registry.create(a.id, "feat/a", None).unwrap_err();
     assert!(
         dup.to_string().contains("already exists"),
         "duplicate branch should be refused: {dup}"
@@ -1020,8 +1021,8 @@ async fn durable_state_survives_a_daemon_restart() {
         let adapter = Box::new(ClaudeAdapter::with_command(vec!["cat".into()]));
         let registry = Registry::with_state(adapter, state_path.clone());
         let repo_id = registry.register(worktrees).id;
-        let info = registry.create(repo_id, "feature").unwrap();
-        let mini = registry.create(repo_id, "mini").unwrap();
+        let info = registry.create(repo_id, "feature", None).unwrap();
+        let mini = registry.create(repo_id, "mini", None).unwrap();
         registry.set_minis(vec![mini.id]);
         registry.set_active(Some(info.id));
         registry.focus(Some(info.id));
@@ -1073,6 +1074,136 @@ async fn durable_state_survives_a_daemon_restart() {
     );
 }
 
+/// End-to-end: a dispatched task reaches the **real spawned process's argv**, last, after any
+/// flags. The other tests substitute `cat` for the CLI, and the adapter deliberately only passes a
+/// task to a literal `claude` (a positional task handed to `$SHELL` would be run as a script) — so
+/// only a shim named `claude` on `PATH` can observe the whole daemon → adapter → PTY path.
+#[tokio::test]
+async fn a_dispatched_task_reaches_the_spawned_process() {
+    let tmp = tempfile::tempdir().unwrap();
+    let repo = tmp.path().join("repo");
+    std::fs::create_dir(&repo).unwrap();
+    init_repo(&repo);
+
+    // A fake `claude` that records its arguments and then idles (so the PTY stays open).
+    let bin = tmp.path().join("bin");
+    std::fs::create_dir(&bin).unwrap();
+    let argv_file = tmp.path().join("argv.txt");
+    let shim = bin.join("claude");
+    std::fs::write(
+        &shim,
+        format!(
+            "#!/bin/sh\nprintf '%s\\n' \"$@\" > {}\nexec cat\n",
+            argv_file.display()
+        ),
+    )
+    .unwrap();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&shim, std::fs::Permissions::from_mode(0o755)).unwrap();
+    }
+    // Prepend (never replace) so `cat` and friends still resolve for every other test.
+    let path = std::env::var("PATH").unwrap_or_default();
+    std::env::set_var("PATH", format!("{}:{}", bin.display(), path));
+
+    let worktrees = WorktreeService::with_base(&repo, tmp.path().join("wt")).unwrap();
+    // The default adapter — command `claude`, which now resolves to the shim.
+    let registry = Registry::new(Box::new(ClaudeAdapter::default()));
+    let repo_id = registry.register(worktrees).id;
+
+    let task = "fix the flaky config_home test";
+    registry.create(repo_id, "dispatched", Some(task)).unwrap();
+
+    let recorded = tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            if let Ok(s) = std::fs::read_to_string(&argv_file) {
+                if !s.is_empty() {
+                    return s;
+                }
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("the shim recorded its argv");
+
+    let args: Vec<&str> = recorded.lines().collect();
+    assert_eq!(
+        args.last(),
+        Some(&task),
+        "the task is the final argument, got {args:?}"
+    );
+}
+
+/// A dispatched agent's task is **durable**. `ai_session_id` only arrives from a hook, so an agent
+/// that dies before its first hook fires has nothing to `--resume` — without a persisted prompt it
+/// would relaunch into an empty session with its task lost, which is exactly the dispatch-time
+/// failure (a crash at boot). Asserted against `state.json` directly: the prompt is deliberately
+/// not on the wire, since no client ever needs it back.
+#[tokio::test]
+async fn a_dispatched_task_survives_a_daemon_restart() {
+    let tmp = tempfile::tempdir().unwrap();
+    let repo = tmp.path().join("repo");
+    std::fs::create_dir(&repo).unwrap();
+    init_repo(&repo);
+    let wt_base = tmp.path().join("wt");
+    let state_path = tmp.path().join("state.json");
+
+    let task = "fix the flaky config_home test";
+    let dispatched = {
+        let worktrees = WorktreeService::with_base(&repo, &wt_base).unwrap();
+        let adapter = Box::new(ClaudeAdapter::with_command(vec!["cat".into()]));
+        let registry = Registry::with_state(adapter, state_path.clone());
+        let repo_id = registry.register(worktrees).id;
+        // One agent dispatched with a task, one created the conversational way.
+        let dispatched = registry.create(repo_id, "dispatched", Some(task)).unwrap();
+        registry.create(repo_id, "conversational", None).unwrap();
+        dispatched
+    };
+
+    let prompt_of = |path: &std::path::Path, id: AgentId| -> Option<String> {
+        let v: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(path).unwrap()).unwrap();
+        v["agents"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|a| a["id"].as_str() == Some(&id.to_full_string()))
+            .and_then(|a| a["prompt"].as_str())
+            .map(str::to_string)
+    };
+
+    assert_eq!(
+        prompt_of(&state_path, dispatched.id).as_deref(),
+        Some(task),
+        "the task is written to state.json"
+    );
+
+    // Reload into a fresh daemon and force a re-save: the task must survive the round trip, not
+    // just the first write.
+    let adapter = Box::new(ClaudeAdapter::with_command(vec!["cat".into()]));
+    let registry = Registry::with_state(adapter, state_path.clone());
+    registry.load_state();
+    registry.focus(Some(dispatched.id)); // any mutation that triggers save()
+
+    assert_eq!(
+        prompt_of(&state_path, dispatched.id).as_deref(),
+        Some(task),
+        "the task survives load → save"
+    );
+    let conversational = registry
+        .infos()
+        .into_iter()
+        .find(|a| a.branch.as_deref() == Some("conversational"))
+        .expect("the conversational agent reloaded");
+    assert_eq!(
+        prompt_of(&state_path, conversational.id),
+        None,
+        "an agent created without a task carries no prompt"
+    );
+}
+
 /// `resume()` re-stamps `last_opened` (same MRU reasoning as `focus()`): a reconnecting client
 /// should see the resumed agent jump to the top of the sidebar immediately, not only after the
 /// next reconnect. Drives the real wire path — `ClientMsg::ResumeAgent` over a connected client —
@@ -1092,7 +1223,7 @@ async fn resuming_an_agent_stamps_last_opened_and_broadcasts() {
         let adapter = Box::new(ClaudeAdapter::with_command(vec!["cat".into()]));
         let registry = Registry::with_state(adapter, state_path.clone());
         let repo_id = registry.register(worktrees).id;
-        let info = registry.create(repo_id, "feature").unwrap();
+        let info = registry.create(repo_id, "feature", None).unwrap();
         (info.id, info.last_opened)
     };
 

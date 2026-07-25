@@ -66,7 +66,9 @@ keystroke is typed into that terminal, except three reserved chords — `Ctrl+Q`
 ### Agents and worktrees
 
 `n` in the sidebar creates an agent: amux makes a git worktree for the branch you name, launches
-the agent CLI in it, and adds it to the roster. Agents are durable — if one exits (or the daemon
+the agent CLI in it, and adds it to the roster. `Tab` moves to a second field where you can give
+the agent its task up front — it starts working immediately, so you can dispatch several in a row
+without leaving the sidebar. Leave the task empty to get an agent idling at its prompt instead. Agents are durable — if one exits (or the daemon
 restarts), it goes **suspended**, not away: the worktree and conversation id survive, and `r`
 resumes it in place. `d` is the only destructive command, and it asks before discarding
 uncommitted work.
@@ -100,7 +102,7 @@ Everywhere: `Ctrl+Q` quit · `Ctrl+h/j/k/l` move focus · `Ctrl+B` command prefi
 | `j`/`k` or arrows | move the selection |
 | `Enter` or `l` | open the agent in the main area |
 | `m` | open the agent as a mini |
-| `n` | new agent in the selected repo (prompts for a branch) |
+| `n` | new agent in the selected repo (prompts for a branch, and an optional task to start it on) |
 | `N` | new agent in a repo by path (prompts for directory + branch; `Tab` switches fields) |
 | `H` | new HEAD session in the selected repo (no worktree, no branch) |
 | `d` | delete the agent (asks `y/n` before discarding uncommitted work) |

@@ -138,9 +138,15 @@ fn handle_command(
         ClientMsg::AddRepo { path } => {
             report_err(register_repo(registry, &path));
         }
-        ClientMsg::CreateAgent { repo, branch } => {
-            report_err(registry.create(repo, &branch).map(|_| ()))
-        }
+        ClientMsg::CreateAgent {
+            repo,
+            branch,
+            prompt,
+        } => report_err(
+            registry
+                .create(repo, &branch, prompt.as_deref())
+                .map(|_| ()),
+        ),
         ClientMsg::CreateAgentAt { path, branch } => {
             report_err(registry.create_at(&path, &branch).map(|_| ()))
         }

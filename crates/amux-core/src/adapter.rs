@@ -24,6 +24,10 @@ pub struct LaunchContext<'a> {
     pub branch: Option<&'a str>,
     /// A prior session id to resume, if the adapter supports it.
     pub resume: Option<&'a str>,
+    /// The task to start the agent on, handed to the CLI at launch so a dispatched agent is
+    /// already working. Mutually exclusive with [`Self::resume`]: replaying the task onto a
+    /// resumed conversation would inject it as a fresh turn into a session that already has it.
+    pub prompt: Option<&'a str>,
     /// The agent's full id (round-trippable), exported so its hooks tag reports with it.
     pub agent_id: &'a str,
     /// Hook mailbox wiring; `None` disables hook integration (tests, hookless CLIs).
@@ -101,10 +105,11 @@ impl AgentAdapter for ClaudeAdapter {
 
     fn spawn_spec(&self, ctx: &LaunchContext) -> SpawnSpec {
         let mut command = self.command.clone();
+        let is_claude =
+            self.kind() == "claude-code" && command.first().map(String::as_str) == Some("claude");
         // `claude --resume <id>` when resuming a known session.
         if let Some(id) = ctx.resume {
-            if self.kind() == "claude-code" && command.first().map(String::as_str) == Some("claude")
-            {
+            if is_claude {
                 command.push("--resume".to_string());
                 command.push(id.to_string());
             }
@@ -115,6 +120,15 @@ impl AgentAdapter for ClaudeAdapter {
         if let Some(path) = ctx.settings_path {
             command.push("--settings".to_string());
             command.push(path.to_string_lossy().into_owned());
+        }
+        // The task to start on — `claude [flags] <prompt>` (interactive; `-p` would make it
+        // one-shot). Last, after every flag, since a value-taking flag like `--settings` would
+        // otherwise swallow it. Never alongside `--resume`: that conversation already contains the
+        // task, so re-sending would inject it as a fresh turn.
+        if let (Some(task), None) = (ctx.prompt, ctx.resume) {
+            if is_claude {
+                command.push(task.to_string());
+            }
         }
         // TERM/COLORTERM are owned by the daemon's PTY layer (it advertises a screen-family
         // terminal so apps fill backgrounds), so they're deliberately not set here.
@@ -199,10 +213,100 @@ mod tests {
             worktree,
             branch: Some(branch),
             resume,
+            prompt: None,
             agent_id: "agent-1",
             hooks: None,
             settings_path: None,
         }
+    }
+
+    /// A launch context carrying a task, with everything else at its test default.
+    fn ctx_with_prompt<'a>(
+        worktree: &'a Path,
+        resume: Option<&'a str>,
+        prompt: &'a str,
+    ) -> LaunchContext<'a> {
+        LaunchContext {
+            worktree,
+            branch: Some("feat/x"),
+            resume,
+            prompt: Some(prompt),
+            agent_id: "agent-1",
+            hooks: None,
+            settings_path: None,
+        }
+    }
+
+    #[test]
+    fn prompt_is_appended_as_the_final_argument() {
+        let adapter = ClaudeAdapter::default();
+        let spec = adapter.spawn_spec(&ctx_with_prompt(
+            Path::new("/tmp/wt/x"),
+            None,
+            "fix the flaky config_home test",
+        ));
+        assert_eq!(
+            spec.command,
+            vec![
+                "claude".to_string(),
+                "fix the flaky config_home test".to_string()
+            ],
+            "the task is a positional argument: `claude [flags] <task>`"
+        );
+    }
+
+    #[test]
+    fn prompt_stays_last_after_flags() {
+        // `--settings` takes a value, so a task inserted before it would be consumed as that
+        // value. The task must come after every flag.
+        let ext = tempfile::tempdir().unwrap();
+        let settings = ext.path().join("head-settings.json");
+        let adapter = ClaudeAdapter::default();
+        let lc = LaunchContext {
+            worktree: Path::new("/tmp/wt/x"),
+            branch: None,
+            resume: None,
+            prompt: Some("investigate the panic"),
+            agent_id: "agent-head",
+            hooks: None,
+            settings_path: Some(&settings),
+        };
+        let spec = adapter.spawn_spec(&lc);
+        assert_eq!(
+            spec.command.last().map(String::as_str),
+            Some("investigate the panic"),
+            "command: {:?}",
+            spec.command
+        );
+    }
+
+    /// THE regression guard: resuming a conversation must never replay the task into it.
+    #[test]
+    fn resume_drops_the_prompt() {
+        let adapter = ClaudeAdapter::default();
+        let spec = adapter.spawn_spec(&ctx_with_prompt(
+            Path::new("/tmp/wt/x"),
+            Some("sess-123"),
+            "fix the flaky test",
+        ));
+        assert_eq!(
+            spec.command,
+            vec![
+                "claude".to_string(),
+                "--resume".to_string(),
+                "sess-123".to_string()
+            ],
+            "a resumed session already contains the task — re-sending it injects a new turn"
+        );
+    }
+
+    /// The prompt is `claude` positional-argument syntax, so it must not leak into a substituted
+    /// command — `$SHELL "some task"` would try to run the task as a script.
+    #[test]
+    fn custom_command_ignores_the_prompt() {
+        let adapter = ClaudeAdapter::with_command(vec!["cat".to_string()]);
+        let spec = adapter.spawn_spec(&ctx_with_prompt(Path::new("/tmp/wt/x"), None, "a task"));
+        assert_eq!(spec.command, vec!["cat".to_string()]);
     }
 
     #[test]
@@ -250,6 +354,7 @@ mod tests {
             worktree,
             branch: Some("feat/x"),
             resume: None,
+            prompt: None,
             agent_id: "agent-xyz",
             hooks: Some(HookSetup {
                 socket: sock,
@@ -295,6 +400,7 @@ mod tests {
             worktree: tree.path(),
             branch: None,
             resume: None,
+            prompt: None,
             agent_id: "agent-head",
             hooks: Some(HookSetup {
                 socket: sock,

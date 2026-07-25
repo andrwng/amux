@@ -172,6 +172,13 @@ mod tests {
         roundtrip(ClientMsg::CreateAgent {
             repo: RepoId::from_canonical_path(&PathBuf::from("/repos/amux")),
             branch: "feat/x".into(),
+            prompt: None,
+        });
+        // Dispatch-with-a-task: the prompt rides the same message.
+        roundtrip(ClientMsg::CreateAgent {
+            repo: RepoId::from_canonical_path(&PathBuf::from("/repos/amux")),
+            branch: "feat/x".into(),
+            prompt: Some("fix the flaky config_home test".into()),
         });
         roundtrip(ClientMsg::CreateAgentAt {
             path: "/repos/other".into(),
@@ -319,6 +326,7 @@ mod tests {
                 ClientMsg::CreateAgent {
                     repo,
                     branch: "x".into(),
+                    prompt: None,
                 },
                 &mut buf,
             )
@@ -329,7 +337,8 @@ mod tests {
             codec.decode(&mut buf).unwrap(),
             Some(ClientMsg::CreateAgent {
                 repo,
-                branch: "x".into()
+                branch: "x".into(),
+                prompt: None
             })
         );
         assert_eq!(codec.decode(&mut buf).unwrap(), None);

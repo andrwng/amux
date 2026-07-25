@@ -73,7 +73,13 @@ pub enum ClientMsg {
     /// client sends this for its own working directory on connect.
     AddRepo { path: PathBuf },
     /// Create a new agent on `branch` in an already-registered repo (worktree + primary terminal).
-    CreateAgent { repo: RepoId, branch: String },
+    /// `prompt` is the task to start the agent on, handed to the CLI at launch so a dispatched
+    /// agent is already working; `None` launches it idle at its prompt (the conversational flow).
+    CreateAgent {
+        repo: RepoId,
+        branch: String,
+        prompt: Option<String>,
+    },
     /// Register the repo at `path` (idempotent) and create an agent on `branch` in it — the
     /// two-field "new agent in a new repo" flow.
     CreateAgentAt { path: PathBuf, branch: String },

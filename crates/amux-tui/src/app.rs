@@ -104,14 +104,17 @@ impl Selection {
     }
 }
 
-/// Which field the two-field "new agent in a repo by path" prompt is editing.
-#[derive(Clone, Copy, PartialEq, Eq)]
+/// Which field a two-field create prompt is editing: `dir`+`branch` for `N` (new repo by path),
+/// `branch`+`task` for `n` (dispatch into the selected repo).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum Field {
     Dir,
     Branch,
+    /// The task to dispatch the agent on — optional; empty means "launch it idle at its prompt".
+    Task,
 }
 
-#[derive(Clone, Copy, PartialEq, Eq)]
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum InputMode {
     Normal,
     /// `n` — branch-only, into the repo under the cursor (`create_repo`).
@@ -330,9 +333,10 @@ struct App {
     scroll_offset: usize,
     /// The active mouse selection (drag in progress or last completed), if any.
     selection: Option<Selection>,
-    /// Branch buffer (both `n` and `N`); repo-path buffer + focused field (`N` only).
+    /// Branch buffer (both `n` and `N`); repo-path buffer (`N` only); task buffer (`n` only).
     create_buf: String,
     dir_buf: String,
+    task_buf: String,
     create_field: Field,
     /// Target repo for the `n` flow (resolved from the cursor at prompt time).
     create_repo: Option<RepoId>,
@@ -375,6 +379,7 @@ impl App {
             selection: None,
             create_buf: String::new(),
             dir_buf: String::new(),
+            task_buf: String::new(),
             create_field: Field::Dir,
             create_repo: None,
             confirm_id: None,
@@ -733,9 +738,10 @@ impl App {
     async fn on_paste(&mut self, text: String, sink: &mut Sink) -> Result<()> {
         match self.input {
             // Prompt buffers are single-line; drop control chars so a stray newline can't submit.
+            // Routed to the focused field so a task pasted from notes lands in one shot.
             InputMode::Creating => {
-                self.create_buf
-                    .extend(text.chars().filter(|c| !c.is_control()));
+                let clean: String = text.chars().filter(|c| !c.is_control()).collect();
+                self.active_buf().push_str(&clean);
             }
             InputMode::CreatingRepo => {
                 let buf = self.active_buf();
@@ -840,6 +846,8 @@ impl App {
                 if let Some(repo) = self.selected_repo() {
                     self.create_repo = Some(repo);
                     self.create_buf.clear();
+                    self.task_buf.clear();
+                    self.create_field = Field::Branch;
                     self.input = InputMode::Creating;
                 }
             }
@@ -1199,25 +1207,37 @@ impl App {
         Ok(Flow::Continue)
     }
 
+    /// The two-field `n` prompt: `Tab` switches branch↔task, `Enter` creates. An empty task
+    /// launches the agent idle at its prompt (the conversational flow); a task dispatches it
+    /// already working. A branch is still required — `Enter` with none cancels, as before.
     async fn key_creating(&mut self, key: KeyEvent, sink: &mut Sink) -> Result<Flow> {
         match key.code {
             KeyCode::Enter => {
                 let branch = std::mem::take(&mut self.create_buf);
+                let task = std::mem::take(&mut self.task_buf);
                 let repo = self.create_repo.take();
                 self.input = InputMode::Normal;
                 if let (Some(repo), false) = (repo, branch.trim().is_empty()) {
+                    let task = task.trim();
                     sink.send(ClientMsg::CreateAgent {
                         repo,
                         branch: branch.trim().to_string(),
+                        prompt: (!task.is_empty()).then(|| task.to_string()),
                     })
                     .await?;
                 }
             }
             KeyCode::Esc => self.input = InputMode::Normal,
-            KeyCode::Backspace => {
-                self.create_buf.pop();
+            KeyCode::Tab | KeyCode::Down | KeyCode::Up => {
+                self.create_field = match self.create_field {
+                    Field::Task => Field::Branch,
+                    _ => Field::Task,
+                };
             }
-            KeyCode::Char(c) => self.create_buf.push(c),
+            KeyCode::Backspace => {
+                self.active_buf().pop();
+            }
+            KeyCode::Char(c) => self.active_buf().push(c),
             _ => {}
         }
         Ok(Flow::Continue)
@@ -1244,9 +1264,10 @@ impl App {
                 }
             }
             KeyCode::Tab | KeyCode::Down | KeyCode::Up => {
+                // `N` has no task field; anything but Dir returns to Dir.
                 self.create_field = match self.create_field {
                     Field::Dir => Field::Branch,
-                    Field::Branch => Field::Dir,
+                    _ => Field::Dir,
                 };
             }
             KeyCode::Esc => self.input = InputMode::Normal,
@@ -1263,6 +1284,7 @@ impl App {
         match self.create_field {
             Field::Dir => &mut self.dir_buf,
             Field::Branch => &mut self.create_buf,
+            Field::Task => &mut self.task_buf,
         }
     }
 
@@ -2371,8 +2393,21 @@ fn render_status(frame: &mut Frame, area: Rect, app: &App) {
             .and_then(|id| app.repos.iter().find(|r| r.id == id))
             .map(|r| r.name.as_str())
             .unwrap_or("?");
+        let cursor = |f: Field| {
+            if app.create_field == f {
+                "\u{2588}"
+            } else {
+                ""
+            }
+        };
         (
-            format!(" new agent in {repo} — branch: {}\u{2588}", app.create_buf),
+            format!(
+                " new agent in {repo} — branch: {}{}  task: {}{}  (tab switch \u{b7} enter create \u{b7} task optional)",
+                app.create_buf,
+                cursor(Field::Branch),
+                app.task_buf,
+                cursor(Field::Task),
+            ),
             Style::default().fg(Color::Black).bg(Color::Cyan),
         )
     } else if app.input == InputMode::CreatingRepo {
@@ -3504,6 +3539,107 @@ mod tests {
         assert_eq!(
             app.active_agent, None,
             "Esc after the prefix opened nothing"
+        );
+    }
+
+    /// Drive the `n` create form: type into the focused field, `Tab` to switch, `Enter` submit.
+    /// Returns the `ClientMsg` the app sent, or `None` if it sent nothing.
+    async fn run_create_form(keys: &str, tab_at: Option<usize>) -> Option<ClientMsg> {
+        use amux_proto::ServerCodec;
+        let (client_end, server_end) = UnixStream::pair().unwrap();
+        let (mut sink, _rx) = Framed::new(client_end, ClientCodec::default()).split();
+        let mut server = Framed::new(server_end, ServerCodec::default());
+
+        let (mut app, ids) = app_with_agents(1);
+        app.focus = Focus::Sidebar;
+        app.sidebar_sel = Some(Row::Agent(ids[0]));
+        app.on_key(key(KeyCode::Char('n')), &mut sink)
+            .await
+            .unwrap();
+        assert_eq!(app.input, InputMode::Creating, "`n` opens the create form");
+
+        for (i, c) in keys.chars().enumerate() {
+            if tab_at == Some(i) {
+                app.on_key(key(KeyCode::Tab), &mut sink).await.unwrap();
+            }
+            app.on_key(key(KeyCode::Char(c)), &mut sink).await.unwrap();
+        }
+        app.on_key(key(KeyCode::Enter), &mut sink).await.unwrap();
+
+        tokio::time::timeout(Duration::from_millis(200), server.next())
+            .await
+            .ok()
+            .flatten()
+            .map(|m| m.unwrap())
+    }
+
+    /// Dispatch: branch in the first field, task in the second, both reach the daemon in one
+    /// message — the whole point of the feature.
+    #[tokio::test]
+    async fn create_form_dispatches_branch_and_task() {
+        // "fix-x" then Tab then "do it"
+        let sent = run_create_form("fix-xdo it", Some(5)).await;
+        assert_eq!(
+            sent,
+            Some(ClientMsg::CreateAgent {
+                repo: RepoId::from_canonical_path(std::path::Path::new("/r")),
+                branch: "fix-x".into(),
+                prompt: Some("do it".into()),
+            })
+        );
+    }
+
+    /// The conversational flow is untouched: no task typed → no prompt on the wire.
+    #[tokio::test]
+    async fn create_form_without_a_task_sends_no_prompt() {
+        let sent = run_create_form("fix-x", None).await;
+        assert_eq!(
+            sent,
+            Some(ClientMsg::CreateAgent {
+                repo: RepoId::from_canonical_path(std::path::Path::new("/r")),
+                branch: "fix-x".into(),
+                prompt: None,
+            })
+        );
+    }
+
+    /// A branch is still required — a task alone creates nothing (cancel-on-empty is unchanged).
+    #[tokio::test]
+    async fn create_form_still_requires_a_branch() {
+        // Tab straight to the task field, type only there.
+        let sent = run_create_form("do it", Some(0)).await;
+        assert_eq!(sent, None, "no branch, no agent");
+    }
+
+    /// Both fields are visible in the prompt, so the form is discoverable.
+    #[test]
+    fn create_form_renders_both_fields() {
+        use ratatui::{backend::TestBackend, Terminal};
+        let mut app = App::new(100, 40);
+        let repo = RepoId::from_canonical_path(std::path::Path::new("/r"));
+        app.repos = vec![RepoInfo {
+            id: repo,
+            name: "r".into(),
+            path: "/r".into(),
+        }];
+        app.input = InputMode::Creating;
+        app.create_repo = Some(repo);
+        app.create_field = Field::Branch;
+        app.create_buf = "fix-x".into();
+        app.task_buf = "do it".into();
+
+        let mut term = Terminal::new(TestBackend::new(90, 1)).unwrap();
+        term.draw(|f| render_status(f, f.area(), &app)).unwrap();
+        let content: String = term
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|c| c.symbol())
+            .collect();
+        assert!(
+            content.contains("branch: fix-x") && content.contains("task: do it"),
+            "both fields render, got: {content}"
         );
     }
 

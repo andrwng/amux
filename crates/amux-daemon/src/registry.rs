@@ -81,6 +81,11 @@ struct Agent {
     workspace: Workspace,
     worktree: PathBuf,
     ai_session_id: Option<String>,
+    /// The task this agent was dispatched with, if any. Kept (not consumed) so a relaunch that
+    /// has no conversation to resume — `ai_session_id` only arrives from a hook, so an agent that
+    /// died at boot has none — starts on the same task instead of an empty session. The adapter
+    /// drops it whenever `--resume` applies, so it is passed unconditionally.
+    prompt: Option<String>,
     created_at: DateTime<Utc>,
     last_activity: DateTime<Utc>,
     /// When the user last opened (viewed) this agent — the sidebar's MRU key. Stamped on
@@ -176,6 +181,9 @@ struct PersistedAgent {
     branch: Option<String>,
     worktree: PathBuf,
     ai_session_id: Option<String>,
+    /// The task the agent was dispatched with. `default` so older `state.json` files load.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    prompt: Option<String>,
     created_at: DateTime<Utc>,
     last_activity: DateTime<Utc>,
     #[serde(default)]
@@ -397,6 +405,7 @@ impl Registry {
                         branch: a.workspace.branch().map(str::to_string),
                         worktree: a.worktree.clone(),
                         ai_session_id: a.ai_session_id.clone(),
+                        prompt: a.prompt.clone(),
                         created_at: a.created_at,
                         last_activity: a.last_activity,
                         last_opened: Some(a.last_opened),
@@ -486,6 +495,7 @@ impl Registry {
                     workspace,
                     worktree: a.worktree,
                     ai_session_id: a.ai_session_id,
+                    prompt: a.prompt,
                     created_at: a.created_at,
                     last_activity: a.last_activity,
                     last_opened: a.last_opened.unwrap_or(a.last_activity),
@@ -561,14 +571,23 @@ impl Registry {
             .and_then(|t| t.session.clone())
     }
 
-    /// Register the repo at `path` (idempotent) and create an agent on `branch` in it.
+    /// Register the repo at `path` (idempotent) and create an agent on `branch` in it. The
+    /// "new agent in a new repo" flow registers a repo rather than dispatching work, so it never
+    /// carries a task.
     pub fn create_at(self: &Arc<Self>, path: &Path, branch: &str) -> Result<AgentInfo> {
         let info = self.register_path(path, WorktreeLocation::Global)?;
-        self.create(info.id, branch)
+        self.create(info.id, branch, None)
     }
 
-    /// Create an agent in `repo`: worktree + a primary terminal running the agent CLI.
-    pub fn create(self: &Arc<Self>, repo: RepoId, branch: &str) -> Result<AgentInfo> {
+    /// Create an agent in `repo`: worktree + a primary terminal running the agent CLI. `prompt` is
+    /// the task to start it on — `Some` dispatches an agent already working, `None` launches it
+    /// idle at its prompt.
+    pub fn create(
+        self: &Arc<Self>,
+        repo: RepoId,
+        branch: &str,
+        prompt: Option<&str>,
+    ) -> Result<AgentInfo> {
         let worktrees = self.worktrees_for(repo).context("no such repo")?;
         // One agent per (repo, branch): a branch maps to a single worktree, so a duplicate would
         // just collide. Refuse early with a clear message rather than a raw git error.
@@ -592,6 +611,7 @@ impl Registry {
             worktree: &worktree,
             branch: Some(branch),
             resume: None,
+            prompt,
             agent_id: &agent_full,
             hooks: self.hook_setup(),
             settings_path: None,
@@ -623,6 +643,7 @@ impl Registry {
                 },
                 worktree,
                 ai_session_id: None,
+                prompt: prompt.map(str::to_string),
                 created_at: now,
                 last_activity: now,
                 last_opened: now,
@@ -678,6 +699,9 @@ impl Registry {
             worktree: &repo_root,
             branch: None,
             resume: None,
+            // A HEAD session is "help me with what I'm doing right now" — conversational by
+            // nature, and a singleton, so it takes no dispatched task.
+            prompt: None,
             agent_id: &agent_full,
             hooks,
             settings_path: settings.as_deref(),
@@ -707,6 +731,7 @@ impl Registry {
                 workspace: Workspace::Head,
                 worktree: repo_root,
                 ai_session_id: None,
+                prompt: None,
                 created_at: now,
                 last_activity: now,
                 last_opened: now,
@@ -889,7 +914,7 @@ impl Registry {
 
     /// Resume a suspended agent — respawn its primary terminal in the existing worktree.
     pub fn resume(self: &Arc<Self>, id: AgentId) -> Result<()> {
-        let (worktree, branch, resume_id, primary, already_live) = {
+        let (worktree, branch, resume_id, prompt, primary, already_live) = {
             let state = self.state.lock().unwrap();
             let agent = state.agents.get(&id).context("no such agent")?;
             let live = state
@@ -900,6 +925,7 @@ impl Registry {
                 agent.worktree.clone(),
                 agent.workspace.branch().map(str::to_string),
                 agent.ai_session_id.clone(),
+                agent.prompt.clone(),
                 agent.primary,
                 live,
             )
@@ -919,6 +945,10 @@ impl Registry {
             worktree: &worktree,
             branch: branch.as_deref(),
             resume: resume_id.as_deref(),
+            // Passed unconditionally: the adapter drops the task whenever `--resume` applies (a
+            // resumed conversation already contains it), so this only takes effect when there is
+            // no session to resume — an agent that died before its first hook.
+            prompt: prompt.as_deref(),
             agent_id: &agent_full,
             hooks,
             settings_path: settings.as_deref(),
