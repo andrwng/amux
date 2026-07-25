@@ -370,6 +370,10 @@ Why this is good:
   orphaned the previous daemon, which then kept its PTYs and agent processes alive and unreachable
   forever. Eviction sanity-checks that the pid is an amux process first, because ungraceful
   teardown (an SSH drop, a reboot) leaves stale pidfiles and pids get reused.
+- **Deliberate shutdown is graceful**: `shutdown_all` sends every agent `SIGTERM`, waits out a
+  shared 2s grace concurrently, then `SIGKILL`s the holdouts — so an agent can checkpoint on an
+  upgrade instead of being shot mid-write. Ungraceful teardown skips this by definition, which is
+  why durable state is written **as it changes**, never on the way out.
 
 ---
 

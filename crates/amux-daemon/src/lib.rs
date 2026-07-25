@@ -107,7 +107,8 @@ pub fn run_blocking(repo: PathBuf) -> Result<()> {
 
         // Capture any last durable changes (e.g. unread/activity) before the processes die.
         registry.save();
-        registry.shutdown_all();
+        // Graceful: agents get SIGTERM and a moment to checkpoint before they are killed.
+        registry.shutdown_all().await;
         std::fs::remove_file(&socket).ok();
         std::fs::remove_file(&mailbox).ok();
         std::fs::remove_file(&pidfile).ok();

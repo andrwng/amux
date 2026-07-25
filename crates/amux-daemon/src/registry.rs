@@ -33,6 +33,10 @@ const DEFAULT_SIZE: Size = Size { cols: 80, rows: 24 };
 /// pauses (a silent tool) rarely cause a false idle; the uncommon real miss recovers within this
 /// window, and a later hook (`PostToolUse`, etc.) corrects an over-eager idle immediately.
 const DEFAULT_IDLE_TIMEOUT: Duration = Duration::from_secs(30);
+/// How long agents get to exit on their own when the daemon shuts down deliberately, before they
+/// are killed. Long enough for a coding agent to checkpoint, short enough that a stuck one doesn't
+/// hold up an upgrade.
+const SHUTDOWN_GRACE: Duration = Duration::from_secs(2);
 
 /// Outcome of a delete request.
 pub enum DeleteOutcome {
@@ -1106,13 +1110,26 @@ impl Registry {
         Ok(DoctorReport { pruned, skipped })
     }
 
-    pub fn shutdown_all(&self) {
-        let state = self.state.lock().unwrap();
-        for terminal in state.terminals.values() {
-            if let Some(session) = &terminal.session {
-                session.kill();
-            }
-        }
+    /// Shut every live terminal down **gracefully**: SIGTERM, a shared grace period, then SIGKILL.
+    ///
+    /// Sessions are terminated concurrently under one budget, so a wedged agent delays shutdown by
+    /// [`SHUTDOWN_GRACE`] at most rather than by the sum of them. The sessions are collected out of
+    /// the lock first — holding the registry mutex across an await would block every other task.
+    pub async fn shutdown_all(&self) {
+        let sessions: Vec<Arc<Session>> = {
+            let state = self.state.lock().unwrap();
+            state
+                .terminals
+                .values()
+                .filter_map(|t| t.session.clone())
+                .collect()
+        };
+        futures::future::join_all(
+            sessions
+                .iter()
+                .map(|session| session.terminate(SHUTDOWN_GRACE)),
+        )
+        .await;
     }
 
     fn spawn_primary_monitor(

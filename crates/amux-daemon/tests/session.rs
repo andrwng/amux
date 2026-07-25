@@ -844,7 +844,7 @@ async fn two_repos_keep_their_agents_separate() {
         "duplicate branch should be refused: {dup}"
     );
 
-    registry.shutdown_all();
+    registry.shutdown_all().await;
 }
 
 #[tokio::test]
@@ -1071,6 +1071,88 @@ async fn durable_state_survives_a_daemon_restart() {
     assert!(
         registry.session(info.primary_terminal).is_some(),
         "the primary is live after resume"
+    );
+}
+
+/// A deliberate shutdown gives agents a chance to exit on their own. Before this they were
+/// SIGKILLed, so a coding agent never got to checkpoint — on an upgrade, exactly the moment you
+/// least want it shot mid-write.
+#[tokio::test]
+async fn shutdown_lets_an_agent_exit_on_sigterm() {
+    let tmp = tempfile::tempdir().unwrap();
+    let repo = tmp.path().join("repo");
+    std::fs::create_dir(&repo).unwrap();
+    init_repo(&repo);
+    let worktrees = WorktreeService::with_base(&repo, tmp.path().join("wt")).unwrap();
+
+    // An agent that traps SIGTERM, records that it caught it, and exits by its own choice.
+    let flag = tmp.path().join("caught-sigterm");
+    let adapter = Box::new(ClaudeAdapter::with_command(vec![
+        "sh".into(),
+        "-c".into(),
+        format!(
+            "trap 'touch {}; exit 0' TERM; while :; do sleep 0.05; done",
+            flag.display()
+        ),
+    ]));
+    let registry = Registry::new(adapter);
+    let repo_id = registry.register(worktrees).id;
+    let agent = registry.create(repo_id, "feat/graceful", None).unwrap();
+
+    // Let the shell install its trap before signalling.
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    assert!(registry.session(agent.primary_terminal).is_some());
+
+    let started = std::time::Instant::now();
+    registry.shutdown_all().await;
+
+    assert!(
+        flag.exists(),
+        "the agent should have received SIGTERM and handled it, not been killed outright"
+    );
+    assert!(
+        started.elapsed() < Duration::from_secs(2),
+        "a cooperating agent should not burn the whole grace period, took {:?}",
+        started.elapsed()
+    );
+}
+
+/// ...and an agent that ignores SIGTERM is still gone when the grace period is up, so an upgrade
+/// can never be blocked by a wedged process.
+#[tokio::test]
+async fn shutdown_kills_an_agent_that_ignores_sigterm() {
+    let tmp = tempfile::tempdir().unwrap();
+    let repo = tmp.path().join("repo");
+    std::fs::create_dir(&repo).unwrap();
+    init_repo(&repo);
+    let worktrees = WorktreeService::with_base(&repo, tmp.path().join("wt")).unwrap();
+
+    let adapter = Box::new(ClaudeAdapter::with_command(vec![
+        "sh".into(),
+        "-c".into(),
+        "trap '' TERM; while :; do sleep 0.05; done".into(),
+    ]));
+    let registry = Registry::new(adapter);
+    let repo_id = registry.register(worktrees).id;
+    let agent = registry.create(repo_id, "feat/stubborn", None).unwrap();
+    tokio::time::sleep(Duration::from_millis(300)).await;
+
+    let session = registry
+        .session(agent.primary_terminal)
+        .expect("the agent is live");
+    registry.shutdown_all().await;
+
+    // The SIGKILL backstop fired; the waiter thread reaps it moments later.
+    let gone = tokio::time::timeout(Duration::from_secs(5), async {
+        while !session.is_exited() {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .is_ok();
+    assert!(
+        gone,
+        "a stubborn agent must still be killed after the grace"
     );
 }
 

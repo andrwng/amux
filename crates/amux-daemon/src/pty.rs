@@ -10,6 +10,7 @@ use std::io::{Read, Write};
 use std::path::Path;
 use std::sync::{Arc, Mutex, OnceLock};
 use std::thread::{self, JoinHandle};
+use std::time::Duration;
 
 use anyhow::{Context, Result};
 use nix::sys::signal::{kill, Signal};
@@ -235,6 +236,31 @@ impl Session {
     /// Terminate the child by PID (SIGKILL). The waiter thread then reaps and flips the watch.
     pub fn kill(&self) {
         if let Some(pid) = self.pid {
+            let _ = kill(Pid::from_raw(pid as i32), Signal::SIGKILL);
+        }
+    }
+
+    /// Ask the child to exit (SIGTERM), wait up to `grace` for it, then SIGKILL.
+    ///
+    /// Used when the daemon is shutting down on purpose — an upgrade eviction, `amux daemon
+    /// --stop`, a logout. A coding agent killed outright never gets to checkpoint; SIGTERM gives
+    /// it the chance, and the deadline guarantees shutdown still completes if it doesn't take it.
+    /// Ungraceful teardown (SIGKILL, a lost SSH connection, a panic) skips this by definition,
+    /// which is why durable state is written as it changes rather than on the way out.
+    pub async fn terminate(&self, grace: Duration) {
+        let Some(pid) = self.pid else {
+            return;
+        };
+        if self.is_exited() {
+            return;
+        }
+        if kill(Pid::from_raw(pid as i32), Signal::SIGTERM).is_err() {
+            return; // already gone
+        }
+        let mut exit_rx = self.exit_rx();
+        // `changed()` resolves on the waiter thread's flip; a closed channel also means exited.
+        let _ = tokio::time::timeout(grace, exit_rx.changed()).await;
+        if !self.is_exited() {
             let _ = kill(Pid::from_raw(pid as i32), Signal::SIGKILL);
         }
     }
