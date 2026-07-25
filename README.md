@@ -151,14 +151,36 @@ amux daemon --stop  # stop the daemon and every agent it owns
 
 ## Configuration
 
-Optional, and there's only one knob. `$XDG_CONFIG_HOME/amux/config.toml` (else
-`~/.config/amux/config.toml`, on macOS as well as Linux):
+There is no config file until you write one, and amux runs fine without it. When you do want one,
+it goes at `$XDG_CONFIG_HOME/amux/config.toml` — else `~/.config/amux/config.toml`, on macOS as
+well as Linux. It holds exactly one setting today:
 
 ```toml
-root = "~/somewhere-else/.amux"   # where worktrees, state, and sockets live (default: ~/.amux)
+# ~/.config/amux/config.toml — every key is optional
+root = "~/somewhere-else/.amux"   # the amux home (default: ~/.amux). A leading ~ is expanded.
 ```
 
-`amux doctor` prints the resolved paths, so you can check the file took effect.
+**`root`** is where everything amux owns lives, and it's the answer to "how do I keep this off my
+home directory / small disk?":
+
+| Under the root | What it is |
+| --- | --- |
+| `worktrees/<repo>-<hash>/<branch>/` | one worktree per agent, kept out of your project tree |
+| `state.json` | the agent roster, layouts, and minis — what survives a daemon restart |
+| `head-settings/` | hook settings for HEAD sessions, written here so your live repo is untouched |
+| `run/` | the daemon's control + hook sockets and pidfile |
+
+Two details worth knowing:
+
+- **A configured `root` is self-contained.** Its sockets move under `<root>/run` instead of
+  `$XDG_RUNTIME_DIR`, so two different roots are two fully independent amux instances that never
+  collide. (With no `root` set, sockets prefer `$XDG_RUNTIME_DIR/amux`, else `~/.amux/run`.)
+- **Mistakes are loud, never silent.** A malformed file or an unknown key (say `roott`) is a
+  startup error rather than a shrug back to defaults — otherwise you'd believe your data had moved
+  when it hadn't. Setting `root` does not migrate anything: point it at a new path and amux starts
+  empty there, so move the old directory yourself if you want your agents to come along.
+
+Run `amux doctor` to see which config file was loaded and where the amux home resolved to.
 
 ## Development
 
