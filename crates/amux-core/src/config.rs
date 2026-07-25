@@ -2,11 +2,16 @@
 //! Loaded at startup to resolve the amux home (see `paths::amux_home`); the seed of the config
 //! system sketched in `docs/DESIGN.md` §4.4.
 //!
+//! The path is resolved by hand rather than via `directories`' platform config dir, which is
+//! `~/Library/Application Support` on macOS — that would put the config in a different place on
+//! each of our two first-class platforms, and would silently ignore `$XDG_CONFIG_HOME` there.
+//! amux is a Unix CLI: one XDG path, identical on macOS and Linux.
+//!
 //! A missing file is normal — amux runs on built-in defaults (`~/.amux`). A file that fails to
 //! parse (or has an unknown key) is a **hard error**, never a silent fallback: otherwise you'd
 //! believe your data moved to `root` while amux quietly kept using the default.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
 use serde::Deserialize;
@@ -42,9 +47,25 @@ impl Config {
     }
 }
 
-/// `~/.config/amux/config.toml` (respects `$XDG_CONFIG_HOME`). `None` if the home dir is unknown.
+/// `$XDG_CONFIG_HOME/amux/config.toml`, else `~/.config/amux/config.toml` — the same path on
+/// macOS and Linux. `None` if the home dir is unknown.
 pub fn config_path() -> Option<PathBuf> {
-    directories::BaseDirs::new().map(|d| d.config_dir().join("amux").join("config.toml"))
+    let xdg = std::env::var("XDG_CONFIG_HOME").ok();
+    Some(resolve_config_path(
+        xdg.as_deref(),
+        &crate::paths::home().ok()?,
+    ))
+}
+
+/// Resolve the config file path: `$XDG_CONFIG_HOME` if set and non-empty, else `<home>/.config`,
+/// then `amux/config.toml`. Pure.
+fn resolve_config_path(xdg_config_home: Option<&str>, home: &Path) -> PathBuf {
+    match xdg_config_home.map(str::trim).filter(|s| !s.is_empty()) {
+        Some(x) => PathBuf::from(x),
+        None => home.join(".config"),
+    }
+    .join("amux")
+    .join("config.toml")
 }
 
 #[cfg(test)]
@@ -67,6 +88,24 @@ mod tests {
         assert!(
             Config::from_toml("root = ").is_err(),
             "syntactically broken TOML must error"
+        );
+    }
+
+    #[test]
+    fn config_path_prefers_xdg_then_dot_config() {
+        let home = PathBuf::from("/home/u");
+        assert_eq!(
+            resolve_config_path(Some("/xdg"), &home),
+            PathBuf::from("/xdg/amux/config.toml")
+        );
+        assert_eq!(
+            resolve_config_path(None, &home),
+            PathBuf::from("/home/u/.config/amux/config.toml")
+        );
+        // Empty/whitespace XDG is treated as unset (matching `paths::resolve_runtime_dir`).
+        assert_eq!(
+            resolve_config_path(Some("  "), &home),
+            PathBuf::from("/home/u/.config/amux/config.toml")
         );
     }
 

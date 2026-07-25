@@ -40,8 +40,9 @@ impl RuntimePaths {
     }
 }
 
-/// The user's home directory.
-fn home() -> Result<PathBuf> {
+/// The user's home directory. (`home_dir()` is the one `directories` lookup that agrees across
+/// macOS and Linux — see `crate::config` for why we don't use its `config_dir()`.)
+pub(crate) fn home() -> Result<PathBuf> {
     Ok(directories::BaseDirs::new()
         .context("cannot determine home directory")?
         .home_dir()

@@ -14,7 +14,9 @@ fn configured_root_relocates_the_whole_amux_home() {
     )
     .unwrap();
 
-    // BaseDirs reads XDG_CONFIG_HOME when constructed, so set it before resolving.
+    // `config_path()` reads XDG_CONFIG_HOME on every call, on macOS as well as Linux — a
+    // platform config dir (`~/Library/Application Support` via `directories`) would ignore it
+    // here and resolve the home to the default instead.
     std::env::set_var("XDG_CONFIG_HOME", tmp.path().join("config"));
 
     assert_eq!(
