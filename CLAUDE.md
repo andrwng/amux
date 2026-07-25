@@ -136,8 +136,12 @@ amux. Keep it that way; it drifts fast, and a stale shortcut table is worse than
   caller (wire + domain). `anyhow` for internal fallible glue and at the binary edges (`main.rs`).
   Never `unwrap()`/`expect()` in library code except for a genuinely unreachable startup invariant —
   and then with a message saying why.
-- **Logging.** `tracing` only; structured; JSON logs to `~/.amux/log/`. No `println!`/`eprintln!`/
-  `dbg!` in library crates.
+- **Logging.** `tracing` only — never `println!`/`eprintln!`/`dbg!` in a library crate (the TUI
+  owns stdout; a stray write corrupts the display). **There is no log file yet:** the daemon
+  installs a plain `tracing_subscriber::fmt()` to stdout filtered by `RUST_LOG`, and `daemonize`
+  points stdio at `/dev/null` — so an auto-spawned daemon's logs go nowhere. To read them, run it
+  yourself: `RUST_LOG=debug amux daemon --foreground`. Durable JSON logs under `<amux_home>/log/`
+  are a design goal (`DESIGN.md` §3), not something you can go look at today.
 - **Dependencies.** Do not add an external crate without first declaring it in
   `[workspace.dependencies]` (root `Cargo.toml`) and consuming it with `{ workspace = true }`. The
   pinned set in `DESIGN.md` §11 is mutually verified and load-bearing — prefer it, and justify any

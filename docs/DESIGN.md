@@ -96,7 +96,9 @@ delete/prune, uniqueness — can't silently misfire on it); and its Claude hook 
 against the user's own concurrent edits to that tree is the user's responsibility, not amux's.
 
 Error handling: typed errors (`thiserror`) in `amux-core`/`amux-proto`; `anyhow` at binary
-edges. Logging: `tracing` throughout, JSON logs to `~/.amux/log/`.
+edges. Logging: `tracing` throughout. *Intended:* JSON logs under `<amux_home>/log/`. *Today:* a
+plain `fmt()` subscriber on stdout filtered by `RUST_LOG`, which a daemonized process sends to
+`/dev/null` — readable only via `amux daemon --foreground`. Writing them to a file is unbuilt.
 
 ---
 
