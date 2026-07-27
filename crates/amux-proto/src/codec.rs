@@ -187,6 +187,9 @@ mod tests {
         roundtrip(ClientMsg::CreateHeadAgent {
             repo: RepoId::from_canonical_path(&PathBuf::from("/repos/amux")),
         });
+        roundtrip(ClientMsg::CreateHeadAgentAt {
+            path: "/repos/other".into(),
+        });
         roundtrip(ClientMsg::DeleteAgent { id, force: true });
         roundtrip(ClientMsg::ResumeAgent { id });
         roundtrip(ClientMsg::SpawnShell {

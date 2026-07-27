@@ -312,6 +312,9 @@ fn handle_command(
             report_err(registry.create_at(&path, &branch).map(|_| ()))
         }
         ClientMsg::CreateHeadAgent { repo } => report_err(registry.create_head(repo).map(|_| ())),
+        ClientMsg::CreateHeadAgentAt { path } => {
+            report_err(registry.create_head_at(&path).map(|_| ()))
+        }
         ClientMsg::DeleteAgent { id, force } => match registry.delete(id, force) {
             Ok(DeleteOutcome::Deleted) => {}
             Ok(DeleteOutcome::NeedsConfirm(message)) => {

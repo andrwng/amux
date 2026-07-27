@@ -20,5 +20,7 @@ pub use message::{AgentInfo, ClientMsg, DaemonMsg, Layout, RepoInfo, Size};
 /// daemon still starting agents in the false Working state); v15 MRU sidebar
 /// (AgentInfo.last_opened, OpenedChanged — sidebar orders by last-opened); v16 branchless HEAD
 /// sessions (CreateHeadAgent, AgentInfo.branch is now optional — `None` = a HEAD session);
-/// v17 task at launch (CreateAgent.prompt — dispatch an agent already working on its task).
-pub const PROTO_VERSION: u32 = 17;
+/// v17 task at launch (CreateAgent.prompt — dispatch an agent already working on its task);
+/// v18 HEAD session by path (CreateHeadAgentAt — register a repo and open its HEAD session in one
+/// step, so the client needs no `RepoId` it cannot learn for an already-registered repo).
+pub const PROTO_VERSION: u32 = 18;

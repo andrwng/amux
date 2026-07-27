@@ -60,7 +60,7 @@ These come from `DESIGN.md` §2. Each is tagged with the crate that owns it.
    New runtime state lives in the daemon and reaches clients only as a `DaemonMsg`.
 3. **The daemon↔client boundary is `amux-proto` — and only that.** Never leak internal types across
    the wire. Any change to a wire message bumps `PROTO_VERSION` (`amux-proto/src/lib.rs`, currently
-   16) and updates the codec round-trip tests. *(Review-enforced: a missing bump compiles and
+   18) and updates the codec round-trip tests. *(Review-enforced: a missing bump compiles and
    passes CI but breaks a real client↔daemon pair — watch for it.)*
 4. **CLI-specifics live behind one seam.** Everything is agent-CLI-agnostic except `AgentAdapter`
    and `StatusSource` (`amux-core/src/adapter.rs`). Special-casing `"claude"` anywhere outside an
@@ -119,7 +119,7 @@ amux. Keep it that way; it drifts fast, and a stale shortcut table is worse than
   README carries at most one pointer to `DESIGN.md`, at the bottom, under Development.
 - **Getting-familiar, not exhaustive.** A feature earns its key or command, one line of what it
   does, and the section it belongs to. Mechanism, edge cases, invariants and rationale stay in
-  `DESIGN.md` or the code. `H` gets the row *"new HEAD session in the selected repo (no worktree,
+  `DESIGN.md` or the code. `h` gets the row *"new HEAD session in the selected repo (no worktree,
   no branch)"* — and not a word about singleton-per-repo, out-of-tree hook settings, or the §2
   isolation waiver.
 - **Fold in, don't accrete.** New capability belongs inside an existing section (the three panels ·

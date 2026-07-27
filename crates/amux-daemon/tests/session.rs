@@ -161,6 +161,44 @@ async fn head_session_runs_in_repo_root_and_makes_no_worktree() {
     assert_eq!(wt_entries, 0, "a HEAD session must not create a worktree");
 }
 
+/// The by-path flow (`H` in the sidebar): a repo the daemon has never seen is registered and its
+/// HEAD session opened in one message — the client has no `RepoId` to send, which is the whole
+/// reason `CreateHeadAgentAt` exists.
+#[tokio::test]
+async fn head_session_by_path_registers_the_repo_first() {
+    let (mut client, repo_id, tmp) = setup().await;
+    let other = tmp.path().join("other");
+    std::fs::create_dir(&other).unwrap();
+    init_repo(&other);
+
+    client
+        .send(ClientMsg::CreateHeadAgentAt {
+            path: other.clone(),
+        })
+        .await
+        .unwrap();
+    let (registered, info) = tokio::time::timeout(Duration::from_secs(5), async {
+        let mut registered = false;
+        loop {
+            match client.next().await {
+                Some(Ok(DaemonMsg::RepoAdded(r))) if r.path == other.canonicalize().unwrap() => {
+                    registered = true
+                }
+                Some(Ok(DaemonMsg::AgentAdded(info))) => return (registered, info),
+                Some(Ok(_)) => {}
+                other => panic!("stream ended before AgentAdded: {other:?}"),
+            }
+        }
+    })
+    .await
+    .expect("timed out waiting for AgentAdded");
+
+    assert!(registered, "the unknown repo was registered on the way");
+    assert_ne!(info.repo, repo_id, "the session belongs to the named repo");
+    assert_eq!(info.branch, None, "still a branchless HEAD session");
+    assert_eq!(info.name, "HEAD");
+}
+
 #[tokio::test]
 async fn head_session_is_a_singleton_per_repo() {
     let (mut client, repo, _tmp) = setup().await;

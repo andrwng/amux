@@ -87,6 +87,11 @@ pub enum ClientMsg {
     /// running in the repo root on `HEAD`, with no amux-managed worktree or branch. If one
     /// already exists for the repo, the daemon returns it rather than creating a duplicate.
     CreateHeadAgent { repo: RepoId },
+    /// Register the repo at `path` (idempotent) and create its singleton HEAD session — the
+    /// by-path counterpart of `CreateHeadAgent`, as `CreateAgentAt` is to `CreateAgent`. One
+    /// message rather than an `AddRepo` round-trip because registration is silent for a repo the
+    /// daemon already knows, leaving a client with no `RepoId` to follow up with.
+    CreateHeadAgentAt { path: PathBuf },
     /// Delete an agent — kills all its terminals and removes its worktree. Only destructive op.
     DeleteAgent { id: AgentId, force: bool },
     /// Resume a suspended agent's primary terminal in its existing worktree.

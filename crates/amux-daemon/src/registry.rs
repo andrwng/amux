@@ -613,6 +613,14 @@ impl Registry {
         self.create(info.id, branch, None)
     }
 
+    /// Register the repo at `path` (idempotent) and create its singleton HEAD session. Registration
+    /// is what the caller cannot do for itself: a client only learns a `RepoId` from the
+    /// `RepoAdded` broadcast, which a repo the daemon already knows never emits.
+    pub fn create_head_at(self: &Arc<Self>, path: &Path) -> Result<AgentInfo> {
+        let info = self.register_path(path, WorktreeLocation::Global)?;
+        self.create_head(info.id)
+    }
+
     /// Create an agent in `repo`: worktree + a primary terminal running the agent CLI. `prompt` is
     /// the task to start it on — `Some` dispatches an agent already working, `None` launches it
     /// idle at its prompt.

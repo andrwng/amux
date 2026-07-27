@@ -121,6 +121,9 @@ enum InputMode {
     Creating,
     /// `N` — two fields (directory + branch); registers the repo by path.
     CreatingRepo,
+    /// `H` — one field (directory); registers the repo by path and opens its HEAD session. A HEAD
+    /// session has no branch and takes no task, so the directory is the whole prompt.
+    CreatingHead,
     Confirming,
 }
 
@@ -668,6 +671,7 @@ impl App {
         match self.input {
             InputMode::Creating => return self.key_creating(key, sink).await,
             InputMode::CreatingRepo => return self.key_creating_repo(key, sink).await,
+            InputMode::CreatingHead => return self.key_creating_head(key, sink).await,
             InputMode::Confirming => return self.key_confirm(key, sink).await,
             InputMode::Normal => {}
         }
@@ -744,7 +748,7 @@ impl App {
                 let clean: String = text.chars().filter(|c| !c.is_control()).collect();
                 self.active_buf().push_str(&clean);
             }
-            InputMode::CreatingRepo => {
+            InputMode::CreatingRepo | InputMode::CreatingHead => {
                 let buf = self.active_buf();
                 buf.extend(text.chars().filter(|c| !c.is_control()));
             }
@@ -859,12 +863,18 @@ impl App {
                 self.create_field = Field::Dir;
                 self.input = InputMode::CreatingRepo;
             }
-            // `H`: new branchless HEAD session in the repo under the cursor — runs an agent in the
+            // `h`: new branchless HEAD session in the repo under the cursor — runs an agent in the
             // repo root on HEAD (no worktree, no branch). Singleton per repo; no prompt.
-            KeyCode::Char('H') => {
+            KeyCode::Char('h') => {
                 if let Some(repo) = self.selected_repo() {
                     sink.send(ClientMsg::CreateHeadAgent { repo }).await?;
                 }
+            }
+            // `H`: the same HEAD session in a repo given by path — `h` is to `H` as `n` is to `N`.
+            KeyCode::Char('H') => {
+                self.dir_buf.clear();
+                self.create_field = Field::Dir;
+                self.input = InputMode::CreatingHead;
             }
             KeyCode::Char('d') => {
                 if let Some(id) = self.selected_agent() {
@@ -1320,6 +1330,32 @@ impl App {
                 self.active_buf().pop();
             }
             KeyCode::Char(c) => self.active_buf().push(c),
+            _ => {}
+        }
+        Ok(Flow::Continue)
+    }
+
+    /// The one-field `H` prompt: Enter registers the repo at that path and opens its HEAD session.
+    /// There is no second field — a HEAD session has no branch and takes no task.
+    async fn key_creating_head(&mut self, key: KeyEvent, sink: &mut Sink) -> Result<Flow> {
+        match key.code {
+            KeyCode::Enter => {
+                let dir = self.dir_buf.trim().to_string();
+                // Enter with an empty field cancels, matching `n`'s empty-branch behaviour.
+                self.dir_buf.clear();
+                self.input = InputMode::Normal;
+                if !dir.is_empty() {
+                    sink.send(ClientMsg::CreateHeadAgentAt {
+                        path: expand_path(&dir),
+                    })
+                    .await?;
+                }
+            }
+            KeyCode::Esc => self.input = InputMode::Normal,
+            KeyCode::Backspace => {
+                self.dir_buf.pop();
+            }
+            KeyCode::Char(c) => self.dir_buf.push(c),
             _ => {}
         }
         Ok(Flow::Continue)
@@ -2470,6 +2506,14 @@ fn render_status(frame: &mut Frame, area: Rect, app: &App) {
                 cursor(Field::Dir),
                 app.create_buf,
                 cursor(Field::Branch),
+            ),
+            Style::default().fg(Color::Black).bg(Color::Cyan),
+        )
+    } else if app.input == InputMode::CreatingHead {
+        (
+            format!(
+                " new HEAD session \u{2014} dir: {}\u{2588}  (enter create \u{b7} esc cancel)",
+                app.dir_buf,
             ),
             Style::default().fg(Color::Black).bg(Color::Cyan),
         )
@@ -3826,6 +3870,110 @@ mod tests {
         assert!(
             content.contains("branch: fix-x") && content.contains("task: do it"),
             "both fields render, got: {content}"
+        );
+    }
+
+    /// Drive the sidebar from a clean start: focus it with the cursor on the one agent, press
+    /// `keys`, and return the first message that reached the daemon (`None` if none did).
+    async fn run_sidebar(keys: &[KeyCode]) -> (App, Option<ClientMsg>) {
+        use amux_proto::ServerCodec;
+        let (client_end, server_end) = UnixStream::pair().unwrap();
+        let (mut sink, _rx) = Framed::new(client_end, ClientCodec::default()).split();
+        let mut server = Framed::new(server_end, ServerCodec::default());
+
+        let (mut app, ids) = app_with_agents(1);
+        app.focus = Focus::Sidebar;
+        app.sidebar_sel = Some(Row::Agent(ids[0]));
+        for k in keys {
+            app.on_key(key(*k), &mut sink).await.unwrap();
+        }
+        let sent = tokio::time::timeout(Duration::from_millis(200), server.next())
+            .await
+            .ok()
+            .flatten()
+            .map(|m| m.unwrap());
+        (app, sent)
+    }
+
+    fn chars(s: &str) -> Vec<KeyCode> {
+        s.chars().map(KeyCode::Char).collect()
+    }
+
+    /// `h` is the no-prompt HEAD session in the repo under the cursor — what `H` used to do.
+    #[tokio::test]
+    async fn lowercase_h_opens_head_in_the_selected_repo() {
+        let (app, sent) = run_sidebar(&[KeyCode::Char('h')]).await;
+        assert_eq!(app.input, InputMode::Normal, "`h` opens no prompt");
+        assert_eq!(
+            sent,
+            Some(ClientMsg::CreateHeadAgent {
+                repo: RepoId::from_canonical_path(std::path::Path::new("/r")),
+            })
+        );
+    }
+
+    /// `H` is to `h` as `N` is to `n`: a one-field prompt that names the repo by path.
+    #[tokio::test]
+    async fn uppercase_h_prompts_for_a_dir_then_creates_head_there() {
+        let mut keys = vec![KeyCode::Char('H')];
+        keys.extend(chars("/repos/other"));
+        keys.push(KeyCode::Enter);
+        let (app, sent) = run_sidebar(&keys).await;
+        assert_eq!(app.input, InputMode::Normal, "Enter closes the prompt");
+        assert_eq!(
+            sent,
+            Some(ClientMsg::CreateHeadAgentAt {
+                path: "/repos/other".into(),
+            }),
+            "the typed path goes out as a by-path HEAD session — not the selected repo"
+        );
+    }
+
+    /// The `H` prompt expands `~/` like `N`'s does, and cancels on an empty field or `Esc`.
+    #[tokio::test]
+    async fn head_prompt_expands_tilde_and_cancels_when_empty() {
+        let mut keys = vec![KeyCode::Char('H')];
+        keys.extend(chars("~/x"));
+        keys.push(KeyCode::Enter);
+        let (_, sent) = run_sidebar(&keys).await;
+        let home = directories::BaseDirs::new().unwrap().home_dir().join("x");
+        assert_eq!(sent, Some(ClientMsg::CreateHeadAgentAt { path: home }));
+
+        let (app, sent) = run_sidebar(&[KeyCode::Char('H'), KeyCode::Enter]).await;
+        assert_eq!(sent, None, "an empty dir creates nothing");
+        assert_eq!(app.input, InputMode::Normal);
+
+        let (app, sent) =
+            run_sidebar(&[KeyCode::Char('H'), KeyCode::Char('x'), KeyCode::Esc]).await;
+        assert_eq!(sent, None, "Esc creates nothing");
+        assert_eq!(app.input, InputMode::Normal);
+    }
+
+    /// The `H` prompt names itself and shows what you've typed, so it isn't mistaken for `N`.
+    #[test]
+    fn head_prompt_renders_its_single_field() {
+        use ratatui::{backend::TestBackend, Terminal};
+        let mut app = App::new(100, 40);
+        app.input = InputMode::CreatingHead;
+        app.create_field = Field::Dir;
+        app.dir_buf = "~/Repos/amux".into();
+
+        let mut term = Terminal::new(TestBackend::new(90, 1)).unwrap();
+        term.draw(|f| render_status(f, f.area(), &app)).unwrap();
+        let content: String = term
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|c| c.symbol())
+            .collect();
+        assert!(
+            content.contains("HEAD session") && content.contains("dir: ~/Repos/amux"),
+            "the HEAD prompt renders its field, got: {content}"
+        );
+        assert!(
+            !content.contains("branch"),
+            "a HEAD session has no branch field, got: {content}"
         );
     }
 

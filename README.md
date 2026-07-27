@@ -74,8 +74,11 @@ restarts), it goes **suspended**, not away: the worktree and conversation id sur
 resumes it in place. `d` is the only destructive command, and it asks before discarding
 uncommitted work.
 
-`H` starts a **HEAD session** instead: an agent in the repo root on your current checkout, with no
+`h` starts a **HEAD session** instead: an agent in the repo root on your current checkout, with no
 worktree and no branch. One per repo, for when you want an agent in the tree you're already in.
+
+`N` and `H` are the by-path versions of `n` and `h`: they prompt for a directory, so you can reach a
+repo that isn't in the sidebar yet without leaving amux.
 
 ### Navigation
 
@@ -105,7 +108,8 @@ Everywhere: `Ctrl+Q` quit · `Ctrl+h/j/k/l` move focus · `Ctrl+B` command prefi
 | `m` | open the agent as a mini |
 | `n` | new agent in the selected repo (prompts for a branch, and an optional task to start it on) |
 | `N` | new agent in a repo by path (prompts for directory + branch; `Tab` switches fields) |
-| `H` | new HEAD session in the selected repo (no worktree, no branch) |
+| `h` | new HEAD session in the selected repo (no worktree, no branch) |
+| `H` | new HEAD session in a repo by path (prompts for a directory) |
 | `d` | delete the agent (asks `y/n` before discarding uncommitted work) |
 | `r` | resume an exited agent |
 | `P` | doctor: prune the repo's orphaned worktrees |
