@@ -1618,24 +1618,34 @@ impl App {
 
     /// Wheel-scroll amux's own scrollback for a pane whose app doesn't take the mouse — reusing
     /// scroll mode. Wheeling back to the bottom exits it (returns to live).
+    ///
+    /// Scroll mode is entered only once the view has actually moved. Committing to it first meant a
+    /// wheel-up on a pane with no scrollback parked the TUI in scroll mode at `↑0`, where `on_key`
+    /// routes every keystroke to `key_scroll` — the wheel appeared to do nothing *and* typing
+    /// stopped reaching the pane.
     fn wheel_scroll(&mut self, terminal: TerminalId, up: bool) {
         const STEP: usize = 3;
-        if self.scroll_mode != Some(terminal) {
-            self.scroll_mode = Some(terminal);
-            self.scroll_offset = self
-                .parsers
+        let base = if self.scroll_mode == Some(terminal) {
+            self.scroll_offset
+        } else {
+            self.parsers
                 .get(&terminal)
                 .map(|p| p.screen().scrollback())
-                .unwrap_or(0);
-        }
+                .unwrap_or(0)
+        };
         let requested = if up {
-            self.scroll_offset.saturating_add(STEP)
+            base.saturating_add(STEP)
         } else {
-            self.scroll_offset.saturating_sub(STEP)
+            base.saturating_sub(STEP)
         };
         self.apply_scroll(terminal, requested);
-        if !up && self.scroll_offset == 0 {
-            self.scroll_mode = None; // back to live
+        if self.scroll_offset == 0 {
+            self.scroll_mode = None; // at the live view: nothing to scroll, or scrolled back to it
+            if up && base == 0 {
+                self.info = "no scrollback here yet".to_string();
+            }
+        } else {
+            self.scroll_mode = Some(terminal);
         }
     }
 
@@ -2978,6 +2988,36 @@ mod tests {
             s.starts_with("\u{1b}[<64;") && s.ends_with('M'),
             "SGR wheel-up report: {s:?}"
         );
+    }
+
+    /// A wheel-up on a pane with nothing to scroll must not enter scroll mode. It used to commit to
+    /// the mode before discovering the ring was empty, leaving the TUI parked at `↑0` — where
+    /// `on_key` hands every keystroke to `key_scroll`, so the pane silently stopped receiving input
+    /// until the user pressed `q`. Reachable whenever a pane's history is empty: exactly the state a
+    /// freshly attached pane was left in before snapshots carried scrollback.
+    #[test]
+    fn wheel_up_with_no_scrollback_does_not_enter_scroll_mode() {
+        let mut app = App::new(100, 40);
+        let t = TerminalId::new();
+        app.tree.open(t);
+        app.terminals.insert(t, AgentId::new());
+        // A pane whose parser has never scrolled: a screen's worth of output, no history.
+        let mut parser = vt100::Parser::new(4, 20, 100);
+        parser.process(b"hello");
+        app.parsers.insert(t, parser);
+        app.attached.insert(t, Size { cols: 20, rows: 4 });
+        assert_eq!(app.parsers[&t].screen().scrollback(), 0, "precondition");
+
+        app.wheel_scroll(t, true);
+        assert!(
+            app.scroll_mode.is_none(),
+            "an empty ring must not park the TUI in scroll mode"
+        );
+        assert_eq!(app.scroll_offset, 0);
+        assert!(!app.info.is_empty(), "and it says why nothing happened");
+
+        // Keys still reach the pane rather than being eaten by scroll mode.
+        assert!(app.scroll_mode.is_none());
     }
 
     /// A left-press inside a Claude-style pane — one on the alternate screen that *also* tracks the
