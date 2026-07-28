@@ -132,6 +132,28 @@ enum Flow {
     Quit,
 }
 
+/// Scrollback kept by a client-side parser: none. History lives in the daemon and is paged in on
+/// demand ([`Scroll`]), so a client holding its own ring would be a second, staler copy of it — and
+/// an expensive one, at `cols` cells of 32 bytes per line per attached pane.
+const CLIENT_SCROLLBACK: usize = 0;
+
+/// A pane scrolled back into its history — one screenful, as served by the daemon.
+///
+/// The daemon owns scroll history *and* this client's position in it, so scrolling is a step
+/// ("one line back from what you showed me") answered with a window to render. That keeps the
+/// client a projection (`DESIGN.md` §2, invariant 2): it holds no scrollback, cannot scroll past
+/// what exists, and cannot disagree with the daemon about where the view sits.
+struct Scroll {
+    terminal: TerminalId,
+    /// The served window, parsed for rendering. Deliberately has no scrollback of its own — it is
+    /// exactly what the daemon sent, nothing more.
+    parser: vt100::Parser,
+    /// Lines back from live, and how far back history goes; both straight from the daemon, for the
+    /// `↑offset/available` indicator.
+    offset: usize,
+    available: usize,
+}
+
 pub async fn run() -> Result<()> {
     use crossterm::event::{
         DisableBracketedPaste, DisableMouseCapture, EnableBracketedPaste, EnableMouseCapture,
@@ -139,7 +161,7 @@ pub async fn run() -> Result<()> {
     let (framed, repo) = crate::client::connect().await?;
     let mut terminal = ratatui::init();
     // Capture the mouse so the wheel reaches panes (forwarded to apps that want it, else scrolls
-    // amux's own scrollback). Hold Shift to bypass for native terminal selection.
+    // the daemon's scroll history). Hold Shift to bypass for native terminal selection.
     // Bracketed paste lets the outer terminal hand us a paste as one `Event::Paste` instead of a
     // storm of per-character key events — one write to the child, one redraw. See `on_paste`.
     //
@@ -330,10 +352,8 @@ struct App {
     /// numeric-shortcut overlay while down.
     super_held: bool,
     resize_mode: bool,
-    /// Scroll (copy) mode: the terminal being scrolled and how many rows back into its
-    /// scrollback the view is. `None` = live at the bottom.
-    scroll_mode: Option<TerminalId>,
-    scroll_offset: usize,
+    /// Scroll (copy) mode: the window of history the daemon last served us. `None` = live.
+    scroll: Option<Scroll>,
     /// The active mouse selection (drag in progress or last completed), if any.
     selection: Option<Selection>,
     /// Branch buffer (both `n` and `N`); repo-path buffer (`N` only); task buffer (`n` only).
@@ -377,8 +397,7 @@ impl App {
             prefix: false,
             super_held: false,
             resize_mode: false,
-            scroll_mode: None,
-            scroll_offset: 0,
+            scroll: None,
             selection: None,
             create_buf: String::new(),
             dir_buf: String::new(),
@@ -621,7 +640,7 @@ impl App {
             }
             DaemonMsg::OutputSnapshot { terminal, bytes } => {
                 if let Some(&size) = self.attached.get(&terminal) {
-                    let mut parser = vt100::Parser::new(size.rows, size.cols, 2000);
+                    let mut parser = vt100::Parser::new(size.rows, size.cols, CLIENT_SCROLLBACK);
                     parser.process(&bytes);
                     self.parsers.insert(terminal, parser);
                 }
@@ -629,15 +648,17 @@ impl App {
             DaemonMsg::Output { terminal, bytes } => {
                 if let Some(parser) = self.parsers.get_mut(&terminal) {
                     parser.process(&bytes);
-                    // vt100 bumps its scrollback offset to keep the scrolled view anchored on the
-                    // same lines as new output arrives; mirror that into our cached offset so the
-                    // ↑N indicator and the next scroll keypress stay in sync (the view doesn't
-                    // drift out from under you).
-                    if self.scroll_mode == Some(terminal) {
-                        self.scroll_offset = parser.screen().scrollback();
-                    }
                 }
+                // A scrolled-back pane keeps showing the window it was served; live output lands in
+                // the parser above, ready for when the view returns to live. The daemon re-bases the
+                // position on the next step, so output arriving now doesn't move what's on screen.
             }
+            DaemonMsg::ScrollView {
+                terminal,
+                offset,
+                available,
+                bytes,
+            } => self.on_scroll_view(terminal, offset, available, &bytes),
             DaemonMsg::TerminalExited { terminal, .. } => {
                 self.forget_terminal(terminal);
                 if self.tree.is_empty() {
@@ -675,11 +696,11 @@ impl App {
             InputMode::Confirming => return self.key_confirm(key, sink).await,
             InputMode::Normal => {}
         }
-        if let Some(terminal) = self.scroll_mode {
+        if let Some(terminal) = self.scroll.as_ref().map(|s| s.terminal) {
             if self.parsers.contains_key(&terminal) {
-                return Ok(self.key_scroll(key, terminal));
+                return self.key_scroll(key, terminal, sink).await;
             }
-            self.scroll_mode = None; // the pane went away
+            self.scroll = None; // the pane went away
         }
         if self.resize_mode {
             return self.key_resize(key, sink).await;
@@ -756,7 +777,7 @@ impl App {
             InputMode::Confirming => {}
             InputMode::Normal => {
                 // Sub-modes consume keys for navigation/sizing, not text — ignore pastes there.
-                if self.scroll_mode.is_some() || self.resize_mode || self.prefix {
+                if self.scroll.is_some() || self.resize_mode || self.prefix {
                     return Ok(());
                 }
                 let Some(terminal) = self.focused_terminal() else {
@@ -954,6 +975,9 @@ impl App {
         self.attached.remove(&terminal);
         self.terminals.remove(&terminal);
         self.passthrough.remove(&terminal);
+        if self.scroll.as_ref().is_some_and(|s| s.terminal == terminal) {
+            self.scroll = None;
+        }
     }
 
     /// Make `id` the active agent: save the current agent's layout, restore (or create) `id`'s.
@@ -1132,8 +1156,8 @@ impl App {
             KeyCode::Char('[') if self.focus == Focus::Panes => {
                 if let Some(t) = self.tree.focused_payload() {
                     // A full-screen app (vim, less, and possibly the agent itself) runs on the
-                    // alternate screen, which has no scrollback — there's nothing to scroll here,
-                    // so say so rather than entering a mode where the keys do nothing.
+                    // alternate screen, where nothing scrolls off — answer locally rather than
+                    // making a round trip to be told there's no history.
                     let alt = self
                         .parsers
                         .get(&t)
@@ -1142,8 +1166,13 @@ impl App {
                         self.info =
                             "no scrollback here — this pane runs a full-screen app".to_string();
                     } else {
-                        self.scroll_mode = Some(t);
-                        self.apply_scroll(t, 0);
+                        // One line back, so the reply lands on a real window: the mode opens only if
+                        // there is history to show (see `on_scroll_view`).
+                        sink.send(ClientMsg::Scroll {
+                            terminal: t,
+                            lines: 1,
+                        })
+                        .await?;
                     }
                 }
             }
@@ -1203,50 +1232,96 @@ impl App {
 
     /// Scroll (copy) mode keys — vi-style, matching tmux `mode-keys vi`: j/k line, Ctrl-u/Ctrl-d
     /// half-page, PageUp/PageDown page, g/G top/bottom, q/Esc/Enter to exit.
-    fn key_scroll(&mut self, key: KeyEvent, terminal: TerminalId) -> Flow {
+    ///
+    /// Each key is a *step*, sent to the daemon, which answers with the window to show. Steps rather
+    /// than absolute offsets so that output arriving while you sit scrolled back doesn't move the
+    /// view: the daemon re-bases the position it holds for us.
+    async fn key_scroll(
+        &mut self,
+        key: KeyEvent,
+        terminal: TerminalId,
+        sink: &mut Sink,
+    ) -> Result<Flow> {
         let page = self
             .attached
             .get(&terminal)
             .map(|s| s.rows as usize)
             .unwrap_or(24)
-            .max(1);
+            .max(1) as i32;
         let half = (page / 2).max(1);
-        let offset = self.scroll_offset;
         let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
-        let requested = match key.code {
+        let lines = match key.code {
             // Line: k/j, arrows, and less/vim's Ctrl-y / Ctrl-e.
-            KeyCode::Char('k') | KeyCode::Up => offset.saturating_add(1),
-            KeyCode::Char('j') | KeyCode::Down => offset.saturating_sub(1),
-            KeyCode::Char('y') if ctrl => offset.saturating_add(1),
-            KeyCode::Char('e') if ctrl => offset.saturating_sub(1),
+            KeyCode::Char('k') | KeyCode::Up => 1,
+            KeyCode::Char('j') | KeyCode::Down => -1,
+            KeyCode::Char('y') if ctrl => 1,
+            KeyCode::Char('e') if ctrl => -1,
             // Page.
-            KeyCode::PageUp => offset.saturating_add(page),
-            KeyCode::PageDown => offset.saturating_sub(page),
+            KeyCode::PageUp => page,
+            KeyCode::PageDown => -page,
             // Half page: Ctrl-u/Ctrl-d (tmux vi) and plain u/d (less).
-            KeyCode::Char('u') => offset.saturating_add(half),
-            KeyCode::Char('d') => offset.saturating_sub(half),
-            KeyCode::Char('g') => usize::MAX, // clamped to the buffer length below
-            KeyCode::Char('G') => 0,
+            KeyCode::Char('u') => half,
+            KeyCode::Char('d') => -half,
+            // The extremes; the daemon clamps both to what history it has.
+            KeyCode::Char('g') => i32::MAX,
+            KeyCode::Char('G') => i32::MIN,
             KeyCode::Char('q') | KeyCode::Esc | KeyCode::Enter => {
-                self.apply_scroll(terminal, 0); // back to live
-                self.scroll_mode = None;
-                return Flow::Continue;
+                self.exit_scroll(terminal, sink).await?;
+                return Ok(Flow::Continue);
             }
-            _ => return Flow::Continue,
+            _ => return Ok(Flow::Continue),
         };
-        self.apply_scroll(terminal, requested);
-        Flow::Continue
+        sink.send(ClientMsg::Scroll { terminal, lines }).await?;
+        Ok(Flow::Continue)
     }
 
-    /// Set a terminal's scrollback view to `requested` rows back (clamped to its buffer), and
-    /// remember the actual offset for the status/indicator.
-    fn apply_scroll(&mut self, terminal: TerminalId, requested: usize) {
-        if let Some(parser) = self.parsers.get_mut(&terminal) {
-            parser.screen_mut().set_scrollback(requested);
-            self.scroll_offset = parser.screen().scrollback();
-        } else {
-            self.scroll_offset = 0;
+    /// Leave scroll mode: back to rendering live output, and tell the daemon to forget where we were.
+    async fn exit_scroll(&mut self, terminal: TerminalId, sink: &mut Sink) -> Result<()> {
+        self.scroll = None;
+        sink.send(ClientMsg::Scroll {
+            terminal,
+            lines: i32::MIN,
+        })
+        .await?;
+        Ok(())
+    }
+
+    /// A window of history arrived.
+    ///
+    /// Scroll mode opens only on a window that is actually scrolled back, so a pane with no history
+    /// (`available == 0`, which clamps the offset to 0) reports that instead of entering a mode whose
+    /// keys couldn't move anything — and would then swallow them. Once open it stays open, including
+    /// at the live view: `G` means "bottom", and only `q`/`Esc`/`Enter` (or wheeling down past it)
+    /// leave, matching tmux's copy mode and what the README promises.
+    fn on_scroll_view(
+        &mut self,
+        terminal: TerminalId,
+        offset: usize,
+        available: usize,
+        bytes: &[u8],
+    ) {
+        // Only ever act on the pane we're showing a window for; another pane's reply is not ours to
+        // apply. (A stale reply for a pane we've since left is dropped the same way.)
+        let showing = self.scroll.as_ref().is_some_and(|s| s.terminal == terminal);
+        if offset == 0 && !showing {
+            if available == 0 {
+                self.info = "no scrollback here yet".to_string();
+            }
+            return;
         }
+        let Some(&size) = self.attached.get(&terminal) else {
+            return;
+        };
+        // A fresh parser per frame: the window is self-contained, and carrying no scrollback of our
+        // own is the point — the daemon is the only place history lives.
+        let mut parser = vt100::Parser::new(size.rows, size.cols, 0);
+        parser.process(bytes);
+        self.scroll = Some(Scroll {
+            terminal,
+            parser,
+            offset,
+            available,
+        });
     }
 
     async fn key_resize(&mut self, key: KeyEvent, sink: &mut Sink) -> Result<Flow> {
@@ -1458,7 +1533,7 @@ impl App {
                                 sink.send(ClientMsg::Input { terminal, bytes }).await?;
                             }
                         } else {
-                            self.wheel_scroll(terminal, up);
+                            self.wheel_scroll(terminal, up, sink).await?;
                         }
                     }
                 }
@@ -1491,13 +1566,13 @@ impl App {
             MouseEventKind::ScrollUp | MouseEventKind::ScrollDown => {
                 let up = matches!(me.kind, MouseEventKind::ScrollUp);
                 // An app that enabled mouse tracking (vim/less/htop, and Claude if it does) owns
-                // the wheel; otherwise scroll amux's own scrollback (plain shells).
+                // the wheel; otherwise it scrolls the daemon's history for the pane (plain shells).
                 if self.app_wants_mouse(terminal) {
                     if let Some(bytes) = self.encode_wheel(terminal, up, me.column, me.row, inner) {
                         sink.send(ClientMsg::Input { terminal, bytes }).await?;
                     }
                 } else {
-                    self.wheel_scroll(terminal, up);
+                    self.wheel_scroll(terminal, up, sink).await?;
                 }
             }
             _ => {}
@@ -1577,6 +1652,15 @@ impl App {
         None
     }
 
+    /// What to draw for `terminal`: the served history window while it is scrolled back, else the
+    /// live screen. One place decides, so panes and minis can't disagree.
+    fn screen_for(&self, terminal: TerminalId) -> Option<&vt100::Screen> {
+        match self.scroll.as_ref().filter(|s| s.terminal == terminal) {
+            Some(scroll) => Some(scroll.parser.screen()),
+            None => self.parsers.get(&terminal).map(|p| p.screen()),
+        }
+    }
+
     /// Whether the app in `terminal` has enabled mouse tracking (so it owns the wheel/clicks).
     fn app_wants_mouse(&self, terminal: TerminalId) -> bool {
         self.parsers
@@ -1616,37 +1700,38 @@ impl App {
         })
     }
 
-    /// Wheel-scroll amux's own scrollback for a pane whose app doesn't take the mouse — reusing
-    /// scroll mode. Wheeling back to the bottom exits it (returns to live).
+    /// Wheel-scroll a pane whose app doesn't take the mouse: a step request like any other, except
+    /// that wheeling back down to the live view leaves scroll mode, which is what a mouse user
+    /// expects (the keyboard leaves with `q`/`Esc`).
     ///
-    /// Scroll mode is entered only once the view has actually moved. Committing to it first meant a
-    /// wheel-up on a pane with no scrollback parked the TUI in scroll mode at `↑0`, where `on_key`
-    /// routes every keystroke to `key_scroll` — the wheel appeared to do nothing *and* typing
-    /// stopped reaching the pane.
-    fn wheel_scroll(&mut self, terminal: TerminalId, up: bool) {
-        const STEP: usize = 3;
-        let base = if self.scroll_mode == Some(terminal) {
-            self.scroll_offset
-        } else {
-            self.parsers
-                .get(&terminal)
-                .map(|p| p.screen().scrollback())
-                .unwrap_or(0)
-        };
-        let requested = if up {
-            base.saturating_add(STEP)
-        } else {
-            base.saturating_sub(STEP)
-        };
-        self.apply_scroll(terminal, requested);
-        if self.scroll_offset == 0 {
-            self.scroll_mode = None; // at the live view: nothing to scroll, or scrolled back to it
-            if up && base == 0 {
-                self.info = "no scrollback here yet".to_string();
+    /// Nothing is entered speculatively — scroll mode begins when a window actually arrives, so a
+    /// pane with no history never captures a keystroke while we wait for the answer.
+    async fn wheel_scroll(
+        &mut self,
+        terminal: TerminalId,
+        up: bool,
+        sink: &mut Sink,
+    ) -> Result<()> {
+        const STEP: i32 = 3;
+        let at = self
+            .scroll
+            .as_ref()
+            .filter(|s| s.terminal == terminal)
+            .map(|s| s.offset);
+        if !up {
+            match at {
+                // Already live: the wheel has nothing to do here.
+                None => return Ok(()),
+                // Within a step of live — land exactly on it and hand the pane back.
+                Some(offset) if offset <= STEP as usize => {
+                    return self.exit_scroll(terminal, sink).await
+                }
+                Some(_) => {}
             }
-        } else {
-            self.scroll_mode = Some(terminal);
         }
+        let lines = if up { STEP } else { -STEP };
+        sink.send(ClientMsg::Scroll { terminal, lines }).await?;
+        Ok(())
     }
 
     /// Attach/detach/resize terminals to match the **active** agent's layout. Terminals that
@@ -1689,12 +1774,23 @@ impl App {
                 match self.parsers.get_mut(&terminal) {
                     Some(parser) => parser.screen_mut().set_size(size.rows, size.cols),
                     None => {
-                        self.parsers
-                            .insert(terminal, vt100::Parser::new(size.rows, size.cols, 2000));
+                        self.parsers.insert(
+                            terminal,
+                            vt100::Parser::new(size.rows, size.cols, CLIENT_SCROLLBACK),
+                        );
                     }
                 }
                 sink.send(ClientMsg::Attach { terminal, size }).await?;
                 self.attached.insert(terminal, size);
+                // A served window is rendered for the size it was asked at, so a resize needs a
+                // fresh one; a zero-line step re-serves the same content at the new size.
+                if self
+                    .scroll
+                    .as_ref()
+                    .is_some_and(|sc| sc.terminal == terminal)
+                {
+                    sink.send(ClientMsg::Scroll { terminal, lines: 0 }).await?;
+                }
             }
         }
 
@@ -1710,6 +1806,16 @@ impl App {
             sink.send(ClientMsg::Detach { terminal }).await?;
             self.attached.remove(&terminal);
             self.parsers.remove(&terminal);
+            // The daemon drops our scroll position on detach, so hold no window for it either —
+            // otherwise returning to this pane would show a stale scrolled view whose next step
+            // would jump (the daemon would re-base it from live).
+            if self
+                .scroll
+                .as_ref()
+                .is_some_and(|sc| sc.terminal == terminal)
+            {
+                self.scroll = None;
+            }
         }
 
         // Persist the active agent's layout + the open minis so they survive closing the TUI.
@@ -2192,8 +2298,8 @@ fn render_minis(frame: &mut Frame, area: Rect, app: &App) {
             );
             continue;
         }
-        match app.mini_terminal(i).and_then(|t| app.parsers.get(&t)) {
-            Some(parser) => frame.render_widget(PseudoTerminal::new(parser.screen()), inner),
+        match app.mini_terminal(i).and_then(|t| app.screen_for(t)) {
+            Some(screen) => frame.render_widget(PseudoTerminal::new(screen), inner),
             None => frame.render_widget(
                 Paragraph::new("  \u{2026}").style(Style::default().fg(Color::DarkGray)),
                 inner,
@@ -2444,8 +2550,12 @@ fn render_panes(frame: &mut Frame, area: Rect, app: &App) {
             None => (" empty ".to_string(), Color::DarkGray),
         };
         // Show how far back this pane is scrolled while in scroll mode.
-        if app.scroll_mode == place.payload && app.scroll_offset > 0 {
-            title.push_str(&format!("\u{2191}{} ", app.scroll_offset));
+        if let Some(scroll) = app
+            .scroll
+            .as_ref()
+            .filter(|s| Some(s.terminal) == place.payload)
+        {
+            title.push_str(&format!("\u{2191}{} ", scroll.offset));
         }
         let border = if focused {
             Style::default()
@@ -2461,8 +2571,9 @@ fn render_panes(frame: &mut Frame, area: Rect, app: &App) {
         let inner = block.inner(place.rect);
         frame.render_widget(block, place.rect);
 
-        match place.payload.and_then(|t| app.parsers.get(&t)) {
-            Some(parser) => frame.render_widget(PseudoTerminal::new(parser.screen()), inner),
+        // A scrolled-back pane renders the window the daemon served; everything else renders live.
+        match place.payload.and_then(|t| app.screen_for(t)) {
+            Some(screen) => frame.render_widget(PseudoTerminal::new(screen), inner),
             None => frame.render_widget(
                 Paragraph::new("  \u{2026}").style(Style::default().fg(Color::DarkGray)),
                 inner,
@@ -2532,11 +2643,13 @@ fn render_status(frame: &mut Frame, area: Rect, app: &App) {
             format!(" {} — delete anyway? y/n", app.confirm_msg),
             Style::default().fg(Color::White).bg(Color::Red),
         )
-    } else if app.scroll_mode.is_some() {
+    } else if let Some(scroll) = app.scroll.as_ref() {
+        // `↑offset/available` — how far back the view is, and how far back it *can* go. Both come
+        // from the daemon, so the number never claims history the daemon doesn't have.
         (
             format!(
-                " SCROLL \u{2191}{} — j/k line \u{b7} ^u/^d half \u{b7} PgUp/PgDn page \u{b7} g/G top/bottom \u{b7} q done",
-                app.scroll_offset
+                " SCROLL \u{2191}{}/{} — j/k line \u{b7} ^u/^d half \u{b7} PgUp/PgDn page \u{b7} g/G top/bottom \u{b7} q done",
+                scroll.offset, scroll.available
             ),
             Style::default().fg(Color::Black).bg(Color::Yellow),
         )
@@ -2622,6 +2735,29 @@ mod tests {
         let (client_end, server_end) = UnixStream::pair().unwrap();
         let (sink, _rx) = Framed::new(client_end, ClientCodec::default()).split();
         (sink, server_end)
+    }
+
+    /// Like [`test_sink`], but the far end is decoded, so a test can assert on the exact frames the
+    /// client put on the wire.
+    fn test_server() -> (Sink, Framed<UnixStream, amux_proto::ServerCodec>) {
+        let (client_end, server_end) = UnixStream::pair().unwrap();
+        let (sink, _rx) = Framed::new(client_end, ClientCodec::default()).split();
+        (
+            sink,
+            Framed::new(server_end, amux_proto::ServerCodec::new()),
+        )
+    }
+
+    /// The next frame the client sent, or `None` if it sent nothing (a short timeout, so "nothing
+    /// was sent" is a real assertion rather than a hang).
+    async fn next_msg(
+        server: &mut Framed<UnixStream, amux_proto::ServerCodec>,
+    ) -> Option<ClientMsg> {
+        tokio::time::timeout(Duration::from_millis(200), server.next())
+            .await
+            .ok()
+            .flatten()
+            .map(|m| m.unwrap())
     }
 
     /// THE regression test: a burst of Output frames must coalesce into a SINGLE render (plus the
@@ -2799,39 +2935,115 @@ mod tests {
         }
     }
 
-    #[test]
-    fn scroll_mode_moves_and_clamps_within_scrollback() {
+    /// A pane with a served window in it, as if the daemon had just answered a scroll request.
+    fn scrolled_app(offset: usize, available: usize) -> (App, TerminalId) {
         let mut app = App::new(100, 40);
         let t = TerminalId::new();
-        // A tiny 4-row viewport with plenty of history to scroll through.
-        let mut parser = vt100::Parser::new(4, 20, 100);
-        for i in 0..50 {
-            parser.process(format!("line {i}\r\n").as_bytes());
-        }
-        app.parsers.insert(t, parser);
+        app.tree.open(t);
+        app.terminals.insert(t, AgentId::new());
+        app.parsers
+            .insert(t, vt100::Parser::new(4, 20, CLIENT_SCROLLBACK));
         app.attached.insert(t, Size { cols: 20, rows: 4 });
-        app.scroll_mode = Some(t);
-        app.apply_scroll(t, 0);
-        assert_eq!(app.scroll_offset, 0);
+        app.on_scroll_view(t, offset, available, b"served window");
+        (app, t)
+    }
 
-        // k scrolls up a line; Ctrl-u scrolls a half page (rows/2 = 2).
-        app.key_scroll(key(KeyCode::Char('k')), t);
-        assert_eq!(app.scroll_offset, 1);
-        app.key_scroll(ctrl('u'), t);
-        assert_eq!(app.scroll_offset, 3);
+    /// Scroll keys are *steps* sent to the daemon, which owns the history and our place in it. The
+    /// deltas are what the vi/less bindings promise: a line, a half page (rows/2), a page, and the
+    /// two extremes.
+    #[tokio::test]
+    async fn scroll_keys_send_relative_steps() {
+        let (mut app, t) = scrolled_app(10, 500);
+        let (mut sink, mut server) = test_server();
+        assert!(app.scroll.is_some(), "precondition: scrolled back");
 
-        // g jumps to the top of the scrollback; further up is clamped there.
-        app.key_scroll(key(KeyCode::Char('g')), t);
-        let top = app.scroll_offset;
-        assert!(top > 3, "g reaches the top of history");
-        app.key_scroll(key(KeyCode::Char('k')), t);
-        assert_eq!(app.scroll_offset, top, "clamped at the top");
+        for (pressed, expected) in [
+            (key(KeyCode::Char('k')), 1),
+            (key(KeyCode::Char('j')), -1),
+            (ctrl('u'), 2), // half of the 4-row viewport
+            (ctrl('d'), -2),
+            (key(KeyCode::PageUp), 4),
+            (key(KeyCode::PageDown), -4),
+            (key(KeyCode::Char('g')), i32::MAX),
+            (key(KeyCode::Char('G')), i32::MIN),
+        ] {
+            app.key_scroll(pressed, t, &mut sink).await.unwrap();
+            match next_msg(&mut server).await {
+                Some(ClientMsg::Scroll { terminal, lines }) => {
+                    assert_eq!((terminal, lines), (t, expected), "for {pressed:?}");
+                }
+                other => panic!("expected a Scroll step for {pressed:?}, got {other:?}"),
+            }
+        }
+    }
 
-        // G returns to live; q exits scroll mode.
-        app.key_scroll(key(KeyCode::Char('G')), t);
-        assert_eq!(app.scroll_offset, 0);
-        app.key_scroll(key(KeyCode::Char('q')), t);
-        assert!(app.scroll_mode.is_none());
+    /// Leaving scroll mode returns to live rendering at once, and tells the daemon to forget the
+    /// position it was holding for us — otherwise the next entry would resume where we left off.
+    #[tokio::test]
+    async fn leaving_scroll_mode_resets_the_daemons_position() {
+        let (mut app, t) = scrolled_app(10, 500);
+        let (mut sink, mut server) = test_server();
+
+        app.key_scroll(key(KeyCode::Char('q')), t, &mut sink)
+            .await
+            .unwrap();
+        assert!(app.scroll.is_none(), "back to live immediately");
+        assert_eq!(
+            next_msg(&mut server).await,
+            Some(ClientMsg::Scroll {
+                terminal: t,
+                lines: i32::MIN
+            }),
+            "and the daemon is told we are live again"
+        );
+    }
+
+    /// The served window is what gets drawn — not the live screen underneath it. This is the whole
+    /// point of daemon-owned history: what you scroll to can be output this client never witnessed.
+    #[test]
+    fn a_scrolled_pane_renders_the_served_window() {
+        let mut app = App::new(100, 40);
+        let t = TerminalId::new();
+        app.tree.open(t);
+        app.terminals.insert(t, AgentId::new());
+        let mut live = vt100::Parser::new(4, 20, CLIENT_SCROLLBACK);
+        live.process(b"live output");
+        app.parsers.insert(t, live);
+        app.attached.insert(t, Size { cols: 20, rows: 4 });
+
+        assert!(
+            app.screen_for(t)
+                .unwrap()
+                .contents()
+                .contains("live output"),
+            "live until scrolled"
+        );
+        app.on_scroll_view(t, 7, 500, b"ancient history");
+        let shown = app.screen_for(t).unwrap().contents();
+        assert!(
+            shown.contains("ancient history") && !shown.contains("live output"),
+            "a scrolled pane shows the daemon's window, got: {shown:?}"
+        );
+    }
+
+    /// Reported depth comes from the daemon, so the indicator can't claim history that isn't there.
+    #[test]
+    fn the_status_bar_shows_served_depth() {
+        use ratatui::{backend::TestBackend, Terminal};
+        let (app, _t) = scrolled_app(12, 3400);
+        let mut term = Terminal::new(TestBackend::new(90, 1)).unwrap();
+        term.draw(|f| render_status(f, f.area(), &app)).unwrap();
+        let content: String = term
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|c| c.symbol())
+            .collect();
+        assert!(
+            content.contains("\u{2191}12/3400"),
+            "the indicator shows position and depth, got: {content}"
+        );
     }
 
     fn agent_info(primary: TerminalId) -> AgentInfo {
@@ -2949,8 +3161,8 @@ mod tests {
         assert_eq!(app.selection_text().unwrap(), "alpha\nbravo");
     }
 
-    #[test]
-    fn mouse_wheel_forwards_to_apps_and_scrolls_others() {
+    #[tokio::test]
+    async fn mouse_wheel_forwards_to_apps_and_scrolls_others() {
         let mut app = App::new(100, 40);
         let t = TerminalId::new();
         app.tree.open(t);
@@ -2966,13 +3178,34 @@ mod tests {
         let (hit, _inner) = app.pane_at(40, 10).expect("mouse is over the pane");
         assert_eq!(hit, t);
 
-        // No mouse mode → the wheel scrolls amux's own scrollback; wheeling back exits.
+        // No mouse mode → the wheel asks the daemon for history, three lines at a time.
         assert!(!app.app_wants_mouse(t));
-        app.wheel_scroll(t, true);
-        assert!(app.scroll_offset >= 3 && app.scroll_mode == Some(t));
-        app.wheel_scroll(t, false);
-        assert_eq!(app.scroll_offset, 0);
-        assert!(app.scroll_mode.is_none());
+        let (mut sink, mut server) = test_server();
+        app.wheel_scroll(t, true, &mut sink).await.unwrap();
+        assert_eq!(
+            next_msg(&mut server).await,
+            Some(ClientMsg::Scroll {
+                terminal: t,
+                lines: 3
+            })
+        );
+
+        // Wheeling down within a step of live lands on it and hands the pane back, so a mouse user
+        // never has to press `q` to get their keys back.
+        app.on_scroll_view(t, 2, 500, b"window");
+        app.wheel_scroll(t, false, &mut sink).await.unwrap();
+        assert!(app.scroll.is_none(), "back to live");
+        assert_eq!(
+            next_msg(&mut server).await,
+            Some(ClientMsg::Scroll {
+                terminal: t,
+                lines: i32::MIN
+            })
+        );
+
+        // Wheeling down while already live is a no-op, not a stray request.
+        app.wheel_scroll(t, false, &mut sink).await.unwrap();
+        assert_eq!(next_msg(&mut server).await, None, "nothing sent when live");
 
         // The app enables SGR mouse mode → the wheel is forwarded as an SGR report instead.
         app.parsers
@@ -2990,34 +3223,36 @@ mod tests {
         );
     }
 
-    /// A wheel-up on a pane with nothing to scroll must not enter scroll mode. It used to commit to
-    /// the mode before discovering the ring was empty, leaving the TUI parked at `↑0` — where
-    /// `on_key` hands every keystroke to `key_scroll`, so the pane silently stopped receiving input
-    /// until the user pressed `q`. Reachable whenever a pane's history is empty: exactly the state a
-    /// freshly attached pane was left in before snapshots carried scrollback.
-    #[test]
-    fn wheel_up_with_no_scrollback_does_not_enter_scroll_mode() {
+    /// A pane with nothing to scroll must not capture keystrokes. Scroll mode used to be entered
+    /// before anything was known about the history, so a wheel-up on an empty ring parked the TUI at
+    /// `↑0` — where `on_key` hands every keystroke to `key_scroll`, and the pane silently stopped
+    /// receiving input until the user pressed `q`. Now the wheel only asks, and the mode opens on the
+    /// answer, so "no history" costs a message rather than the keyboard.
+    #[tokio::test]
+    async fn a_pane_with_no_history_never_captures_keys() {
         let mut app = App::new(100, 40);
         let t = TerminalId::new();
         app.tree.open(t);
         app.terminals.insert(t, AgentId::new());
-        // A pane whose parser has never scrolled: a screen's worth of output, no history.
-        let mut parser = vt100::Parser::new(4, 20, 100);
-        parser.process(b"hello");
-        app.parsers.insert(t, parser);
+        app.parsers
+            .insert(t, vt100::Parser::new(4, 20, CLIENT_SCROLLBACK));
         app.attached.insert(t, Size { cols: 20, rows: 4 });
-        assert_eq!(app.parsers[&t].screen().scrollback(), 0, "precondition");
+        let (mut sink, mut server) = test_server();
 
-        app.wheel_scroll(t, true);
+        app.wheel_scroll(t, true, &mut sink).await.unwrap();
         assert!(
-            app.scroll_mode.is_none(),
-            "an empty ring must not park the TUI in scroll mode"
+            app.scroll.is_none(),
+            "asking is not entering: keys still belong to the pane while we wait"
         );
-        assert_eq!(app.scroll_offset, 0);
-        assert!(!app.info.is_empty(), "and it says why nothing happened");
+        assert!(
+            next_msg(&mut server).await.is_some(),
+            "the request went out"
+        );
 
-        // Keys still reach the pane rather than being eaten by scroll mode.
-        assert!(app.scroll_mode.is_none());
+        // The daemon reports no history; that must leave the pane in charge of the keyboard.
+        app.on_scroll_view(t, 0, 0, b"");
+        assert!(app.scroll.is_none(), "still not in scroll mode");
+        assert!(!app.info.is_empty(), "and it says why nothing happened");
     }
 
     /// A left-press inside a Claude-style pane — one on the alternate screen that *also* tracks the
@@ -3287,40 +3522,74 @@ mod tests {
         );
     }
 
+    /// `G` is "bottom", not "exit" — the README lists `q`/`Esc`/`Enter` as the ways out, so landing on
+    /// the live view keeps the mode (as tmux's copy mode does) and the keys keep working.
     #[test]
-    fn scroll_view_stays_anchored_as_output_arrives() {
+    fn reaching_the_live_view_by_key_stays_in_scroll_mode() {
+        let (mut app, t) = scrolled_app(10, 500);
+        // `G` lands on the live view: offset 0, but history still exists.
+        app.on_scroll_view(t, 0, 500, b"the live screen");
+        assert!(
+            app.scroll.is_some(),
+            "still in scroll mode at the bottom; only q/Esc/Enter leave"
+        );
+        assert_eq!(app.scroll.as_ref().unwrap().offset, 0);
+    }
+
+    /// A reply for one pane must not disturb the window being shown for another.
+    #[test]
+    fn a_reply_for_another_pane_is_ignored() {
+        let (mut app, t) = scrolled_app(10, 500);
+        let other = TerminalId::new();
+        app.on_scroll_view(other, 0, 0, b"");
+        assert!(
+            app.scroll.as_ref().is_some_and(|s| s.terminal == t),
+            "the other pane's empty history must not close this pane's window"
+        );
+    }
+
+    /// Switching agents (or closing a pane) detaches its terminal, and the daemon drops the scroll
+    /// position it held for us. The window has to go too: keeping it would render stale history on
+    /// return, and the next step would jump, because the daemon would re-base it from the live view.
+    #[tokio::test]
+    async fn detaching_a_scrolled_pane_drops_its_window() {
+        let (mut app, ids) = app_with_agents(2);
+        let (mut sink, _server) = test_sink();
+        app.activate(ids[0], &mut sink).await.unwrap();
+        let terminal = app.tree.focused_payload().expect("a pane for the agent");
+        app.on_scroll_view(terminal, 12, 500, b"old history");
+        assert!(app.scroll.is_some(), "precondition: scrolled back");
+
+        // Switching agents detaches the pane we were scrolling.
+        app.activate(ids[1], &mut sink).await.unwrap();
+        assert!(
+            app.scroll.is_none(),
+            "the window went with the pane, so returning shows live output"
+        );
+    }
+
+    /// A scrolled-back pane shows a still frame: live output keeps flowing into the live parser, but
+    /// what is on screen does not move until the user asks for another window. The matching half of
+    /// this — that the *next* step still means one line from what you were looking at — is the
+    /// daemon's re-basing, covered end-to-end in the daemon's `scroll_step_is_relative_to_the_served_window`.
+    #[test]
+    fn a_scrolled_pane_holds_still_while_output_arrives() {
         let mut app = App::new(100, 40);
         let t = TerminalId::new();
-        let mut parser = vt100::Parser::new(4, 20, 100);
-        for i in 0..30 {
-            parser.process(format!("line {i}\r\n").as_bytes());
-        }
-        app.parsers.insert(t, parser);
+        app.parsers
+            .insert(t, vt100::Parser::new(4, 20, CLIENT_SCROLLBACK));
         app.attached.insert(t, Size { cols: 20, rows: 4 });
-        app.scroll_mode = Some(t);
-        app.apply_scroll(t, 10); // scroll 10 rows back
+        app.on_scroll_view(t, 10, 500, b"an old window");
 
-        let before = app.parsers[&t].screen().contents();
-        let offset_before = app.scroll_offset;
-
-        // New output arrives — mirror the Output handler: process, then resync the cached offset.
-        {
-            let p = app.parsers.get_mut(&t).unwrap();
-            for i in 30..35 {
-                p.process(format!("line {i}\r\n").as_bytes());
-            }
+        let before = app.screen_for(t).unwrap().contents();
+        for i in 0..20 {
+            let bytes = format!("new line {i}\r\n").into_bytes();
+            app.parsers.get_mut(&t).unwrap().process(&bytes);
         }
-        app.scroll_offset = app.parsers[&t].screen().scrollback();
-
         assert_eq!(
             before,
-            app.parsers[&t].screen().contents(),
-            "the scrolled view stays on the same lines as output arrives"
-        );
-        assert_eq!(
-            app.scroll_offset,
-            offset_before + 5,
-            "the cached offset tracks the anchor (5 new lines)"
+            app.screen_for(t).unwrap().contents(),
+            "the served window is a still frame; new output must not move it"
         );
     }
 

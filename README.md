@@ -137,12 +137,16 @@ modifier. amux deliberately doesn't force the Kitty keyboard protocol on to get 
 Shift and slows typing), so if your terminal doesn't send it, use the prefix form.
 
 **Scroll mode** (`Ctrl+B [`, vi keys like tmux): `j`/`k` line, `Ctrl+U`/`Ctrl+D` half page,
-`PgUp`/`PgDn` page, `g`/`G` top/bottom, `q`/`Esc`/`Enter` back to live. Unavailable in panes
-running a full-screen app (there's no scrollback on the alternate screen).
+`PgUp`/`PgDn` page, `g`/`G` top/bottom, `q`/`Esc`/`Enter` back to live. The status bar shows how far
+back you are and how far back you can go. History belongs to the agent, not to your window: it
+survives switching agents and reconnecting, so you can open a long-running agent and scroll back
+through output from before you got there. Unavailable in panes running a full-screen app (there's no
+scrollback on the alternate screen).
 
-**Mouse:** click focuses; the wheel scrolls amux's scrollback, or is forwarded to apps that
-take the mouse (vim, less, Claude); drag to select and copy from a single pane (via OSC 52,
-works over SSH); hold `Shift` to bypass amux and use your terminal's native selection.
+**Mouse:** click focuses; the wheel scrolls back through history (wheel down to the bottom returns to
+live), or is forwarded to apps that take the mouse (vim, less, Claude); drag to select and copy from a
+single pane (via OSC 52, works over SSH); hold `Shift` to bypass amux and use your terminal's native
+selection.
 
 ## Command line
 
