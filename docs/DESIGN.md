@@ -309,9 +309,15 @@ saw. The daemon also holds each client's *position*, so a step means "one line f
 last showed you" and output arriving under a scrolled-back client cannot slide the view.
 
 The cost is `cols` cells of 32 bytes per retained line (~3.8 MB per 1000 lines at 120 columns),
-allocated only as a session actually produces history. Two limits are inherent and deliberate:
-history is capped, and vt100 saves no lines at all for the alternate screen or while a scroll
-region is set — a full-screen app has no scrollback, which clients report as "nothing to scroll".
+allocated only as a session actually produces history. Three limits are inherent and deliberate:
+history is capped; vt100 saves no lines at all for the alternate screen or while a scroll region is
+set (a full-screen app has no scrollback, which clients report as "nothing to scroll"); and history
+is **never reflowed** on resize, because vt100's `set_size` re-widths the visible grid only and
+exposes no way to re-wrap a saved row. A window is therefore served one saved row per display row —
+never `contents_formatted()`, which honours a `wrapped` flag a resize invalidates and would join
+those rows back together, returning a part-empty window. A row saved wider than the pane is
+truncated at the right edge; a row saved narrower simply ends early.
+
 2. **Status driver**: folds `RawSignal`s (mailbox events, OSC, activity, ticks, exit) through
    the `StatusSource` → `next_state` → on change, emit `StateChanged` to all clients.
 3. **PTY writer**: applies `Input`/`Resize` requests routed from clients.

@@ -1,6 +1,6 @@
 //! A persistent PTY session, shared across client attach/detach. The reader thread feeds a
 //! vt100 parser (the screen for snapshots, and the scrollback clients page through — see
-//! [`Session::scroll_view`]) and a broadcast channel (for live attach); a waiter thread
+//! [`Session::scroll_step`]) and a broadcast channel (for live attach); a waiter thread
 //! reaps the child and flips a `watch` on exit. Killing is by PID, so no one has to own the
 //! `Child` mutably while others read/write. See `docs/DESIGN.md` §5.
 //!
@@ -53,7 +53,7 @@ fn terminfo_exists(name: &str) -> bool {
 }
 
 /// Scrollback retained by the daemon-side parser. This *is* the scroll history clients page
-/// through ([`Session::scroll_view`]) — the daemon owns it, so there is exactly one copy and no
+/// through ([`Session::scroll_step`]) — the daemon owns it, so there is exactly one copy and no
 /// client has to be handed it up front.
 ///
 /// The cost is real but proportional to use: a scrolled-off line holds `cols` cells of 32 bytes, so
@@ -73,6 +73,32 @@ pub struct ScrollPos {
     pub depth: usize,
 }
 
+/// A scroll window as escape codes: each row of `screen` drawn at the row it occupies.
+///
+/// Emitted row by row rather than with `contents_formatted()` because that honours `row.wrapped()`,
+/// and a resize makes that flag lie. vt100's `set_size` re-widths the *visible* grid only — saved
+/// rows keep the width they were recorded at — so after a pane gets wider, rows that wrapped at the
+/// old width are joined back into one line and the window comes back part-empty: a 40-row pane can
+/// render 20 lines of history and 20 blank rows. Drawing one saved row per display row keeps the
+/// window full and puts history where it was when it scrolled past.
+///
+/// Safe despite `rows_formatted`'s contract that a row's bytes assume the cursor already sits on the
+/// row that row came from: here row `i` of the window really is drawn at row `i`. At a stable width
+/// this is byte-for-byte equivalent to `contents_formatted()` (both round-trip to the screen's own
+/// `rows()`), so it changes nothing but the mixed-width case.
+///
+/// History is not reflowed — nothing in vt100 can re-wrap a saved row — so a row saved wider than the
+/// pane is truncated at the right edge. One row in, one row out, whatever the width.
+fn window_bytes(screen: &vt100::Screen) -> Vec<u8> {
+    let cols = screen.size().1;
+    let mut out = b"\x1b[H\x1b[J".to_vec(); // clear, so a short row leaves blanks not leftovers
+    for (i, row) in screen.rows_formatted(0, cols).enumerate() {
+        out.extend_from_slice(format!("\x1b[{};1H", i + 1).as_bytes());
+        out.extend_from_slice(&row);
+    }
+    out
+}
+
 /// One screenful of a session's history, plus where it sits — the reply to a scroll request.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ScrollFrame {
@@ -81,7 +107,7 @@ pub struct ScrollFrame {
     pub offset: usize,
     /// How far back history goes right now, i.e. the largest meaningful `offset`.
     pub available: usize,
-    /// The window as escape codes, ready to feed to a parser (`contents_formatted` at `offset`).
+    /// The window as escape codes, ready to feed to a parser (see [`window_bytes`]).
     pub bytes: Vec<u8>,
 }
 
@@ -200,7 +226,7 @@ impl Session {
     /// mouse tracking (breaks wheel forwarding), the alternate screen, and DECCKM (arrow keys).
     ///
     /// Deliberately the visible screen only. History is not shipped on attach — clients page through
-    /// it on demand via [`Self::scroll_view`], so a snapshot stays small no matter how deep history
+    /// it on demand via [`Self::scroll_step`], so a snapshot stays small no matter how deep history
     /// runs, and scrolling depth doesn't depend on when a client happened to attach.
     pub fn snapshot(&self) -> Vec<u8> {
         let Ok(parser) = self.parser.lock() else {
@@ -278,7 +304,7 @@ impl Session {
 
         parser.screen_mut().set_scrollback(target);
         let offset = parser.screen().scrollback(); // clamped by vt100 to what exists
-        let bytes = parser.screen().contents_formatted();
+        let bytes = window_bytes(parser.screen());
         parser.screen_mut().set_scrollback(0);
         ScrollFrame {
             offset,
@@ -532,6 +558,79 @@ mod tests {
             before_rows[..before_rows.len() - 1],
             "one line older than what the user was looking at"
         );
+    }
+
+    /// A session whose output wraps, so saved rows carry vt100's `wrapped` flag — the flag a resize
+    /// invalidates.
+    fn session_with_wrapping_lines(rows: u16, cols: u16, n: usize) -> Arc<Session> {
+        let session = Session::spawn(
+            &["cat".to_string()],
+            Path::new("/"),
+            &[],
+            Size { rows, cols },
+        )
+        .expect("spawn cat");
+        // Comfortably wider than `cols`, so every line occupies two saved rows.
+        let input: String = (0..n)
+            .map(|i| format!("{i:03}:{}\n", "abcdefghij".repeat(4)))
+            .collect();
+        session.write_input(input.as_bytes()).expect("write");
+        let needle = format!("{:03}:", n - 1);
+        for _ in 0..100 {
+            if let Ok(parser) = session.parser.lock() {
+                if parser.screen().contents().contains(&needle) {
+                    break;
+                }
+            }
+            thread::sleep(Duration::from_millis(20));
+        }
+        session
+    }
+
+    /// A window must be full of history, whatever the pane has been resized to since. vt100 re-widths
+    /// only the visible grid, so saved rows keep the width they were recorded at; serving them with
+    /// `contents_formatted()` re-joined rows that had wrapped at the old width and left the rest of
+    /// the window blank — up to half a tall pane, which reads as wildly wrong spacing.
+    #[test]
+    fn a_widened_pane_still_serves_a_full_window_of_history() {
+        let session = session_with_wrapping_lines(10, 40, 120);
+        // The pane gets wider — a window resize, a closed split, a mini promoted to the main area.
+        session.resize(Size { rows: 10, cols: 80 }).unwrap();
+
+        let frame = session.scroll_step(None, 20);
+        let mut client = vt100::Parser::new(10, 80, 0);
+        client.process(&frame.bytes);
+        let rows: Vec<String> = client.screen().rows(0, 80).collect();
+
+        assert_eq!(rows.len(), 10, "a full screenful");
+        let blank = rows.iter().filter(|r| r.trim().is_empty()).count();
+        assert_eq!(
+            blank, 0,
+            "no blank filler: one saved row per display row, got {rows:#?}"
+        );
+    }
+
+    /// The property that keeps the change honest: at a stable width, serving a window is exactly what
+    /// the daemon's own screen shows at that offset — for wrapped and styled output, at every offset.
+    /// Any drift here is a formatting surprise in a scrolled pane.
+    #[test]
+    fn a_served_window_matches_the_screen_it_came_from() {
+        let session = session_with_wrapping_lines(6, 40, 60);
+        let mut parser = session.parser.lock().unwrap();
+        parser.screen_mut().set_scrollback(usize::MAX);
+        let depth = parser.screen().scrollback();
+        assert!(depth > 10, "precondition: some history to walk");
+
+        for offset in 0..=depth {
+            parser.screen_mut().set_scrollback(offset);
+            let expected: Vec<String> = parser.screen().rows(0, 40).collect();
+            let bytes = window_bytes(parser.screen());
+            let mut client = vt100::Parser::new(6, 40, 0);
+            client.process(&bytes);
+            let actual: Vec<String> = client.screen().rows(0, 40).collect();
+            assert_eq!(actual, expected, "window at offset {offset} differs");
+        }
+        parser.screen_mut().set_scrollback(0);
     }
 
     /// A session with nothing scrolled off reports no history, which is what lets the client say
