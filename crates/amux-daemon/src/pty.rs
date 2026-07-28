@@ -1,5 +1,6 @@
 //! A persistent PTY session, shared across client attach/detach. The reader thread feeds a
-//! vt100 parser (for snapshots) and a broadcast channel (for live attach); a waiter thread
+//! vt100 parser (the screen for snapshots, and the scrollback clients page through — see
+//! [`Session::scroll_view`]) and a broadcast channel (for live attach); a waiter thread
 //! reaps the child and flips a `watch` on exit. Killing is by PID, so no one has to own the
 //! `Child` mutably while others read/write. See `docs/DESIGN.md` §5.
 //!
@@ -51,51 +52,39 @@ fn terminfo_exists(name: &str) -> bool {
         .unwrap_or(false)
 }
 
-/// Scrollback retained by the daemon-side parser (used for snapshots).
-const SCROLLBACK: usize = 2000;
-/// How many lines of that scrollback ride along in a snapshot. Below [`SCROLLBACK`] on purpose:
-/// a snapshot is re-sent on every attach (every agent switch), and the replay costs roughly a
-/// screenful of escape codes per screenful of history — deep enough to scroll back through a
-/// conversation, bounded well under `MAX_FRAME_BYTES`.
-const SNAPSHOT_SCROLLBACK: usize = 1000;
-
-/// Escape codes that reproduce the parser's scrollback in a *client's* parser, oldest line first.
+/// Scrollback retained by the daemon-side parser. This *is* the scroll history clients page
+/// through ([`Session::scroll_view`]) — the daemon owns it, so there is exactly one copy and no
+/// client has to be handed it up front.
 ///
-/// A client rebuilds its parser from the snapshot, so its scrollback ring starts empty and can only
-/// be filled the way a live one is: by lines scrolling off the top of the screen. So walk history a
-/// screenful at a time — paint the window, then park on the last row and emit exactly enough
-/// newlines to scroll that window off — and the lines land in the client's ring in order. Per
-/// screenful rather than per row because a single serialized row assumes the cursor already sits on
-/// the row it came from (`rows_formatted`'s contract), while `contents_formatted` positions a whole
-/// screen for itself.
+/// The cost is real but proportional to use: a scrolled-off line holds `cols` cells of 32 bytes, so
+/// roughly 3.8 MB per 1000 lines at 120 columns, allocated only as a session actually produces
+/// history. 5000 lines is ~25 screenfuls under `less`-like use and covers a long agent
+/// conversation; a session that never scrolls costs nothing.
+const SCROLLBACK: usize = 5000;
+
+/// Where a client's scrolled-back window sits, and how deep history was when it was served.
 ///
-/// Leaves the parser's scroll position as it found it.
-fn history_replay(parser: &mut vt100::Parser) -> Vec<u8> {
-    let restore = parser.screen().scrollback();
-    // `set_scrollback` clamps to what's there, so this asks for "as far back as possible".
-    parser.screen_mut().set_scrollback(usize::MAX);
-    let available = parser.screen().scrollback().min(SNAPSHOT_SCROLLBACK);
-    let rows = usize::from(parser.screen().size().0).max(1);
-
-    let mut out = Vec::new();
-    let mut back = available;
-    while back > 0 {
-        parser.screen_mut().set_scrollback(back);
-        out.extend_from_slice(&parser.screen().contents_formatted());
-        // The last window is short when history isn't a whole multiple of a screen; scrolling only
-        // `back` lines there leaves the live screen's own rows in place, to be overwritten by the
-        // repaint that follows this replay.
-        let scroll = back.min(rows);
-        out.extend_from_slice(format!("\x1b[{rows};1H").as_bytes());
-        for _ in 0..scroll {
-            out.extend_from_slice(b"\r\n");
-        }
-        back -= scroll;
-    }
-
-    parser.screen_mut().set_scrollback(restore);
-    out
+/// The pair is what makes a *relative* step exact: comparing the recorded depth with the current one
+/// says how much output has arrived since, which is how far the window has drifted from the live
+/// view. Held per client (two clients scroll the same session independently), never by the session.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ScrollPos {
+    pub offset: usize,
+    pub depth: usize,
 }
+
+/// One screenful of a session's history, plus where it sits — the reply to a scroll request.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ScrollFrame {
+    /// Lines back from the live view, *clamped* to what history exists. The client renders what it
+    /// is given rather than tracking the limit itself.
+    pub offset: usize,
+    /// How far back history goes right now, i.e. the largest meaningful `offset`.
+    pub available: usize,
+    /// The window as escape codes, ready to feed to a parser (`contents_formatted` at `offset`).
+    pub bytes: Vec<u8>,
+}
+
 /// Broadcast backlog per session (chunks). On overflow a lagging client resyncs via snapshot.
 const OUTPUT_BACKLOG: usize = 1024;
 
@@ -206,16 +195,18 @@ impl Session {
     }
 
     /// Current screen as a `contents_formatted()` dump — sent to a (re)attaching client. Prefixed
-    /// with **scrollback** and a **mode preamble**, because `contents_formatted()` describes only
-    /// the visible screen: without the former a client could scroll back zero lines, and without
-    /// the latter it would lose mouse tracking (breaks wheel forwarding), the alternate screen,
-    /// and DECCKM (arrow keys).
+    /// with a **mode preamble** because `contents_formatted()` replays cells + attributes but NOT
+    /// terminal modes: without this, a client rebuilding its parser from the snapshot would lose
+    /// mouse tracking (breaks wheel forwarding), the alternate screen, and DECCKM (arrow keys).
+    ///
+    /// Deliberately the visible screen only. History is not shipped on attach — clients page through
+    /// it on demand via [`Self::scroll_view`], so a snapshot stays small no matter how deep history
+    /// runs, and scrolling depth doesn't depend on when a client happened to attach.
     pub fn snapshot(&self) -> Vec<u8> {
-        let Ok(mut parser) = self.parser.lock() else {
+        let Ok(parser) = self.parser.lock() else {
             return Vec::new();
         };
         let mut out = Vec::new();
-        out.extend_from_slice(&history_replay(&mut parser));
         let screen = parser.screen();
         if screen.alternate_screen() {
             out.extend_from_slice(b"\x1b[?1049h");
@@ -237,6 +228,63 @@ impl Session {
         });
         out.extend_from_slice(&screen.contents_formatted());
         out
+    }
+
+    /// Move a client's scroll position by `lines` and serve the window it lands on.
+    ///
+    /// This is the whole of scrolling: the daemon holds the history, so a client never keeps its own
+    /// copy (`DESIGN.md` §2, invariant 2) and depth is whatever this session has retained rather than
+    /// whatever a client happened to observe live.
+    ///
+    /// `from` is where we last put that client (`None` = at the live view). History grows underneath
+    /// a scrolled-back client, and that growth is exactly how far its window has drifted from live,
+    /// so it is added back before the step: one keypress moves one line from *what the user is
+    /// looking at*, even on a pane that is streaming output.
+    ///
+    /// Depth is read and the window rendered under a single lock, and the same depth is both used for
+    /// that correction and reported as `available`. Splitting them across two locks loses drift
+    /// permanently — a chunk landing in between records the *new* depth against the *old* offset, so
+    /// the growth it represents can never be accounted for again.
+    ///
+    /// The target is clamped to available history and the clamped value comes back in the frame, so a
+    /// client renders where it actually is rather than predicting it.
+    ///
+    /// A pane on the alternate screen (a full-screen app) has no history by design: vt100 saves lines
+    /// only as they scroll off the *normal* screen, and none at all while a scroll region is set. Such
+    /// a session reports `available: 0`, which clients render as "nothing to scroll".
+    pub fn scroll_step(&self, from: Option<ScrollPos>, lines: i32) -> ScrollFrame {
+        let Ok(mut parser) = self.parser.lock() else {
+            return ScrollFrame {
+                offset: 0,
+                available: 0,
+                bytes: Vec::new(),
+            };
+        };
+        // `set_scrollback` clamps to what exists, so this reads the depth: ask for everything, see
+        // what we got. The live view sits at offset 0 and is restored before returning, so nothing
+        // else (snapshots, status heuristics) ever sees a moved view.
+        parser.screen_mut().set_scrollback(usize::MAX);
+        let available = parser.screen().scrollback();
+
+        let base = match from {
+            Some(pos) => pos.offset + available.saturating_sub(pos.depth),
+            None => 0,
+        };
+        let target = if lines >= 0 {
+            base.saturating_add(lines as usize)
+        } else {
+            base.saturating_sub(lines.unsigned_abs() as usize)
+        };
+
+        parser.screen_mut().set_scrollback(target);
+        let offset = parser.screen().scrollback(); // clamped by vt100 to what exists
+        let bytes = parser.screen().contents_formatted();
+        parser.screen_mut().set_scrollback(0);
+        ScrollFrame {
+            offset,
+            available,
+            bytes,
+        }
     }
 
     pub fn subscribe(&self) -> broadcast::Receiver<Vec<u8>> {
@@ -326,9 +374,9 @@ impl Drop for Session {
 mod tests {
     use super::*;
 
-    /// Feed a session `n` numbered lines through `cat` and return the snapshot once the parser has
-    /// caught up (or after a bounded wait, so a stuck child fails the assertion, not the suite).
-    fn snapshot_after_lines(rows: u16, n: usize) -> Vec<u8> {
+    /// A session fed `n` numbered lines through `cat`, once the parser has caught up (bounded wait,
+    /// so a stuck child fails an assertion rather than hanging the suite).
+    fn session_with_lines(rows: u16, n: usize) -> Arc<Session> {
         let session = Session::spawn(
             &["cat".to_string()],
             Path::new("/"),
@@ -339,7 +387,6 @@ mod tests {
         let input: String = (0..n).map(|i| format!("line {i}\n")).collect();
         session.write_input(input.as_bytes()).expect("write");
 
-        // `cat` echoes back through the PTY; poll until the newest line has landed.
         let needle = format!("line {}", n - 1);
         for _ in 0..100 {
             if let Ok(parser) = session.parser.lock() {
@@ -349,74 +396,156 @@ mod tests {
             }
             thread::sleep(Duration::from_millis(20));
         }
-        session.snapshot()
+        session
     }
 
-    /// Rebuild a client-side parser from `snapshot` bytes, exactly as the TUI does.
-    fn replay(snapshot: &[u8], rows: u16) -> vt100::Parser {
-        let mut client = vt100::Parser::new(rows, 40, SCROLLBACK);
-        client.process(snapshot);
-        client
+    /// Render a frame the way the TUI does: feed it to a parser and read the screen.
+    fn rendered(frame: &ScrollFrame, rows: u16) -> String {
+        let mut client = vt100::Parser::new(rows, 40, 0);
+        client.process(&frame.bytes);
+        client.screen().contents()
     }
 
-    /// THE regression guard: a snapshot must carry scrollback, not just the visible screen. It
-    /// didn't, so every attach — and attaches happen on every agent switch — handed the client a
-    /// parser with an empty ring. The wheel then "scrolled" a pane that had no history in it,
-    /// silently doing nothing until enough new output had accumulated to refill it.
+    /// The core of daemon-owned scrolling: a client asks for a window into history and gets exactly
+    /// that window, with depth that has nothing to do with when it attached. Previously the client
+    /// scrolled a private ring that only held output it had personally witnessed since its last
+    /// attach — so scrolling reached ~nothing on a freshly opened pane and reset on every agent
+    /// switch.
     #[test]
-    fn snapshot_carries_scrollback_so_a_reattaching_client_can_scroll_back() {
-        let snapshot = snapshot_after_lines(10, 200);
-        let mut client = replay(&snapshot, 10);
+    fn scroll_step_serves_history_a_window_at_a_time() {
+        let session = session_with_lines(10, 200);
 
-        client.screen_mut().set_scrollback(usize::MAX);
-        let depth = client.screen().scrollback();
+        let live = session.scroll_step(None, 0);
+        assert_eq!(live.offset, 0);
         assert!(
-            depth >= 150,
-            "a client rebuilt from the snapshot must inherit history; got {depth} lines"
+            live.available >= 150,
+            "history should be deep after 200 lines on a 10-row screen; got {}",
+            live.available
+        );
+        assert!(
+            rendered(&live, 10).contains("line 199"),
+            "offset 0 is the live view"
         );
 
-        // Scrolled all the way back, it sees the *start* of the output — the part that was
-        // previously unreachable.
-        let oldest = client.screen().contents();
+        // Scrolled back to the very start, the client sees the beginning of the output.
+        let oldest = session.scroll_step(None, i32::MAX);
+        assert_eq!(
+            oldest.offset, live.available,
+            "asked for the top, got the top"
+        );
+        let text = rendered(&oldest, 10);
         assert!(
-            oldest.contains("line 5"),
-            "the oldest window should hold early lines, got: {oldest:?}"
+            text.contains("line 0") || text.contains("line 1"),
+            "the deepest window holds the first lines, got: {text:?}"
         );
 
-        // And the live view is still correct: history replay must not disturb the visible screen.
-        client.screen_mut().set_scrollback(0);
-        let live = client.screen().contents();
+        // And a window in between is genuinely in between.
+        let middle = session.scroll_step(None, (live.available / 2) as i32);
+        let middle_text = rendered(&middle, 10);
         assert!(
-            live.contains("line 199"),
-            "the visible screen must still show the newest output, got: {live:?}"
-        );
-    }
-
-    /// History is capped, and the cap is what bounds the frame — a session that has scrolled far
-    /// more than [`SNAPSHOT_SCROLLBACK`] lines must not replay its whole ring.
-    #[test]
-    fn snapshot_scrollback_is_bounded() {
-        // The daemon parser keeps SCROLLBACK lines; ask for more history than the cap allows.
-        let snapshot = snapshot_after_lines(10, SNAPSHOT_SCROLLBACK + 300);
-        let mut client = replay(&snapshot, 10);
-        client.screen_mut().set_scrollback(usize::MAX);
-        let depth = client.screen().scrollback();
-        assert!(
-            depth <= SNAPSHOT_SCROLLBACK,
-            "history must be capped at {SNAPSHOT_SCROLLBACK}, got {depth}"
+            !middle_text.contains("line 199") && !middle_text.contains("line 0"),
+            "a mid-history window shows neither end, got: {middle_text:?}"
         );
     }
 
-    /// `history_replay` borrows the live parser to walk its ring; it must hand back the scroll
-    /// position it found, or the daemon's own view would drift every time a client attached.
+    /// The daemon clamps, and says what it clamped to. The client renders the reply rather than
+    /// tracking the limit itself, so an over-scroll can't leave the two disagreeing about position.
     #[test]
-    fn history_replay_restores_the_scroll_position() {
-        let mut parser = vt100::Parser::new(4, 20, SCROLLBACK);
-        for i in 0..50 {
-            parser.process(format!("line {i}\r\n").as_bytes());
+    fn scroll_step_clamps_past_the_end_of_history() {
+        let session = session_with_lines(10, 100);
+        let frame = session.scroll_step(None, i32::MAX);
+        assert_eq!(
+            frame.offset, frame.available,
+            "an absurd offset comes back clamped to the oldest line"
+        );
+        assert!(!frame.bytes.is_empty(), "and still renders a window");
+    }
+
+    /// Serving a window must not disturb the session: it borrows the parser's scroll position, and
+    /// snapshots (and the status heuristics) must still see the live screen afterwards.
+    #[test]
+    fn scroll_step_leaves_the_live_view_untouched() {
+        let session = session_with_lines(10, 100);
+        let _ = session.scroll_step(None, 50);
+
+        assert_eq!(
+            session.parser.lock().unwrap().screen().scrollback(),
+            0,
+            "the parser is back at the live view"
+        );
+        let mut client = vt100::Parser::new(10, 40, 0);
+        client.process(&session.snapshot());
+        assert!(
+            client.screen().contents().contains("line 99"),
+            "a snapshot taken after a scroll still shows the newest output"
+        );
+    }
+
+    /// The re-basing that makes a relative step exact: with output arriving under a scrolled-back
+    /// client, a zero-line step must land on *the same content*, and a one-line step exactly one line
+    /// older. Both depend on depth and window coming from one lock — measuring depth separately loses
+    /// the correction for good, which showed up as the view jumping a whole batch of new output.
+    #[test]
+    fn scroll_step_re_bases_past_output_that_arrived_since() {
+        let session = session_with_lines(10, 200);
+        let first = session.scroll_step(None, 20);
+        let before = rendered(&first, 10);
+        let pos = ScrollPos {
+            offset: first.offset,
+            depth: first.available,
+        };
+
+        // More output lands while the client sits scrolled back.
+        session.write_input(b"extra 0\nextra 1\nextra 2\n").unwrap();
+        for _ in 0..100 {
+            if session.scroll_step(None, 0).available > first.available {
+                break;
+            }
+            thread::sleep(Duration::from_millis(20));
         }
-        parser.screen_mut().set_scrollback(7);
-        let _ = history_replay(&mut parser);
-        assert_eq!(parser.screen().scrollback(), 7, "scroll position restored");
+
+        let held = session.scroll_step(Some(pos), 0);
+        assert_eq!(
+            rendered(&held, 10),
+            before,
+            "a zero-line step holds the window it was showing, however much output arrived"
+        );
+        assert!(
+            held.offset > pos.offset,
+            "and it did so by moving deeper ({} -> {}), not by standing still",
+            pos.offset,
+            held.offset
+        );
+
+        let stepped = session.scroll_step(
+            Some(ScrollPos {
+                offset: held.offset,
+                depth: held.available,
+            }),
+            1,
+        );
+        let after = rendered(&stepped, 10);
+        let (before_rows, after_rows): (Vec<_>, Vec<_>) =
+            (before.lines().collect(), after.lines().collect());
+        assert_eq!(
+            after_rows[1..],
+            before_rows[..before_rows.len() - 1],
+            "one line older than what the user was looking at"
+        );
+    }
+
+    /// A session with nothing scrolled off reports no history, which is what lets the client say
+    /// "nothing to scroll" instead of entering a scroll mode that can't move.
+    #[test]
+    fn scroll_step_reports_no_history_for_a_fresh_session() {
+        let session = Session::spawn(
+            &["cat".to_string()],
+            Path::new("/"),
+            &[],
+            Size { rows: 10, cols: 40 },
+        )
+        .expect("spawn cat");
+        let frame = session.scroll_step(None, 3);
+        assert_eq!((frame.offset, frame.available), (0, 0));
     }
 }

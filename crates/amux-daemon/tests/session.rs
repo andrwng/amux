@@ -20,6 +20,11 @@ use tokio_util::codec::Framed;
 
 type Client = Framed<UnixStream, ClientCodec>;
 
+/// The size the daemon spawns a session at (`registry::DEFAULT_SIZE`), which is the size scroll
+/// windows come back at.
+const DEFAULT_ROWS: u16 = 24;
+const DEFAULT_COLS: u16 = 80;
+
 fn init_repo(dir: &Path) {
     let repo = Repository::init(dir).unwrap();
     {
@@ -145,6 +150,119 @@ async fn wait_for_removed(client: &mut Client, id: AgentId) -> bool {
     })
     .await
     .unwrap_or(false)
+}
+
+/// Ask for a scroll window and wait for the reply, ignoring the unrelated traffic in between.
+async fn scroll(client: &mut Client, terminal: TerminalId, lines: i32) -> (usize, usize, Vec<u8>) {
+    client
+        .send(ClientMsg::Scroll { terminal, lines })
+        .await
+        .unwrap();
+    tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            match client.next().await {
+                Some(Ok(DaemonMsg::ScrollView {
+                    offset,
+                    available,
+                    bytes,
+                    ..
+                })) => return (offset, available, bytes),
+                Some(Ok(_)) => {}
+                other => panic!("stream ended before ScrollView: {other:?}"),
+            }
+        }
+    })
+    .await
+    .expect("timed out waiting for ScrollView")
+}
+
+/// The rows of a served window, as text — what the user would see.
+fn window_rows(bytes: &[u8], rows: u16, cols: u16) -> Vec<String> {
+    let mut parser = vt100::Parser::new(rows, cols, 0);
+    parser.process(bytes);
+    parser.screen().rows(0, cols).collect()
+}
+
+/// Send `n` numbered lines to a terminal and wait until history has grown by roughly that much.
+async fn feed_lines(client: &mut Client, terminal: TerminalId, range: std::ops::Range<usize>) {
+    let (_, before, _) = scroll(client, terminal, 0).await;
+    let want = before + (range.end - range.start) / 2; // echoed twice (pty echo + `cat`)
+    let input: String = range.map(|i| format!("line {i}\n")).collect();
+    client
+        .send(ClientMsg::Input {
+            terminal,
+            bytes: input.into_bytes(),
+        })
+        .await
+        .unwrap();
+    for _ in 0..100 {
+        let (_, available, _) = scroll(client, terminal, 0).await;
+        if available >= want {
+            return;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    panic!("history never grew after feeding lines");
+}
+
+/// THE regression test for the bug that started this: scroll depth must not depend on when a client
+/// attached. Here the client never attaches at all — it writes output, then scrolls back into it —
+/// because the daemon owns the history. Previously a client could only scroll a private ring holding
+/// what it had personally witnessed since its last attach, so a freshly opened pane scrolled back
+/// almost nothing and every agent switch reset it.
+#[tokio::test]
+async fn scroll_history_is_deeper_than_what_a_client_witnessed() {
+    let (mut client, repo, _tmp) = setup().await;
+    let info = create_agent(&mut client, repo, "feat/scroll").await;
+    let terminal = info.primary_terminal;
+
+    feed_lines(&mut client, terminal, 0..300).await;
+
+    // Jump to the very start of history: `offset` and `available` from the *same* reply, since the
+    // agent may still be writing (comparing across replies would race with its output).
+    let (offset, available, bytes) = scroll(&mut client, terminal, i32::MAX).await;
+    assert!(
+        available > 100,
+        "the daemon should hold deep history; got {available} lines"
+    );
+    assert_eq!(offset, available, "i32::MAX lands on the oldest line");
+    let text = window_rows(&bytes, DEFAULT_ROWS, DEFAULT_COLS).join("\n");
+    assert!(
+        text.contains("line 0") || text.contains("line 1"),
+        "the oldest window holds the first lines written, got: {text:?}"
+    );
+}
+
+/// A scroll step means "one line from the window you showed me", even when output has arrived since.
+/// The daemon re-bases the position it holds for the client, so a pane streaming output can't slide
+/// the view out from under the next keypress — the reason the wire carries a relative step rather
+/// than an absolute offset.
+#[tokio::test]
+async fn scroll_step_is_relative_to_the_served_window() {
+    let (mut client, repo, _tmp) = setup().await;
+    let info = create_agent(&mut client, repo, "feat/anchor").await;
+    let terminal = info.primary_terminal;
+
+    feed_lines(&mut client, terminal, 0..300).await;
+    let (first_offset, _, bytes) = scroll(&mut client, terminal, 20).await;
+    let before = window_rows(&bytes, DEFAULT_ROWS, DEFAULT_COLS);
+
+    // Output arrives while we sit scrolled back.
+    feed_lines(&mut client, terminal, 300..340).await;
+
+    // One line back from what we were shown — not one line back from the *new* bottom.
+    let (second_offset, _, bytes) = scroll(&mut client, terminal, 1).await;
+    let after = window_rows(&bytes, DEFAULT_ROWS, DEFAULT_COLS);
+
+    assert!(
+        second_offset > first_offset,
+        "the position was re-based past the new output ({first_offset} -> {second_offset})"
+    );
+    assert_eq!(
+        after[1..],
+        before[..before.len() - 1],
+        "the window moved exactly one line older, not to wherever the new bottom put it"
+    );
 }
 
 #[tokio::test]

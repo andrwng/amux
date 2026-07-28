@@ -24,6 +24,7 @@ use amux_proto::{
     check_version, ClientCodec, ClientMsg, DaemonMsg, ServerCodec, Size, PROTO_VERSION,
 };
 
+use crate::pty::ScrollPos;
 use crate::registry::{DeleteOutcome, Registry};
 
 /// How long to wait for a daemon to answer the probe handshake. It only has to serialize a
@@ -248,11 +249,12 @@ async fn handle_client(stream: UnixStream, registry: Arc<Registry>) -> Result<()
     let (out_tx, mut out_rx) = mpsc::unbounded_channel::<DaemonMsg>();
     let mut events = registry.subscribe_events();
     let mut attached: Attachments = HashMap::new();
+    let mut scroll: ScrollPositions = HashMap::new();
 
     loop {
         tokio::select! {
             command = stream.next() => match command {
-                Some(Ok(msg)) => handle_command(msg, &registry, &out_tx, &mut attached),
+                Some(Ok(msg)) => handle_command(msg, &registry, &out_tx, &mut attached, &mut scroll),
                 _ => break,
             },
             outbound = out_rx.recv() => match outbound {
@@ -282,6 +284,7 @@ fn handle_command(
     registry: &Arc<Registry>,
     out_tx: &mpsc::UnboundedSender<DaemonMsg>,
     attached: &mut Attachments,
+    scroll: &mut ScrollPositions,
 ) {
     let report_err = |result: Result<()>| {
         if let Err(e) = result {
@@ -332,6 +335,7 @@ fn handle_command(
         }
         ClientMsg::CloseTerminal { terminal } => {
             detach(attached, terminal);
+            scroll.remove(&terminal);
             registry.close_terminal(terminal);
         }
         ClientMsg::Focus { agent } => registry.focus(agent),
@@ -353,7 +357,11 @@ fn handle_command(
             }
         },
         ClientMsg::Attach { terminal, size } => attach(attached, registry, out_tx, terminal, size),
-        ClientMsg::Detach { terminal } => detach(attached, terminal),
+        ClientMsg::Detach { terminal } => {
+            // A pane we are no longer showing can't be scrolled, so its position goes with it.
+            scroll.remove(&terminal);
+            detach(attached, terminal)
+        }
         ClientMsg::Input { terminal, bytes } => {
             if let Some(session) = registry.session(terminal) {
                 let _ = session.write_input(&bytes);
@@ -363,6 +371,9 @@ fn handle_command(
             if let Some(session) = registry.session(terminal) {
                 let _ = session.resize(size);
             }
+        }
+        ClientMsg::Scroll { terminal, lines } => {
+            scroll_view(scroll, registry, out_tx, terminal, lines)
         }
     }
 }
@@ -421,6 +432,48 @@ fn attach(
         }
     });
     attached.insert(terminal, forwarder);
+}
+
+/// Where each scrolled-back terminal's view sits for *this* client, and how deep history was when
+/// we served it. Per connection, so two clients scroll the same terminal independently, and dropped
+/// as soon as a client returns to the live view — nothing accumulates for panes nobody is scrolling.
+type ScrollPositions = HashMap<TerminalId, ScrollPos>;
+
+/// Move this client's scroll position by `lines` and send it the window that lands on.
+///
+/// The step is relative and the session re-bases it past output that has arrived since we last
+/// served this client (see [`Session::scroll_step`]); all this layer does is remember where each
+/// client is. That correction is exact until history reaches its cap and begins dropping lines, past
+/// which the oldest window ages out no matter what we do.
+fn scroll_view(
+    scroll: &mut ScrollPositions,
+    registry: &Arc<Registry>,
+    out_tx: &mpsc::UnboundedSender<DaemonMsg>,
+    terminal: TerminalId,
+    lines: i32,
+) {
+    let Some(session) = registry.session(terminal) else {
+        return;
+    };
+    let frame = session.scroll_step(scroll.get(&terminal).copied(), lines);
+    // Offset 0 *is* the live view, so there is no position left to remember.
+    if frame.offset == 0 {
+        scroll.remove(&terminal);
+    } else {
+        scroll.insert(
+            terminal,
+            ScrollPos {
+                offset: frame.offset,
+                depth: frame.available,
+            },
+        );
+    }
+    let _ = out_tx.send(DaemonMsg::ScrollView {
+        terminal,
+        offset: frame.offset,
+        available: frame.available,
+        bytes: frame.bytes,
+    });
 }
 
 fn detach(attached: &mut Attachments, terminal: TerminalId) {

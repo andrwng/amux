@@ -287,8 +287,7 @@ Both are user-only permissioned and live in the user runtime dir.
 AgentHandle {
     agent: Agent,
     pty_master, child,                 // portable-pty
-    parser: vt100::Parser,             // daemon-side screen (for OSC + snapshots + heuristics)
-    scrollback: RingBuffer,            // bounded recent output for late-joining clients
+    parser: vt100::Parser,             // daemon-side screen + scroll history (see below)
     status: Box<dyn StatusSource>,
     output_tx: broadcast::Sender<Bytes>,   // fan-out raw PTY bytes to subscribed clients
     state: AgentState,
@@ -297,8 +296,22 @@ AgentHandle {
 
 Per agent, three concerns run as owned tokio tasks:
 
-1. **PTY reader**: read master → (a) feed daemon `vt100::Parser`, (b) scan for OSC, (c) push
-   into `scrollback`, (d) `output_tx.send(bytes)`, (e) feed `PtyActivity` to the status source.
+1. **PTY reader**: read master → (a) feed daemon `vt100::Parser`, (b) scan for OSC,
+   (c) `output_tx.send(bytes)`, (d) feed `PtyActivity` to the status source.
+
+**Scroll history lives here, and only here.** The sketch above had a separate `scrollback:
+RingBuffer` beside the parser; in practice the parser's own bounded scrollback *is* that buffer
+(`SCROLLBACK`, currently 5000 lines), so there is one copy rather than two. Clients hold none: a
+client asks for a window (`ClientMsg::Scroll`) and renders the reply (§6), which is what keeps
+invariant 2 honest for history and makes scroll depth independent of when a client attached — a
+client that attaches to a long-running agent can immediately scroll back through output it never
+saw. The daemon also holds each client's *position*, so a step means "one line from the window I
+last showed you" and output arriving under a scrolled-back client cannot slide the view.
+
+The cost is `cols` cells of 32 bytes per retained line (~3.8 MB per 1000 lines at 120 columns),
+allocated only as a session actually produces history. Two limits are inherent and deliberate:
+history is capped, and vt100 saves no lines at all for the alternate screen or while a scroll
+region is set — a full-screen app has no scrollback, which clients report as "nothing to scroll".
 2. **Status driver**: folds `RawSignal`s (mailbox events, OSC, activity, ticks, exit) through
    the `StatusSource` → `next_state` → on change, emit `StateChanged` to all clients.
 3. **PTY writer**: applies `Input`/`Resize` requests routed from clients.
@@ -392,6 +405,14 @@ both sides refuse mismatches.
 > all carry a `terminal`. A split adds a shell terminal in the same worktree via
 > `SpawnShell { terminal, like }`, closed with `CloseTerminal { terminal }`. `AgentInfo` carries
 > its `primary_terminal`. The sketch below is kept for the shape of the create/roster half.
+>
+> **Scrolling (v19)** is a request/reply pair: `Scroll { terminal, lines }` moves this client's
+> position by a *relative* step (`i32::MIN` = back to live, which also says "I've left scroll
+> mode") and the daemon answers `ScrollView { terminal, offset, available, bytes }` — one
+> screenful, with the offset clamped to what history exists. Relative rather than absolute because
+> the daemon holds the position and re-bases it past output that has arrived since (§5.2), so a
+> keypress means what the user saw; and because deltas compose, so a spun wheel needs no in-flight
+> bookkeeping on either side.
 
 ```rust
 enum ClientMsg {

@@ -92,6 +92,15 @@ pub enum ClientMsg {
     /// message rather than an `AddRepo` round-trip because registration is silent for a repo the
     /// daemon already knows, leaving a client with no `RepoId` to follow up with.
     CreateHeadAgentAt { path: PathBuf },
+    /// Move this client's scroll position for `terminal` by `lines` — positive scrolls back into
+    /// history, negative back toward the live view — and reply with the window it lands on.
+    ///
+    /// Relative, not absolute, because the daemon holds both the history *and* each client's
+    /// position in it: a step means "one line from where I last showed you", so output arriving
+    /// while you sit scrolled back can't slide the view out from under the next keypress. Deltas
+    /// also compose, so a spun wheel needs no in-flight bookkeeping. `i32::MIN` is "back to live",
+    /// which is also how a client says it has left scroll mode.
+    Scroll { terminal: TerminalId, lines: i32 },
     /// Delete an agent — kills all its terminals and removes its worktree. Only destructive op.
     DeleteAgent { id: AgentId, force: bool },
     /// Resume a suspended agent's primary terminal in its existing worktree.
@@ -174,9 +183,20 @@ pub enum DaemonMsg {
     Navigate { terminal: TerminalId, dir: Dir },
     /// Delete was refused because the worktree has uncommitted changes — confirm to force it.
     DeleteNeedsConfirm { id: AgentId, message: String },
-    /// Full screen of a terminal as a `contents_formatted()` dump, sent on attach.
+    /// Full screen of a terminal as a `contents_formatted()` dump, sent on attach. The visible screen
+    /// only — history is served on request (`ScrollView`), not shipped on attach.
     OutputSnapshot {
         terminal: TerminalId,
+        bytes: Vec<u8>,
+    },
+    /// One screenful of scroll history, answering a [`ClientMsg::Scroll`]. `offset` is where the
+    /// window sits (the step's landing point, clamped to what history exists) and `available` is how
+    /// far back history goes, so a client can render the window and show where it is without keeping
+    /// any history itself.
+    ScrollView {
+        terminal: TerminalId,
+        offset: usize,
+        available: usize,
         bytes: Vec<u8>,
     },
     /// Incremental output from a terminal.

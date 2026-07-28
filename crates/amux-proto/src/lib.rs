@@ -22,5 +22,7 @@ pub use message::{AgentInfo, ClientMsg, DaemonMsg, Layout, RepoInfo, Size};
 /// sessions (CreateHeadAgent, AgentInfo.branch is now optional — `None` = a HEAD session);
 /// v17 task at launch (CreateAgent.prompt — dispatch an agent already working on its task);
 /// v18 HEAD session by path (CreateHeadAgentAt — register a repo and open its HEAD session in one
-/// step, so the client needs no `RepoId` it cannot learn for an already-registered repo).
-pub const PROTO_VERSION: u32 = 18;
+/// step, so the client needs no `RepoId` it cannot learn for an already-registered repo);
+/// v19 daemon-owned scrollback (Scroll + ScrollView — clients page through history the daemon holds
+/// instead of keeping a private ring, so depth no longer depends on when they attached).
+pub const PROTO_VERSION: u32 = 19;

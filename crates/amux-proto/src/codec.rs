@@ -190,6 +190,19 @@ mod tests {
         roundtrip(ClientMsg::CreateHeadAgentAt {
             path: "/repos/other".into(),
         });
+        roundtrip(ClientMsg::Scroll {
+            terminal: t,
+            lines: 3,
+        });
+        // The extremes are meaningful: to the oldest line, and back to live.
+        roundtrip(ClientMsg::Scroll {
+            terminal: t,
+            lines: i32::MAX,
+        });
+        roundtrip(ClientMsg::Scroll {
+            terminal: t,
+            lines: i32::MIN,
+        });
         roundtrip(ClientMsg::DeleteAgent { id, force: true });
         roundtrip(ClientMsg::ResumeAgent { id });
         roundtrip(ClientMsg::SpawnShell {
@@ -268,6 +281,12 @@ mod tests {
         roundtrip(DaemonMsg::OutputSnapshot {
             terminal: t,
             bytes: vec![1, 2, 3],
+        });
+        roundtrip(DaemonMsg::ScrollView {
+            terminal: t,
+            offset: 42,
+            available: 4096,
+            bytes: b"\x1b[H\x1b[Jline 0".to_vec(),
         });
         roundtrip(DaemonMsg::Output {
             terminal: t,
