@@ -131,6 +131,9 @@ pub enum ClientMsg {
     /// restores its main pane — not just its minis. Distinct from `Focus` (a transient viewed-cell
     /// signal cleared on disconnect); this is the durable "what's open in the main workspace".
     SetActive(Option<AgentId>),
+    /// Persist the "jump to previous" target (tmux's last-window) so `Ctrl+B -` survives closing
+    /// the TUI. Decided by the client (mirrors `SetActive`); the daemon just stores it.
+    SetPrevious(Option<AgentId>),
     /// Start streaming a terminal into a pane (snapshot then live output).
     Attach { terminal: TerminalId, size: Size },
     /// Stop streaming a terminal (its pane closed / was replaced).
@@ -161,6 +164,9 @@ pub enum DaemonMsg {
     Minis(Vec<AgentId>),
     /// The persisted active agent (on connect) so a re-attaching client restores its main pane.
     Active(Option<AgentId>),
+    /// The persisted "jump to previous" target (on connect) so a re-attaching client can seed
+    /// `Ctrl+B -`. Sibling of `Active`.
+    Previous(Option<AgentId>),
     /// A new agent appeared.
     AgentAdded(AgentInfo),
     /// An agent was deleted.

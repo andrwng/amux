@@ -24,5 +24,7 @@ pub use message::{AgentInfo, ClientMsg, DaemonMsg, Layout, RepoInfo, Size};
 /// v18 HEAD session by path (CreateHeadAgentAt — register a repo and open its HEAD session in one
 /// step, so the client needs no `RepoId` it cannot learn for an already-registered repo);
 /// v19 daemon-owned scrollback (Scroll + ScrollView — clients page through history the daemon holds
-/// instead of keeping a private ring, so depth no longer depends on when they attached).
-pub const PROTO_VERSION: u32 = 19;
+/// instead of keeping a private ring, so depth no longer depends on when they attached);
+/// v20 previous-session persistence (SetPrevious, Previous — `Ctrl+B -` jump-to-previous target
+/// survives a TUI restart, restored on reconnect like the active agent).
+pub const PROTO_VERSION: u32 = 20;

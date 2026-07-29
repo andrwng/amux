@@ -226,6 +226,8 @@ mod tests {
         roundtrip(ClientMsg::SetMinis(vec![id, AgentId::new()]));
         roundtrip(ClientMsg::SetActive(Some(id)));
         roundtrip(ClientMsg::SetActive(None));
+        roundtrip(ClientMsg::SetPrevious(Some(id)));
+        roundtrip(ClientMsg::SetPrevious(None));
         roundtrip(ClientMsg::Attach {
             terminal: t,
             size: Size {
@@ -258,6 +260,8 @@ mod tests {
         roundtrip(DaemonMsg::Minis(vec![id]));
         roundtrip(DaemonMsg::Active(Some(id)));
         roundtrip(DaemonMsg::Active(None));
+        roundtrip(DaemonMsg::Previous(Some(id)));
+        roundtrip(DaemonMsg::Previous(None));
         roundtrip(DaemonMsg::AgentAdded(sample_info()));
         roundtrip(DaemonMsg::AgentRemoved { id });
         roundtrip(DaemonMsg::StateChanged {
