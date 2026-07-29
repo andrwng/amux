@@ -1793,3 +1793,45 @@ async fn resuming_an_agent_stamps_last_opened_and_broadcasts() {
     .expect("resuming an agent should broadcast OpenedChanged");
     assert!(at >= before, "the MRU stamp moves forward on resume");
 }
+
+/// `previous` (the Ctrl+B - target) survives a real daemon restart: it is written to
+/// state.json by set_previous and restored by load_state, exactly like `active`. The
+/// reconnecting-client test uses an in-memory registry where save() is a no-op, so this
+/// pins the on-disk round-trip that a daemon restart actually depends on.
+#[tokio::test]
+async fn previous_survives_a_daemon_restart() {
+    let tmp = tempfile::tempdir().unwrap();
+    let repo = tmp.path().join("repo");
+    std::fs::create_dir(&repo).unwrap();
+    init_repo(&repo);
+    let wt_base = tmp.path().join("wt");
+    let state_path = tmp.path().join("state.json");
+
+    // First daemon: two agents, active = a2, previous = a1. Each mutation persists to disk.
+    let (a1, a2) = {
+        let worktrees = WorktreeService::with_base(&repo, &wt_base).unwrap();
+        let adapter = Box::new(ClaudeAdapter::with_command(vec!["cat".into()]));
+        let registry = Registry::with_state(adapter, state_path.clone());
+        let repo_id = registry.register(worktrees).id;
+        let a1 = registry.create(repo_id, "feat/one", None).unwrap().id;
+        let a2 = registry.create(repo_id, "feat/two", None).unwrap().id;
+        registry.set_active(Some(a2));
+        registry.set_previous(Some(a1));
+        (a1, a2)
+    };
+
+    // Second daemon: load_state re-reads state.json from disk — the real save→load round-trip.
+    let adapter = Box::new(ClaudeAdapter::with_command(vec!["cat".into()]));
+    let registry = Registry::with_state(adapter, state_path.clone());
+    registry.load_state();
+    assert_eq!(
+        registry.previous(),
+        Some(a1),
+        "previous target survives a daemon restart via state.json"
+    );
+    assert_eq!(
+        registry.active(),
+        Some(a2),
+        "active survives too (sanity check)"
+    );
+}
