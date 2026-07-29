@@ -961,6 +961,138 @@ async fn layout_persists_for_a_reconnecting_client() {
     );
 }
 
+/// The "jump to previous" target is persisted and replayed to a reconnecting client, so
+/// `Ctrl+B -` still works after the TUI restarts.
+#[tokio::test]
+async fn previous_persists_for_a_reconnecting_client() {
+    let tmp = tempfile::tempdir().unwrap();
+    let repo = tmp.path().join("repo");
+    std::fs::create_dir(&repo).unwrap();
+    init_repo(&repo);
+    let worktrees = WorktreeService::with_base(&repo, tmp.path().join("wt")).unwrap();
+    let adapter = Box::new(ClaudeAdapter::with_command(vec!["cat".into()]));
+    let registry = Registry::new(adapter);
+    let repo_id = registry.register(worktrees).id;
+    let socket = tmp.path().join("amuxd.sock");
+    let listener = UnixListener::bind(&socket).unwrap();
+    tokio::spawn(serve(listener, registry));
+
+    let mut client = handshake(&socket).await;
+    let a1 = create_agent(&mut client, repo_id, "feat/one").await;
+    let a2 = create_agent(&mut client, repo_id, "feat/two").await;
+    client
+        .send(ClientMsg::SetActive(Some(a2.id)))
+        .await
+        .unwrap();
+    client
+        .send(ClientMsg::SetPrevious(Some(a1.id)))
+        .await
+        .unwrap();
+    // Round-trip so the daemon has surely processed SetPrevious before we reconnect.
+    client.send(ClientMsg::ListAgents).await.unwrap();
+    tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            if let Some(Ok(DaemonMsg::Agents(_))) = client.next().await {
+                return;
+            }
+        }
+    })
+    .await
+    .unwrap();
+
+    let stream = UnixStream::connect(&socket).await.unwrap();
+    let mut c2 = Framed::new(stream, ClientCodec::new());
+    c2.send(ClientMsg::Hello {
+        proto_version: PROTO_VERSION,
+    })
+    .await
+    .unwrap();
+    let mut got_previous = None;
+    tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            match c2.next().await {
+                Some(Ok(DaemonMsg::Previous(prev))) => {
+                    got_previous = Some(prev);
+                    return; // Previous is the last handshake frame
+                }
+                Some(Ok(_)) => {}
+                _ => return,
+            }
+        }
+    })
+    .await
+    .unwrap();
+    assert_eq!(
+        got_previous,
+        Some(Some(a1.id)),
+        "reconnecting client should receive the saved previous target"
+    );
+}
+
+/// Deleting the previous agent clears the persisted target, so the daemon never replays a ghost.
+#[tokio::test]
+async fn removing_the_previous_agent_clears_it() {
+    let tmp = tempfile::tempdir().unwrap();
+    let repo = tmp.path().join("repo");
+    std::fs::create_dir(&repo).unwrap();
+    init_repo(&repo);
+    let worktrees = WorktreeService::with_base(&repo, tmp.path().join("wt")).unwrap();
+    let adapter = Box::new(ClaudeAdapter::with_command(vec!["cat".into()]));
+    let registry = Registry::new(adapter);
+    let repo_id = registry.register(worktrees).id;
+    let socket = tmp.path().join("amuxd.sock");
+    let listener = UnixListener::bind(&socket).unwrap();
+    tokio::spawn(serve(listener, registry));
+
+    let mut client = handshake(&socket).await;
+    let a1 = create_agent(&mut client, repo_id, "feat/one").await;
+    let a2 = create_agent(&mut client, repo_id, "feat/two").await;
+    client
+        .send(ClientMsg::SetActive(Some(a2.id)))
+        .await
+        .unwrap();
+    client
+        .send(ClientMsg::SetPrevious(Some(a1.id)))
+        .await
+        .unwrap();
+    client
+        .send(ClientMsg::DeleteAgent {
+            id: a1.id,
+            force: true,
+        })
+        .await
+        .unwrap();
+    assert!(wait_for_removed(&mut client, a1.id).await);
+
+    let stream = UnixStream::connect(&socket).await.unwrap();
+    let mut c2 = Framed::new(stream, ClientCodec::new());
+    c2.send(ClientMsg::Hello {
+        proto_version: PROTO_VERSION,
+    })
+    .await
+    .unwrap();
+    let mut got_previous = Some(Some(a1.id));
+    tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            match c2.next().await {
+                Some(Ok(DaemonMsg::Previous(prev))) => {
+                    got_previous = Some(prev);
+                    return;
+                }
+                Some(Ok(_)) => {}
+                _ => return,
+            }
+        }
+    })
+    .await
+    .unwrap();
+    assert_eq!(
+        got_previous,
+        Some(None),
+        "deleting the previous agent must clear the persisted target"
+    );
+}
+
 #[tokio::test]
 async fn two_repos_keep_their_agents_separate() {
     // Register two independent repos on one daemon; each agent should carry its own repo id and

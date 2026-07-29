@@ -149,6 +149,9 @@ struct State {
     /// Which agent occupies the main area — replayed so a re-attaching client restores its main
     /// pane. Durable (unlike `focused`, which is the transient viewed-cell for unread).
     active: Option<AgentId>,
+    /// The "jump to previous" target (`Ctrl+B -`) — replayed to a re-attaching client so the
+    /// last-window jump survives the TUI closing. Durable, like `active`; the client decides it.
+    previous: Option<AgentId>,
 }
 
 /// The durable slice of the daemon's state, written to `state.json` so agents/repos/minis survive
@@ -163,6 +166,10 @@ struct PersistedState {
     /// Which agent occupied the main area (restored into the client's main pane on reconnect).
     #[serde(default)]
     active: Option<AgentId>,
+    /// The persisted "jump to previous" target (restored into the client's `Ctrl+B -` on connect).
+    /// `default` so a `state.json` written before this field still loads.
+    #[serde(default)]
+    previous: Option<AgentId>,
     /// Each agent's pane layout, so tiled splits survive a daemon restart rather than collapsing
     /// back to a single pane. A `Vec` of pairs because `AgentId` is not a JSON object key;
     /// `default` so a `state.json` written before this field still loads.
@@ -396,6 +403,25 @@ impl Registry {
         self.state.lock().unwrap().active
     }
 
+    /// Persist the "jump to previous" target (`Ctrl+B -`), replayed to a re-attaching client.
+    /// Dumb storage decided by the client — the daemon never derives it. Saves only on a real
+    /// change (same anti-churn reasoning as `set_active`).
+    pub fn set_previous(&self, previous: Option<AgentId>) {
+        let changed = {
+            let mut state = self.state.lock().unwrap();
+            let changed = state.previous != previous;
+            state.previous = previous;
+            changed
+        };
+        if changed {
+            self.save();
+        }
+    }
+
+    pub fn previous(&self) -> Option<AgentId> {
+        self.state.lock().unwrap().previous
+    }
+
     /// Serialize durable state (repos/agents/minis) to `state.json` via an atomic temp+rename.
     /// No-op without a state path; a write failure is logged, never fatal.
     pub fn save(&self) {
@@ -432,6 +458,7 @@ impl Registry {
                     .collect(),
                 minis: state.minis.clone(),
                 active: state.active,
+                previous: state.previous,
                 layouts: state
                     .layouts
                     .iter()
@@ -537,6 +564,10 @@ impl Registry {
         state.active = persisted
             .active
             .filter(|id| state.agents.contains_key(id) && !state.minis.contains(id));
+        // Restore the previous-jump target only if its agent survived the load.
+        state.previous = persisted
+            .previous
+            .filter(|id| state.agents.contains_key(id));
         // Restore each surviving agent's layout, blanking the leaves whose PTYs died with the
         // previous daemon. Built separately because it reads `state.agents` while writing
         // `state.layouts`.
@@ -1056,6 +1087,9 @@ impl Registry {
             state.minis.retain(|a| *a != id);
             if state.active == Some(id) {
                 state.active = None;
+            }
+            if state.previous == Some(id) {
+                state.previous = None;
             }
             let terminal_ids: Vec<TerminalId> = state
                 .terminals
