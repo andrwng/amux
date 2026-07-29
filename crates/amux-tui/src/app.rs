@@ -155,7 +155,16 @@ struct Scroll {
     available: usize,
 }
 
-pub async fn run() -> Result<()> {
+/// The profile actually used: the `--profile` flag if given, else the config's `profile`
+/// (which itself defaults to `Blue`). Encodes the precedence CLI > config > default.
+fn effective_profile(
+    cli: Option<amux_core::config::Profile>,
+    config: amux_core::config::Profile,
+) -> amux_core::config::Profile {
+    cli.unwrap_or(config)
+}
+
+pub async fn run(profile: Option<amux_core::config::Profile>) -> Result<()> {
     use crossterm::event::{
         DisableBracketedPaste, DisableMouseCapture, EnableBracketedPaste, EnableMouseCapture,
     };
@@ -179,6 +188,8 @@ pub async fn run() -> Result<()> {
 
     let (cols, rows) = crossterm::terminal::size().unwrap_or((80, 24));
     let mut app = App::new(cols, rows);
+    let config = amux_core::config::Config::load()?;
+    app.theme = Theme::for_profile(effective_profile(profile, config.profile));
     let (mut sink, mut stream) = framed.split();
     let mut events = EventStream::new();
 
@@ -2709,6 +2720,17 @@ fn render_status(frame: &mut Frame, area: Rect, app: &App) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn effective_profile_prefers_cli_then_config() {
+        use amux_core::config::Profile;
+        assert_eq!(
+            effective_profile(Some(Profile::Red), Profile::Green),
+            Profile::Red
+        );
+        assert_eq!(effective_profile(None, Profile::Green), Profile::Green);
+        assert_eq!(effective_profile(None, Profile::Blue), Profile::Blue);
+    }
 
     fn key(code: KeyCode) -> KeyEvent {
         KeyEvent::new(code, KeyModifiers::NONE)

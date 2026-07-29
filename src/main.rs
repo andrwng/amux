@@ -12,6 +12,10 @@ use clap::{Parser, Subcommand};
 struct Cli {
     #[command(subcommand)]
     command: Option<Command>,
+
+    /// Border/accent color profile for the TUI: blue (default), green, yellow, or red.
+    #[arg(long, value_parser = parse_profile)]
+    profile: Option<amux_core::config::Profile>,
 }
 
 #[derive(Subcommand)]
@@ -42,10 +46,15 @@ enum Command {
     Passthrough { state: String },
 }
 
+fn parse_profile(s: &str) -> Result<amux_core::config::Profile, String> {
+    s.parse()
+        .map_err(|e: amux_core::config::ParseProfileError| e.to_string())
+}
+
 fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
     match cli.command {
-        None => amux_tui::run()?,
+        None => amux_tui::run(cli.profile)?,
         Some(Command::Daemon {
             foreground,
             stop,

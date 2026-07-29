@@ -56,6 +56,7 @@ name = "amux"
 path = "src/main.rs"
 
 [dependencies]
+amux-core = { workspace = true }
 amux-daemon = { workspace = true }
 amux-tui = { workspace = true }
 anyhow = { workspace = true }

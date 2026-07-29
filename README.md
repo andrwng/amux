@@ -153,19 +153,23 @@ selection.
 `amux` with no arguments is the TUI. The rest are occasional-use:
 
 ```sh
-amux doctor         # prune orphaned worktrees in this repo, and show where amux stores things
-amux daemon --stop  # stop the daemon and every agent it owns
+amux doctor                             # prune orphaned worktrees in this repo, and show where amux stores things
+amux daemon --stop                      # stop the daemon and every agent it owns
+amux --profile <blue|green|yellow|red>  # start the TUI with a border/accent color profile (default: blue),
+                                         # to tell concurrent sessions apart
 ```
 
 ## Configuration
 
 There is no config file until you write one, and amux runs fine without it. When you do want one,
 it goes at `$XDG_CONFIG_HOME/amux/config.toml` — else `~/.config/amux/config.toml`, on macOS as
-well as Linux. It holds exactly one setting today:
+well as Linux. It holds two settings today:
 
 ```toml
 # ~/.config/amux/config.toml — every key is optional
 root = "~/somewhere-else/.amux"   # the amux home (default: ~/.amux). A leading ~ is expanded.
+profile = "green"                 # border/accent color: blue (default), green, yellow, or red.
+                                   # Overridden by the --profile flag.
 ```
 
 **`root`** is where everything amux owns lives, and it's the answer to "how do I keep this off my
