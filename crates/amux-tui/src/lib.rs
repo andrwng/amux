@@ -7,6 +7,7 @@ mod client;
 mod doctor;
 mod input;
 mod pane;
+mod theme;
 
 use anyhow::Result;
 

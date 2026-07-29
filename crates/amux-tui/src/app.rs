@@ -36,6 +36,7 @@ use amux_proto::{AgentInfo, ClientCodec, ClientMsg, DaemonMsg, ProtoError, RepoI
 
 use crate::input::{encode_paste, key_to_bytes};
 use crate::pane::{Axis, Dir, Nav, PaneTree};
+use crate::theme::Theme;
 
 /// Full sidebar width: cursor + unread bar + glyph + open marker + name + age.
 const SIDEBAR_W_FULL: u16 = 30;
@@ -335,6 +336,8 @@ struct App {
     /// instead of navigating. Announced by the daemon via `TerminalApp`.
     passthrough: HashMap<TerminalId, bool>,
     focus: Focus,
+    /// The active border/accent color scheme (from `--profile` / config; default `blue`).
+    theme: Theme,
     /// Agents shown as **minis** — a spatial row of small live terminals below the main panes,
     /// left-to-right. Each shows that agent's primary terminal.
     minis: Vec<AgentId>,
@@ -388,6 +391,7 @@ impl App {
             attached: HashMap::new(),
             passthrough: HashMap::new(),
             focus: Focus::Sidebar,
+            theme: Theme::default(),
             minis: Vec::new(),
             minimized: HashSet::new(),
             minis_hidden: false,
@@ -2280,7 +2284,7 @@ fn render_minis(frame: &mut Frame, area: Rect, app: &App) {
         let title = format!(" {glyph} {branch} ");
         let border = if focused {
             Style::default()
-                .fg(Color::Cyan)
+                .fg(app.theme.focus)
                 .add_modifier(Modifier::BOLD)
         } else {
             Style::default().fg(color)
@@ -2300,7 +2304,7 @@ fn render_minis(frame: &mut Frame, area: Rect, app: &App) {
                     Span::styled(
                         bar,
                         Style::default()
-                            .fg(Color::Cyan)
+                            .fg(app.theme.focus)
                             .add_modifier(Modifier::BOLD),
                     ),
                     Span::styled(format!(" {glyph}"), Style::default().fg(color)),
@@ -2333,7 +2337,7 @@ fn render_sidebar(frame: &mut Frame, area: Rect, app: &App) {
         (true, n) => format!(" {n} "),
     };
     let border = if app.focus == Focus::Sidebar {
-        Style::default().fg(Color::Cyan)
+        Style::default().fg(app.theme.focus)
     } else {
         Style::default().fg(Color::DarkGray)
     };
@@ -2390,7 +2394,7 @@ fn render_sidebar(frame: &mut Frame, area: Rect, app: &App) {
                 let name = repo_names.get(&id).copied().unwrap_or("repo");
                 let count = app.agents.iter().filter(|a| a.repo == id).count();
                 let mut style = Style::default()
-                    .fg(Color::Cyan)
+                    .fg(app.theme.focus)
                     .add_modifier(Modifier::BOLD);
                 if selected {
                     style = style.add_modifier(Modifier::REVERSED);
@@ -2401,7 +2405,7 @@ fn render_sidebar(frame: &mut Frame, area: Rect, app: &App) {
                     lines.push(Line::from(vec![
                         Span::styled(
                             format!("{marker}\u{25be} "),
-                            Style::default().fg(Color::Cyan),
+                            Style::default().fg(app.theme.focus),
                         ),
                         Span::styled(format!("{name:.name_w$}"), style),
                     ]));
@@ -2409,7 +2413,7 @@ fn render_sidebar(frame: &mut Frame, area: Rect, app: &App) {
                     lines.push(Line::from(vec![
                         Span::styled(
                             format!("{marker} \u{25be} "),
-                            Style::default().fg(Color::Cyan),
+                            Style::default().fg(app.theme.focus),
                         ),
                         Span::styled(format!("{name} "), style),
                         Span::styled(format!("({count})"), Style::default().fg(Color::DarkGray)),
@@ -2444,7 +2448,7 @@ fn render_sidebar(frame: &mut Frame, area: Rect, app: &App) {
                         format!(" {digit} "),
                         Style::default()
                             .fg(Color::Black)
-                            .bg(Color::Cyan)
+                            .bg(app.theme.focus)
                             .add_modifier(Modifier::BOLD),
                     ),
                     None => Span::styled(
@@ -2453,11 +2457,11 @@ fn render_sidebar(frame: &mut Frame, area: Rect, app: &App) {
                     ),
                 };
                 let cursor_span =
-                    Span::styled(marker.to_string(), Style::default().fg(Color::Cyan));
+                    Span::styled(marker.to_string(), Style::default().fg(app.theme.focus));
                 let unread_span = Span::styled(
                     unread_bar,
                     Style::default()
-                        .fg(Color::Cyan)
+                        .fg(app.theme.focus)
                         .add_modifier(Modifier::BOLD),
                 );
                 if minimized {
@@ -2554,7 +2558,7 @@ fn render_panes(frame: &mut Frame, area: Rect, app: &App) {
                 ),
                 Some(agent) => (
                     format!(" sh \u{b7} {} ", agent.branch.as_deref().unwrap_or("HEAD")),
-                    Color::Blue,
+                    app.theme.shell,
                 ),
                 None => (" terminal ".to_string(), Color::DarkGray),
             },
@@ -2570,7 +2574,7 @@ fn render_panes(frame: &mut Frame, area: Rect, app: &App) {
         }
         let border = if focused {
             Style::default()
-                .fg(Color::Cyan)
+                .fg(app.theme.focus)
                 .add_modifier(Modifier::BOLD)
         } else {
             Style::default().fg(color)
@@ -2621,7 +2625,7 @@ fn render_status(frame: &mut Frame, area: Rect, app: &App) {
                 app.task_buf,
                 cursor(Field::Task),
             ),
-            Style::default().fg(Color::Black).bg(Color::Cyan),
+            Style::default().fg(Color::Black).bg(app.theme.focus),
         )
     } else if app.input == InputMode::CreatingRepo {
         let cursor = |f: Field| {
@@ -2639,7 +2643,7 @@ fn render_status(frame: &mut Frame, area: Rect, app: &App) {
                 app.create_buf,
                 cursor(Field::Branch),
             ),
-            Style::default().fg(Color::Black).bg(Color::Cyan),
+            Style::default().fg(Color::Black).bg(app.theme.focus),
         )
     } else if app.input == InputMode::CreatingHead {
         (
@@ -2647,7 +2651,7 @@ fn render_status(frame: &mut Frame, area: Rect, app: &App) {
                 " new HEAD session \u{2014} dir: {}\u{2588}  (enter create \u{b7} esc cancel)",
                 app.dir_buf,
             ),
-            Style::default().fg(Color::Black).bg(Color::Cyan),
+            Style::default().fg(Color::Black).bg(app.theme.focus),
         )
     } else if app.input == InputMode::Confirming {
         (
@@ -2673,7 +2677,7 @@ fn render_status(frame: &mut Frame, area: Rect, app: &App) {
         (
             " Ctrl+B — % / \" split \u{b7} x close \u{b7} HJKL/r resize \u{b7} [ scroll \u{b7} tab unread \u{b7} # jump \u{b7} - prev"
                 .to_string(),
-            Style::default().fg(Color::Black).bg(Color::Cyan),
+            Style::default().fg(Color::Black).bg(app.theme.focus),
         )
     } else if !app.status.is_empty() {
         (
@@ -3683,6 +3687,25 @@ mod tests {
         assert!(
             content.contains("HEAD"),
             "HEAD session label renders, got: {content}"
+        );
+    }
+
+    /// The chrome accent follows the active profile: with a non-default profile, the focused
+    /// sidebar border is drawn in that profile's focus color (not the default cyan). Focus
+    /// defaults to the sidebar, so `render_sidebar` uses the focus accent for its border.
+    #[test]
+    fn sidebar_border_uses_the_profile_focus_color() {
+        use amux_core::config::Profile;
+        use ratatui::{backend::TestBackend, Terminal};
+        let mut app = App::new(24, 6);
+        app.theme = Theme::for_profile(Profile::Green);
+        let mut term = Terminal::new(TestBackend::new(24, 6)).unwrap();
+        term.draw(|f| render_sidebar(f, f.area(), &app)).unwrap();
+        let fg = term.backend().buffer().cell((0, 0)).unwrap().fg;
+        assert_eq!(
+            fg,
+            Color::LightGreen,
+            "the focused sidebar border should use the profile's focus color"
         );
     }
 
