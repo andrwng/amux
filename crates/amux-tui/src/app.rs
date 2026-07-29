@@ -58,6 +58,21 @@ fn sidebar_width(total_cols: u16) -> u16 {
         SIDEBAR_W_FULL
     }
 }
+
+/// Floor for a full mini's width — today's historical fixed width, so minis never get
+/// narrower than before.
+const MINI_W_MIN: u16 = 44;
+/// Cap for a full mini's width — a classic full-terminal width, so a mini stays a peek even
+/// on an ultrawide screen.
+const MINI_W_MAX: u16 = 80;
+
+/// A full mini pane's width: half the available band width, clamped to `[MINI_W_MIN,
+/// MINI_W_MAX]`. Pure and count-independent — the single source used by `mini_rects` so
+/// rendering, hit-testing, and PTY sizing all agree.
+fn mini_width(available: u16) -> u16 {
+    (available / 2).clamp(MINI_W_MIN, MINI_W_MAX)
+}
+
 const RESIZE_STEP: f32 = 0.05;
 /// Max height of the minis row (capped to half the main area).
 const MINI_ROWS: u16 = 14;
@@ -454,8 +469,8 @@ impl App {
     /// of `area`, laid out left-to-right (newest in the corner). Minimized minis get a narrow
     /// status strip. The group is right-anchored; if it would overrun the left edge it's clamped.
     fn mini_rects(&self, area: Rect) -> Vec<Rect> {
-        const MINI_W: u16 = 44;
         const MIN_W: u16 = 12;
+        let full_w = mini_width(area.width);
         let widths: Vec<u16> = self
             .minis
             .iter()
@@ -463,7 +478,7 @@ impl App {
                 if self.minimized.contains(a) {
                     MIN_W
                 } else {
-                    MINI_W
+                    full_w
                 }
             })
             .collect();
@@ -3741,6 +3756,34 @@ mod tests {
         assert_eq!(sidebar_width(boundary - 1), SIDEBAR_W_MIN);
         assert_eq!(sidebar_width(boundary), SIDEBAR_W_FULL);
         assert_eq!(sidebar_width(200), SIDEBAR_W_FULL);
+    }
+
+    /// A full mini is half the available band width, clamped to a floor of today's fixed
+    /// width and a cap that keeps it a peek. Below the floor → 44; mid-range → half; above
+    /// the cap → 80.
+    #[test]
+    fn mini_width_scales_between_floor_and_cap() {
+        assert_eq!(
+            mini_width(50),
+            MINI_W_MIN,
+            "narrow → floor (half of 50 = 25 < 44)"
+        );
+        assert_eq!(
+            mini_width(88),
+            MINI_W_MIN,
+            "exactly at the floor boundary (44)"
+        );
+        assert_eq!(mini_width(120), 60, "mid-range → half the available width");
+        assert_eq!(
+            mini_width(200),
+            MINI_W_MAX,
+            "wide → cap (half of 200 = 100 > 80)"
+        );
+        assert_eq!(
+            mini_width(160),
+            MINI_W_MAX,
+            "exactly at the cap boundary (80)"
+        );
     }
 
     /// On the narrow rail the sidebar shows the state glyph and a few name characters but drops
