@@ -169,6 +169,8 @@ pub async fn run(profile: Option<amux_core::config::Profile>) -> Result<()> {
         DisableBracketedPaste, DisableMouseCapture, EnableBracketedPaste, EnableMouseCapture,
     };
     let (framed, repo) = crate::client::connect().await?;
+    let config = amux_core::config::Config::load()?;
+    let theme = Theme::for_profile(effective_profile(profile, config.profile));
     let mut terminal = ratatui::init();
     // Capture the mouse so the wheel reaches panes (forwarded to apps that want it, else scrolls
     // the daemon's scroll history). Hold Shift to bypass for native terminal selection.
@@ -188,8 +190,7 @@ pub async fn run(profile: Option<amux_core::config::Profile>) -> Result<()> {
 
     let (cols, rows) = crossterm::terminal::size().unwrap_or((80, 24));
     let mut app = App::new(cols, rows);
-    let config = amux_core::config::Config::load()?;
-    app.theme = Theme::for_profile(effective_profile(profile, config.profile));
+    app.theme = theme;
     let (mut sink, mut stream) = framed.split();
     let mut events = EventStream::new();
 
