@@ -16,6 +16,49 @@ use std::path::{Path, PathBuf};
 use anyhow::{Context, Result};
 use serde::Deserialize;
 
+/// The TUI's border/accent color profile. Selects which color scheme the client's chrome
+/// (focused borders, shell-pane borders, selection accents) uses — so concurrent amux sessions
+/// are visually distinguishable. `Blue` reproduces the original look. Kept ratatui-free here so
+/// `amux-core` stays pure; the name→`Color` mapping lives in `amux-tui`'s `theme` module.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Profile {
+    #[default]
+    Blue,
+    Green,
+    Yellow,
+    Red,
+}
+
+/// A `--profile`/`profile=` value that names no known profile.
+#[derive(Debug, PartialEq, Eq)]
+pub struct ParseProfileError(pub String);
+
+impl std::fmt::Display for ParseProfileError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "unknown profile {:?} (valid: blue, green, yellow, red)",
+            self.0
+        )
+    }
+}
+
+impl std::error::Error for ParseProfileError {}
+
+impl std::str::FromStr for Profile {
+    type Err = ParseProfileError;
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s {
+            "blue" => Ok(Profile::Blue),
+            "green" => Ok(Profile::Green),
+            "yellow" => Ok(Profile::Yellow),
+            "red" => Ok(Profile::Red),
+            other => Err(ParseProfileError(other.to_string())),
+        }
+    }
+}
+
 /// The global amux config. Everything is optional; an empty/missing file means "all defaults".
 #[derive(Debug, Default, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
@@ -24,6 +67,10 @@ pub struct Config {
     /// start with `~`. When unset, defaults to `~/.amux`. Example: `root = "~/xfs2/.amux"`.
     #[serde(default)]
     pub root: Option<String>,
+    /// The TUI border/accent color profile. Defaults to `blue` (the original look).
+    /// Overridden by the `--profile` CLI flag. Example: `profile = "green"`.
+    #[serde(default)]
+    pub profile: Profile,
 }
 
 impl Config {
@@ -74,7 +121,13 @@ mod tests {
 
     #[test]
     fn empty_toml_is_all_defaults() {
-        assert_eq!(Config::from_toml("").unwrap(), Config { root: None });
+        assert_eq!(
+            Config::from_toml("").unwrap(),
+            Config {
+                root: None,
+                profile: Profile::Blue
+            }
+        );
     }
 
     #[test]
@@ -117,5 +170,25 @@ mod tests {
             Config::from_toml(r#"roott = "~/xfs2/.amux""#).is_err(),
             "an unknown key must error"
         );
+    }
+
+    #[test]
+    fn profile_parses_from_str() {
+        use std::str::FromStr;
+        assert_eq!(Profile::from_str("blue"), Ok(Profile::Blue));
+        assert_eq!(Profile::from_str("green"), Ok(Profile::Green));
+        assert_eq!(Profile::from_str("yellow"), Ok(Profile::Yellow));
+        assert_eq!(Profile::from_str("red"), Ok(Profile::Red));
+        assert!(Profile::from_str("purple").is_err());
+    }
+
+    #[test]
+    fn config_parses_profile_and_defaults_to_blue() {
+        assert_eq!(
+            Config::from_toml("profile = \"green\"").unwrap().profile,
+            Profile::Green
+        );
+        assert_eq!(Config::from_toml("").unwrap().profile, Profile::Blue);
+        assert!(Config::from_toml("profile = \"purple\"").is_err());
     }
 }
