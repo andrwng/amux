@@ -562,6 +562,15 @@ impl App {
                     }
                 }
             }
+            DaemonMsg::Previous(prev) => {
+                // Seed the jump-to-previous target from persistence. Sent after `Active`, so the
+                // main-pane restore (which runs `swap_to_agent` and may set `prev_active_agent`)
+                // has already happened and this persisted value wins. Reconcile so the daemon's
+                // copy re-converges to it — the earlier `Minis`/`Active` reconciles pushed a stale
+                // `None` before this seed arrived (the same converge dance `Active` relies on).
+                self.prev_active_agent = prev.filter(|id| self.agents.iter().any(|a| a.id == *id));
+                self.reconcile(sink).await?;
+            }
             DaemonMsg::AgentAdded(info) => {
                 // Select the freshly-created agent so the next Enter opens it.
                 let id = info.id;
@@ -1828,6 +1837,8 @@ impl App {
         }
         sink.send(ClientMsg::SetMinis(self.minis.clone())).await?;
         sink.send(ClientMsg::SetActive(self.active_agent)).await?;
+        sink.send(ClientMsg::SetPrevious(self.prev_active_agent))
+            .await?;
         Ok(())
     }
 
@@ -4392,6 +4403,38 @@ mod tests {
             .unwrap();
         assert_eq!(app.prev_active_agent, None);
         assert_eq!(app.previous_agent(), None, "no target left to jump to");
+    }
+
+    /// A restart seeds `Ctrl+B -` from the daemon: the persisted previous target arrives as
+    /// `DaemonMsg::Previous` on connect, so the jump works before the user has swapped anything.
+    #[tokio::test]
+    async fn daemon_previous_seeds_the_jump_target() {
+        let (mut app, ids) = app_with_agents(2);
+        let (mut sink, _server) = test_sink();
+        // Simulate the connect-time main-pane restore (DaemonMsg::Active reopened ids[1]).
+        let _ = app.swap_to_agent(ids[1]);
+        assert_eq!(
+            app.prev_active_agent, None,
+            "restoring the active agent from nothing leaves no previous"
+        );
+        // Previous arrives last on connect and seeds the jump target.
+        app.on_daemon(DaemonMsg::Previous(Some(ids[0])), &mut sink)
+            .await
+            .unwrap();
+        assert_eq!(
+            app.prev_active_agent,
+            Some(ids[0]),
+            "seed the jump target from the daemon's persisted previous"
+        );
+        app.on_key(ctrl('b'), &mut sink).await.unwrap();
+        app.on_key(key(KeyCode::Char('-')), &mut sink)
+            .await
+            .unwrap();
+        assert_eq!(
+            app.active_agent,
+            Some(ids[0]),
+            "Ctrl+B - jumps to the seeded previous immediately after a restart"
+        );
     }
 
     /// While the overlay is active, the previous agent's row is marked `-` in place of its digit.
