@@ -127,20 +127,32 @@ pub fn run_blocking(repo: PathBuf) -> Result<()> {
     })
 }
 
-/// Stop a running daemon by sending it SIGTERM (read from the pidfile).
-pub fn stop() -> Result<()> {
-    let paths = amux_core::paths::RuntimePaths::resolve()?;
-    let pidfile = pid_file(&paths.dir);
-    let contents = std::fs::read_to_string(&pidfile).map_err(|_| {
+/// Stop a running daemon: SIGTERM the pid in the pidfile, but only after confirming it is alive
+/// and actually an amux process — a stale pidfile (a SIGKILL/SSH-drop leftover) can name a dead
+/// or reused pid, and we must not signal an unrelated process.
+fn stop_at(pidfile: &Path) -> Result<()> {
+    let contents = std::fs::read_to_string(pidfile).map_err(|_| {
         anyhow!(
             "no running amux daemon (no pidfile at {})",
             pidfile.display()
         )
     })?;
     let pid: i32 = contents.trim().parse().context("parse pidfile")?;
+    if !server::alive(pid) || !server::looks_like_amux(pid) {
+        std::fs::remove_file(pidfile).ok();
+        return Err(anyhow!(
+            "no running amux daemon (stale pidfile named pid {pid}; removed it)"
+        ));
+    }
     kill(Pid::from_raw(pid), Signal::SIGTERM).context("signal the daemon")?;
     println!("stopped amux daemon (pid {pid})");
     Ok(())
+}
+
+/// Stop a running daemon by SIGTERM (pid from the pidfile under the resolved runtime dir).
+pub fn stop() -> Result<()> {
+    let paths = amux_core::paths::RuntimePaths::resolve()?;
+    stop_at(&pid_file(&paths.dir))
 }
 
 /// Remove the daemon's runtime files, but only if `pidfile` still names `my_pid`. A daemon that
@@ -186,5 +198,34 @@ mod tests {
         cleanup_if_owner(&pidfile, &[&socket], 12345);
         assert!(!socket.exists(), "owner removes its socket");
         assert!(!pidfile.exists(), "owner removes its pidfile");
+    }
+
+    #[test]
+    fn stop_refuses_a_stale_or_dead_pid_and_clears_it() {
+        let tmp = tempfile::tempdir().unwrap();
+        let pidfile = tmp.path().join("amuxd.pid");
+
+        // A pid that is definitely dead (spawn a trivial child and reap it).
+        let mut child = std::process::Command::new("true").spawn().unwrap();
+        child.wait().unwrap();
+        let dead = child.id();
+        std::fs::write(&pidfile, dead.to_string()).unwrap();
+
+        let err = stop_at(&pidfile).unwrap_err();
+        assert!(
+            err.to_string().contains("no running amux daemon"),
+            "stop must refuse a dead pid, got: {err}"
+        );
+        assert!(!pidfile.exists(), "stop clears the stale pidfile");
+    }
+
+    #[test]
+    fn stop_errors_when_no_pidfile() {
+        let tmp = tempfile::tempdir().unwrap();
+        let err = stop_at(&tmp.path().join("amuxd.pid")).unwrap_err();
+        assert!(
+            err.to_string().contains("no running amux daemon"),
+            "got: {err}"
+        );
     }
 }
