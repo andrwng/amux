@@ -4,13 +4,14 @@
 //! state, terminal exited) are pushed to every client. See `docs/DESIGN.md` §5–6, `SPLITS.md`.
 
 use std::collections::HashMap;
-use std::io::ErrorKind;
 use std::path::Path;
 use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::{bail, Context, Result};
 use futures::{SinkExt, StreamExt};
+use nix::errno::Errno;
+use nix::fcntl::{Flock, FlockArg};
 use nix::sys::signal::{kill, Signal};
 use nix::unistd::Pid;
 use tokio::net::{UnixListener, UnixStream};
@@ -36,39 +37,84 @@ const EVICT_GRACE: Duration = Duration::from_secs(5);
 /// How often to re-check whether the evicted daemon has exited.
 const EVICT_POLL: Duration = Duration::from_millis(50);
 
-/// What answered (or failed to answer) on an already-bound control socket.
+/// What answered (or failed to answer) on the socket a live daemon holds.
 enum Probe {
-    /// A daemon speaking our exact protocol version — the socket is legitimately taken.
+    /// A daemon speaking our exact protocol version — a healthy incumbent; stand down.
     Compatible,
-    /// Something is listening, but we cannot talk to it: a different `PROTO_VERSION` (the reinstall
-    /// case), an undecodable frame, or no answer at all.
+    /// A confirmed *different* protocol: a `Hello` with another version, an unexpected frame, or
+    /// an undecodable one (postcard is positional, so an older layout decodes as garbage). The
+    /// reinstall case — evict and replace it.
     Incompatible,
-    /// Nothing is behind the socket file — a crash left it on disk.
-    Dead,
+    /// Alive (it holds the lock) but not answering the handshake in time, or the socket isn't
+    /// accepting yet: busy/mid-start/wedged. Stand down — never kill a live daemon for being slow.
+    Unreachable,
 }
 
-/// Bind the control socket, arbitrating against whatever already owns it.
+/// A daemon's exclusive claim on a home: the lifetime `flock` guard plus the bound control
+/// socket. Dropping `lock` releases the advisory lock.
+pub struct Singleton {
+    pub lock: Flock<std::fs::File>,
+    pub listener: UnixListener,
+}
+
+/// How many times we'll try to evict a confirmed-incompatible incumbent before giving up.
+const MAX_EVICTIONS: u32 = 3;
+
+/// Acquire the per-home singleton lock and bind the control socket.
 ///
-/// A *compatible* daemon means this one is redundant and refuses to start. An *incompatible* one —
-/// the reinstall case, where the new binary bumped `PROTO_VERSION` — is terminated via `pidfile`
-/// before we take the socket. That eviction is the whole point: unlinking the socket and walking
-/// away (what the client used to do) leaves the old daemon running unreachably, holding its PTYs
-/// and agent processes forever.
-pub async fn bind_or_detect(socket: &Path, pidfile: &Path) -> Result<UnixListener> {
-    match UnixListener::bind(socket) {
-        Ok(listener) => Ok(listener),
-        Err(e) if e.kind() == ErrorKind::AddrInUse => match probe(socket).await {
-            Probe::Compatible => bail!(
-                "an amux daemon is already running (socket {})",
-                socket.display()
-            ),
-            Probe::Incompatible => {
-                evict(pidfile).await;
-                rebind(socket).context("rebind after evicting the previous daemon")
+/// Returns `Some(Singleton)` when this process now owns the home, or `None` when a live daemon
+/// already owns it and this process should stand down (the client will connect to the incumbent).
+/// A *confirmed* protocol mismatch (the reinstall case) is evicted and replaced; a busy/slow/
+/// unreachable incumbent is left alone — killing a live daemon for being slow is the bug we're
+/// removing.
+pub async fn acquire_and_bind(
+    lock_path: &Path,
+    socket: &Path,
+    pidfile: &Path,
+) -> Result<Option<Singleton>> {
+    let mut evictions = 0u32;
+    loop {
+        let file = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(lock_path)
+            .with_context(|| format!("open lock file {}", lock_path.display()))?;
+        match Flock::lock(file, FlockArg::LockExclusiveNonblock) {
+            Ok(lock) => {
+                // No live daemon holds the home. Any socket on disk is a crash leftover.
+                let listener = rebind(socket).context("bind control socket")?;
+                return Ok(Some(Singleton { lock, listener }));
             }
-            Probe::Dead => rebind(socket).context("rebind after removing stale socket"),
-        },
-        Err(e) => Err(e).context("bind control socket"),
+            Err((_file, e)) if e == Errno::EWOULDBLOCK || e == Errno::EAGAIN => {
+                match probe(socket).await {
+                    Probe::Compatible => {
+                        tracing::info!("an amux daemon is already running; standing down");
+                        return Ok(None);
+                    }
+                    Probe::Unreachable => {
+                        tracing::info!(
+                            "a daemon holds the lock but isn't answering yet; standing down"
+                        );
+                        return Ok(None);
+                    }
+                    Probe::Incompatible => {
+                        evictions += 1;
+                        if evictions > MAX_EVICTIONS {
+                            bail!(
+                                "could not evict the incompatible daemon after {evictions} tries"
+                            );
+                        }
+                        evict(pidfile).await; // its death releases the lock; loop to claim it
+                        continue;
+                    }
+                }
+            }
+            Err((_file, e)) => {
+                return Err(anyhow::anyhow!(e)).context("flock the daemon lock file")
+            }
+        }
     }
 }
 
@@ -86,7 +132,7 @@ fn rebind(socket: &Path) -> Result<UnixListener> {
 /// an edge to the client to save twenty lines.
 async fn probe(socket: &Path) -> Probe {
     let Ok(stream) = UnixStream::connect(socket).await else {
-        return Probe::Dead;
+        return Probe::Unreachable; // socket not accepting — owner mid-start or wedged
     };
     let mut framed = Framed::new(stream, ClientCodec::new());
     let exchange = async {
@@ -102,8 +148,9 @@ async fn probe(socket: &Path) -> Probe {
         Ok(Some(Ok(DaemonMsg::Hello { proto_version }))) if proto_version == PROTO_VERSION => {
             Probe::Compatible
         }
-        // A mismatched `Hello`, a rejection `Error`, a frame our codec cannot decode (postcard is
-        // positional, so an older enum layout decodes as garbage), a closed connection, or silence.
+        // Silence past the timeout, or a clean close with no frame: alive but not answering.
+        Err(_) | Ok(None) => Probe::Unreachable,
+        // A different-version `Hello`, an unexpected frame, or an undecodable one: different protocol.
         _ => Probe::Incompatible,
     }
 }
@@ -169,7 +216,7 @@ async fn evict(pidfile: &Path) {
 }
 
 /// Whether `pid` still exists. Signal 0 checks for the process without delivering anything.
-fn alive(pid: i32) -> bool {
+pub(crate) fn alive(pid: i32) -> bool {
     kill(Pid::from_raw(pid), None).is_ok()
 }
 
@@ -184,7 +231,7 @@ fn alive(pid: i32) -> bool {
 /// Fails **open**: if `ps` is missing or unreadable we proceed with the eviction, since leaving an
 /// unreachable daemon running is the bug we came here to fix. `comm` is the executable name on
 /// Linux and its path on macOS, so match on the final path component.
-fn looks_like_amux(pid: i32) -> bool {
+pub(crate) fn looks_like_amux(pid: i32) -> bool {
     let Ok(out) = std::process::Command::new("ps")
         .args(["-o", "comm=", "-p", &pid.to_string()])
         .output()

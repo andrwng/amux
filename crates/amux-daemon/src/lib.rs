@@ -15,7 +15,7 @@ mod server;
 pub use daemonize::daemonize;
 pub use mailbox::{bind_mailbox, run_hook, run_nav, run_passthrough, serve_mailbox};
 pub use registry::Registry;
-pub use server::{bind_or_detect, serve};
+pub use server::{acquire_and_bind, serve, Singleton};
 
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
@@ -58,6 +58,8 @@ pub fn run_blocking(repo: PathBuf) -> Result<()> {
         );
     }
     let pidfile = pid_file(&paths.dir);
+    let lock = paths.lock();
+    let runtime_dir = paths.dir.clone();
 
     // The agent CLI. Phase 2 runs real `claude` (hooks push exact status); override with
     // `AMUX_AGENT_CMD` (space-separated) to point at a shell or a fake agent for testing.
@@ -71,9 +73,20 @@ pub fn run_blocking(repo: PathBuf) -> Result<()> {
 
     let runtime = tokio::runtime::Runtime::new().context("build tokio runtime")?;
     runtime.block_on(async move {
-        // Arbitrates against a daemon already on the socket: refuses to start behind a compatible
-        // one, evicts an incompatible one (the reinstall case) so it cannot linger with its PTYs.
-        let listener = server::bind_or_detect(&socket, &pidfile).await?;
+        // Arbitrates against a daemon already on the socket via the advisory lock: stands down
+        // behind a compatible or merely-unreachable incumbent, evicts only a confirmed-incompatible
+        // one (the reinstall case) so it cannot linger with its PTYs.
+        let Some(server::Singleton {
+            lock: _lock,
+            listener,
+        }) = server::acquire_and_bind(&lock, &socket, &pidfile).await?
+        else {
+            tracing::info!(
+                "another amux daemon owns {}; exiting",
+                runtime_dir.display()
+            );
+            return Ok(());
+        };
         std::fs::set_permissions(&socket, std::fs::Permissions::from_mode(0o600)).ok();
         let hook_listener = mailbox::bind_mailbox(&mailbox)?;
         std::fs::set_permissions(&mailbox, std::fs::Permissions::from_mode(0o600)).ok();

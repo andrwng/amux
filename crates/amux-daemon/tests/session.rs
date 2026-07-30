@@ -1835,3 +1835,40 @@ async fn previous_survives_a_daemon_restart() {
         "active survives too (sanity check)"
     );
 }
+
+/// The advisory lock makes the daemon a true singleton: a second daemon cannot claim the home
+/// while the first holds the lock (it stands down without binding or evicting), and once the
+/// holder exits the lock frees so a fresh daemon can claim it.
+#[tokio::test]
+async fn daemon_singleton_lock_prevents_a_second_daemon() {
+    let tmp = tempfile::tempdir().unwrap();
+    let lock = tmp.path().join("amuxd.lock");
+    let socket = tmp.path().join("amuxd.sock");
+    let pidfile = tmp.path().join("amuxd.pid");
+
+    let first = amux_daemon::acquire_and_bind(&lock, &socket, &pidfile)
+        .await
+        .unwrap();
+    assert!(first.is_some(), "first daemon claims the singleton");
+
+    // While the first holds the lock, a second stands down — it must NOT bind a second socket
+    // or evict the live holder (the probe can't handshake the non-serving first, so it reads as
+    // unreachable, which is stand-down, not eviction).
+    let second = amux_daemon::acquire_and_bind(&lock, &socket, &pidfile)
+        .await
+        .unwrap();
+    assert!(
+        second.is_none(),
+        "second daemon stands down while the lock is held"
+    );
+
+    // The holder exits → lock frees → a fresh daemon claims it.
+    drop(first);
+    let third = amux_daemon::acquire_and_bind(&lock, &socket, &pidfile)
+        .await
+        .unwrap();
+    assert!(
+        third.is_some(),
+        "a new daemon claims the singleton after the holder exits"
+    );
+}
