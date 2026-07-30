@@ -38,6 +38,12 @@ impl RuntimePaths {
     pub fn mailbox(&self) -> PathBuf {
         self.dir.join("amuxd-hooks.sock")
     }
+
+    /// The advisory lock file that enforces one daemon per home. Held (via `flock`) for the
+    /// daemon's lifetime; the OS releases it on any exit, so it needs no cleanup.
+    pub fn lock(&self) -> PathBuf {
+        self.dir.join("amuxd.lock")
+    }
 }
 
 /// The user's home directory. (`home_dir()` is the one `directories` lookup that agrees across
@@ -174,6 +180,21 @@ mod tests {
         assert_eq!(
             resolve_runtime_dir(None, Some(""), &home()),
             PathBuf::from("/home/u/.amux/run")
+        );
+    }
+
+    #[test]
+    fn lock_path_sits_beside_the_socket() {
+        let paths = RuntimePaths {
+            dir: std::path::PathBuf::from("/run/amux"),
+        };
+        assert_eq!(
+            paths.lock(),
+            std::path::PathBuf::from("/run/amux/amuxd.lock")
+        );
+        assert_eq!(
+            paths.socket(),
+            std::path::PathBuf::from("/run/amux/amuxd.sock")
         );
     }
 }
