@@ -6,7 +6,7 @@
 //! **The client never clears the socket itself.** Unlinking it here is what used to orphan the
 //! previous daemon: the name became free, a new daemon bound it, and the old process kept running
 //! unreachably with its PTYs and agent processes. Arbitration belongs to the daemon that binds —
-//! see `amux-daemon`'s `bind_or_detect`, which probes and evicts.
+//! see `amux-daemon`'s `acquire_and_bind`, which probes and evicts confirmed-incompatible daemons.
 
 use std::path::{Path, PathBuf};
 use std::time::Duration;
