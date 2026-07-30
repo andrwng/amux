@@ -122,9 +122,7 @@ pub fn run_blocking(repo: PathBuf) -> Result<()> {
         registry.save();
         // Graceful: agents get SIGTERM and a moment to checkpoint before they are killed.
         registry.shutdown_all().await;
-        std::fs::remove_file(&socket).ok();
-        std::fs::remove_file(&mailbox).ok();
-        std::fs::remove_file(&pidfile).ok();
+        cleanup_if_owner(&pidfile, &[&socket, &mailbox], std::process::id());
         outcome
     })
 }
@@ -143,4 +141,50 @@ pub fn stop() -> Result<()> {
     kill(Pid::from_raw(pid), Signal::SIGTERM).context("signal the daemon")?;
     println!("stopped amux daemon (pid {pid})");
     Ok(())
+}
+
+/// Remove the daemon's runtime files, but only if `pidfile` still names `my_pid`. A daemon that
+/// has been superseded (evicted, or slow to shut down) must never delete its successor's socket
+/// and pidfile — that leaves the live daemon with a corrupted, unfindable identity.
+fn cleanup_if_owner(pidfile: &Path, others: &[&Path], my_pid: u32) {
+    let owner = std::fs::read_to_string(pidfile)
+        .ok()
+        .and_then(|s| s.trim().parse::<u32>().ok());
+    if owner != Some(my_pid) {
+        tracing::info!(
+            "pidfile {} names {:?}, not me ({my_pid}); leaving runtime files in place",
+            pidfile.display(),
+            owner
+        );
+        return;
+    }
+    for p in others {
+        std::fs::remove_file(p).ok();
+    }
+    std::fs::remove_file(pidfile).ok();
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn cleanup_only_when_the_pidfile_names_me() {
+        let tmp = tempfile::tempdir().unwrap();
+        let pidfile = tmp.path().join("amuxd.pid");
+        let socket = tmp.path().join("amuxd.sock");
+        std::fs::write(&socket, b"").unwrap();
+
+        // Pidfile names a DIFFERENT process — a successor owns these files; leave them.
+        std::fs::write(&pidfile, "999999").unwrap();
+        cleanup_if_owner(&pidfile, &[&socket], 12345);
+        assert!(socket.exists(), "must not delete a successor's socket");
+        assert!(pidfile.exists(), "must not delete a successor's pidfile");
+
+        // Pidfile names me — I own them; remove them.
+        std::fs::write(&pidfile, "12345").unwrap();
+        cleanup_if_owner(&pidfile, &[&socket], 12345);
+        assert!(!socket.exists(), "owner removes its socket");
+        assert!(!pidfile.exists(), "owner removes its pidfile");
+    }
 }
