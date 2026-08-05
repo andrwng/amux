@@ -228,15 +228,26 @@ impl<P: Copy + PartialEq> PaneTree<P> {
     /// Grow/shrink the focused pane in `dir` by `step`, adjusting the nearest ancestor split of
     /// the matching axis.
     pub fn resize(&mut self, dir: Dir, step: f32) {
-        let (axis, grow) = match dir {
-            Dir::Right => (Axis::LeftRight, true),
-            Dir::Left => (Axis::LeftRight, false),
-            Dir::Down => (Axis::TopBottom, true),
-            Dir::Up => (Axis::TopBottom, false),
-        };
+        let (axis, grow) = axis_and_grow(dir);
+        let delta = if grow { step } else { -step };
+        self.adjust_boundary(axis, move |ratio| ratio + delta);
+    }
+
+    /// Snap the same boundary [`resize`](Self::resize) would move to the next clean stop in `dir`
+    /// (quarters and thirds) — the coarse, capital-HJKL counterpart to the fine nudge. Stops are
+    /// fractions of the moved split's own slot, so nested and top-level splits behave alike.
+    pub fn resize_snap(&mut self, dir: Dir) {
+        let (axis, grow) = axis_and_grow(dir);
+        self.adjust_boundary(axis, move |ratio| snap_ratio(ratio, grow));
+    }
+
+    /// Walk to the nearest matching-axis split above the focused pane and remap its ratio through
+    /// `adjust`, clamped to a visible range. Both resize paths share this so they always land on
+    /// the identical boundary — they differ only in how they move it.
+    fn adjust_boundary(&mut self, axis: Axis, adjust: impl Fn(f32) -> f32) {
         let focus = self.focus;
         if let Some(root) = &mut self.root {
-            resize_toward(root, focus, axis, grow, step);
+            resize_toward(root, focus, axis, &adjust);
         }
     }
 
@@ -490,12 +501,50 @@ fn leaf_with_payload<P: Copy + PartialEq>(node: &Node<P>, payload: P) -> Option<
     }
 }
 
+/// Direction → (split axis, does the boundary move toward larger ratios?). Down/Right grow the
+/// first child (ratio up); Up/Left grow the second (ratio down). The sign is independent of which
+/// side the focus is on, so resize reads from the focused pane's perspective: on the top pane J
+/// extends it down; on the bottom pane K extends it up.
+fn axis_and_grow(dir: Dir) -> (Axis, bool) {
+    match dir {
+        Dir::Right => (Axis::LeftRight, true),
+        Dir::Left => (Axis::LeftRight, false),
+        Dir::Down => (Axis::TopBottom, true),
+        Dir::Up => (Axis::TopBottom, false),
+    }
+}
+
+/// Ratio stops the capital-HJKL snap lands on — quarters and thirds, bracketed by the 0.1/0.9
+/// clamp bounds so an edge press still moves *somewhere* until the boundary is pinned. Ascending.
+const SNAP_STOPS: [f32; 7] = [0.1, 0.25, 1.0 / 3.0, 0.5, 2.0 / 3.0, 0.75, 0.9];
+
+/// Snap `ratio` to the next stop in the move direction: `grow` climbs to the next-larger stop,
+/// shrink drops to the next-smaller. The epsilon keeps a press off the stop it already sits on
+/// (so landing exactly on 0.5 and pressing again advances); at the far end the ratio is returned
+/// unchanged.
+fn snap_ratio(ratio: f32, grow: bool) -> f32 {
+    const EPS: f32 = 0.01;
+    if grow {
+        SNAP_STOPS
+            .iter()
+            .copied()
+            .find(|&s| s > ratio + EPS)
+            .unwrap_or(ratio)
+    } else {
+        SNAP_STOPS
+            .iter()
+            .rev()
+            .copied()
+            .find(|&s| s < ratio - EPS)
+            .unwrap_or(ratio)
+    }
+}
+
 fn resize_toward<P>(
     node: &mut Node<P>,
     focus: PaneId,
     axis: Axis,
-    grow: bool,
-    step: f32,
+    adjust: &dyn Fn(f32) -> f32,
 ) -> (bool, bool) {
     match node {
         Node::Leaf { id, .. } => (*id == focus, false),
@@ -505,22 +554,16 @@ fn resize_toward<P>(
             first,
             second,
         } => {
-            let (in_first, handled_first) = resize_toward(first, focus, axis, grow, step);
+            let (in_first, handled_first) = resize_toward(first, focus, axis, adjust);
             let (in_second, handled_second) = if in_first {
                 (false, false)
             } else {
-                resize_toward(second, focus, axis, grow, step)
+                resize_toward(second, focus, axis, adjust)
             };
             let in_sub = in_first || in_second;
             let handled = handled_first || handled_second;
             if in_sub && !handled && *node_axis == axis {
-                // Move the shared boundary in the key's screen direction (Down/Right grow the first
-                // child, Up/Left the second) — so resize reads from the focused pane's perspective:
-                // on the top pane J extends it down; on the bottom pane K extends it up. The sign
-                // is independent of which side the focus is on (a `== in_first` here inverts the
-                // bottom/right pane and makes K shrink instead of grow).
-                let delta = if grow { step } else { -step };
-                *ratio = (*ratio + delta).clamp(0.1, 0.9);
+                *ratio = adjust(*ratio).clamp(0.1, 0.9);
                 return (true, true);
             }
             (in_sub, handled)
@@ -945,6 +988,99 @@ mod tests {
         assert!(
             shrunk < grown,
             "Right should shrink the right pane ({grown} → {shrunk})"
+        );
+    }
+
+    #[test]
+    fn snap_ratio_ratchets_through_clean_stops() {
+        let third = 1.0 / 3.0;
+        let two_thirds = 2.0 / 3.0;
+        // `grow` (Right/Down) climbs to the next-larger stop; shrink drops to the next-smaller. A
+        // press never sticks on the stop it already sits on, off-stop ratios round to the next
+        // clean stop, and the 0.1/0.9 clamp bounds are terminal — growing past 0.9 or shrinking
+        // past 0.1 stays put.
+        let cases = [
+            (0.5, true, two_thirds),
+            (0.5, false, third),
+            (third, true, 0.5),
+            (third, false, 0.25),
+            (two_thirds, true, 0.75),
+            (two_thirds, false, 0.5),
+            (0.25, false, 0.1),
+            (0.75, true, 0.9),
+            (0.9, true, 0.9),
+            (0.1, false, 0.1),
+            (0.3, true, third),
+            (0.3, false, 0.25),
+            (0.55, true, two_thirds),
+            (0.55, false, 0.5),
+        ];
+        for (ratio, grow, want) in cases {
+            let got = snap_ratio(ratio, grow);
+            assert!(
+                (got - want).abs() < 1e-6,
+                "snap_ratio({ratio}, grow={grow}) = {got}, want {want}"
+            );
+        }
+    }
+
+    #[test]
+    fn resize_snap_lands_the_split_on_a_clean_stop() {
+        // Width 120 so every stop is an exact integer column (⅓·120 = 40, ⅔·120 = 80).
+        let a = Rect::new(0, 0, 120, 40);
+        let mut t = PaneTree::new();
+        t.open(TerminalId::new());
+        t.split(Axis::LeftRight); // focus lands on the right pane (ratio starts at 0.5)
+        let focused_width = |t: &PaneTree<TerminalId>| {
+            t.layout(a)
+                .into_iter()
+                .find(|p| p.focused)
+                .unwrap()
+                .rect
+                .width
+        };
+        assert_eq!(focused_width(&t), 60, "starts at half the row");
+        // Left grows the right pane toward its boundary: first child's ratio 0.5 → ⅓, so the
+        // right pane goes 60 → 80.
+        t.resize_snap(Dir::Left);
+        assert_eq!(focused_width(&t), 80, "snapped to two-thirds of the row");
+        // Right shrinks it one stop back: ratio ⅓ → 0.5, right pane 80 → 60.
+        t.resize_snap(Dir::Right);
+        assert_eq!(focused_width(&t), 60, "snapped back to half");
+    }
+
+    #[test]
+    fn resize_snap_moves_the_nearest_matching_axis_split() {
+        // Two nested left/right splits. Snapping horizontally must move the *inner* boundary the
+        // focused pane sits against, never the outer one.
+        let a = Rect::new(0, 0, 120, 40);
+        let mut t = PaneTree::new();
+        let left = TerminalId::new();
+        t.open(left);
+        t.split(Axis::LeftRight); // outer split; the new right region is focused (and blank)
+        let right_region = TerminalId::new();
+        t.open(right_region); // fill it
+        t.split(Axis::LeftRight); // split that region again; the new rightmost pane is focused
+        let rightmost = TerminalId::new();
+        t.open(rightmost);
+        let width = |t: &PaneTree<TerminalId>, p: TerminalId| {
+            t.layout(a)
+                .into_iter()
+                .find(|x| x.payload == Some(p))
+                .unwrap()
+                .rect
+                .width
+        };
+        assert_eq!(width(&t, left), 60, "outer split starts at half");
+        // Snap-Left grows the focused (rightmost) pane against the inner boundary: the inner split
+        // goes 0.5 → ⅓, shrinking its first child (`right_region`) to a third of the 60-wide right
+        // region. The outer split is left alone.
+        t.resize_snap(Dir::Left);
+        assert_eq!(width(&t, left), 60, "outer split untouched");
+        assert_eq!(
+            width(&t, right_region),
+            20,
+            "inner split snapped to a third of its own slot"
         );
     }
 }

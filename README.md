@@ -122,7 +122,7 @@ Everywhere: `Ctrl+Q` quit · `Ctrl+h/j/k/l` move focus · `Ctrl+B` command prefi
 | --- | --- |
 | `%` / `"` | split left‑right / top‑bottom (spawns `$SHELL` in the same worktree) |
 | `x` | close the focused pane or mini (a shell pane's shell is killed; the agent's own terminal just hides — the agent keeps running) |
-| `r` or `H`/`J`/`K`/`L` | resize mode: `hjkl`/arrows nudge the split, `Esc`/`Enter` done |
+| `r` or `H`/`J`/`K`/`L` | resize mode: `hjkl`/arrows nudge the split, capital `HJKL` snap it to the next quarter/third, `Esc`/`Enter` done |
 | `[` | scroll (copy) mode — see below |
 | `Tab` | jump to the next agent with unread output and open it |
 | `1`–`9`, `0` | open that numbered sidebar agent (`0` is the tenth; the digits appear on the rows while the prefix is armed) |

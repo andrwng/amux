@@ -1216,11 +1216,12 @@ impl App {
                     }
                 }
             }
-            // Direct resize (tmux muscle memory): `Ctrl+B` then capital H/J/K/L resizes the
-            // focused pane one step and stays in resize mode so you can keep nudging (like `-r`).
+            // Direct resize (tmux muscle memory): `Ctrl+B` then capital H/J/K/L snaps the focused
+            // pane to the next clean stop and stays in resize mode, so a held Shift keeps snapping
+            // and releasing it switches to fine hjkl nudges (like `-r`).
             KeyCode::Char('H' | 'J' | 'K' | 'L') if !self.tree.is_empty() => {
-                if let Some(dir) = resize_dir(key.code) {
-                    self.tree.resize(dir, RESIZE_STEP);
+                if let Some((dir, _snap)) = resize_dir(key.code) {
+                    self.tree.resize_snap(dir);
                     self.resize_mode = true;
                     self.reconcile(sink).await?;
                 }
@@ -1369,9 +1370,13 @@ impl App {
             self.resize_mode = false;
             return Ok(Flow::Continue);
         }
-        // Accept both hjkl and HJKL (and arrows) so it doesn't matter if Shift is still held.
-        if let Some(dir) = resize_dir(key.code) {
-            self.tree.resize(dir, RESIZE_STEP);
+        // Lowercase hjkl / arrows nudge; capital HJKL snap to the next clean stop.
+        if let Some((dir, snap)) = resize_dir(key.code) {
+            if snap {
+                self.tree.resize_snap(dir);
+            } else {
+                self.tree.resize(dir, RESIZE_STEP);
+            }
             self.reconcile(sink).await?;
         }
         Ok(Flow::Continue)
@@ -2206,14 +2211,22 @@ fn base64_encode(input: &[u8]) -> String {
     out
 }
 
-fn resize_dir(code: KeyCode) -> Option<Dir> {
-    match code {
-        KeyCode::Char('h' | 'H') | KeyCode::Left => Some(Dir::Left),
-        KeyCode::Char('l' | 'L') | KeyCode::Right => Some(Dir::Right),
-        KeyCode::Char('j' | 'J') | KeyCode::Down => Some(Dir::Down),
-        KeyCode::Char('k' | 'K') | KeyCode::Up => Some(Dir::Up),
-        _ => None,
-    }
+/// Map a resize key to `(direction, snap?)`. Lowercase `hjkl` and the arrows nudge the split by a
+/// fine step; capital `HJKL` snap it to the next clean stop. Case is meaningful now, so holding
+/// Shift is the difference between a nudge and a snap.
+fn resize_dir(code: KeyCode) -> Option<(Dir, bool)> {
+    let out = match code {
+        KeyCode::Char('h') | KeyCode::Left => (Dir::Left, false),
+        KeyCode::Char('H') => (Dir::Left, true),
+        KeyCode::Char('l') | KeyCode::Right => (Dir::Right, false),
+        KeyCode::Char('L') => (Dir::Right, true),
+        KeyCode::Char('j') | KeyCode::Down => (Dir::Down, false),
+        KeyCode::Char('J') => (Dir::Down, true),
+        KeyCode::Char('k') | KeyCode::Up => (Dir::Up, false),
+        KeyCode::Char('K') => (Dir::Up, true),
+        _ => return None,
+    };
+    Some(out)
 }
 
 fn ctrl_byte(c: char) -> Option<u8> {
@@ -2697,7 +2710,7 @@ fn render_status(frame: &mut Frame, area: Rect, app: &App) {
         )
     } else if app.resize_mode {
         (
-            " RESIZE — hjkl grow/shrink \u{b7} esc done".to_string(),
+            " RESIZE — hjkl nudge \u{b7} HJKL snap \u{b7} esc done".to_string(),
             Style::default().fg(Color::Black).bg(Color::Yellow),
         )
     } else if app.prefix {
