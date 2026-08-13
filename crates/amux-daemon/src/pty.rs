@@ -403,15 +403,24 @@ mod tests {
     /// A session fed `n` numbered lines through `cat`, once the parser has caught up (bounded wait,
     /// so a stuck child fails an assertion rather than hanging the suite).
     fn session_with_lines(rows: u16, n: usize) -> Arc<Session> {
+        // The shell *prints* the lines itself, then `exec cat` keeps the session alive for tests
+        // that inject more input later. Feeding the lines in via stdin instead made history hold
+        // two copies of each — the PTY line discipline echoes input the moment it arrives, so a
+        // duplicate copy landed alongside cat's output and a window sampled on the seam between
+        // them showed the tail of one copy above the head of the next. `stty -echo` can't prevent
+        // it (echo fires before the shell runs stty); generating on stdout sidesteps it entirely.
+        let gen = format!("i=0; while [ $i -lt {n} ]; do echo \"line $i\"; i=$((i+1)); done");
         let session = Session::spawn(
-            &["cat".to_string()],
+            &[
+                "sh".to_string(),
+                "-c".to_string(),
+                format!("stty -echo; {gen}; exec cat"),
+            ],
             Path::new("/"),
             &[],
             Size { rows, cols: 40 },
         )
-        .expect("spawn cat");
-        let input: String = (0..n).map(|i| format!("line {i}\n")).collect();
-        session.write_input(input.as_bytes()).expect("write");
+        .expect("spawn sh");
 
         let needle = format!("line {}", n - 1);
         for _ in 0..100 {
