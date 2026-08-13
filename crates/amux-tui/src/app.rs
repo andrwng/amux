@@ -863,7 +863,7 @@ impl App {
             Focus::Sidebar => {
                 if dir == Dir::Right {
                     if !self.tree.is_empty() {
-                        self.tree.focus_first();
+                        self.tree.focus_most_recent();
                         self.focus = Focus::Panes;
                     } else if !self.minis.is_empty() {
                         self.enter_mini(0);

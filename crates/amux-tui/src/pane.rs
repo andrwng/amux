@@ -180,9 +180,12 @@ impl<P: Copy + PartialEq> PaneTree<P> {
         }
     }
 
-    pub fn focus_first(&mut self) {
+    /// Focus the pane the user worked in most recently — for returning from the sidebar so focus
+    /// lands where they left off, the way [`navigate`](Self::navigate) does between panes. Falls
+    /// back to the first leaf when the tree has no history (a freshly restored layout).
+    pub fn focus_most_recent(&mut self) {
         if let Some(node) = &self.root {
-            let id = first_leaf(node);
+            let id = most_recent_leaf(node, &self.last_focus);
             self.set_focus(id);
         }
     }
@@ -484,6 +487,25 @@ fn first_leaf<P>(node: &Node<P>) -> PaneId {
     match node {
         Node::Leaf { id, .. } => *id,
         Node::Split { first, .. } => first_leaf(first),
+    }
+}
+
+/// The leaf with the largest recency stamp; ties (and a fully unstamped tree) resolve to the
+/// leftmost, matching [`first_leaf`]. Every visit stamps through `set_focus`, so this is the pane
+/// currently focused whenever the focus is a live leaf.
+fn most_recent_leaf<P>(node: &Node<P>, stamps: &HashMap<PaneId, u64>) -> PaneId {
+    match node {
+        Node::Leaf { id, .. } => *id,
+        Node::Split { first, second, .. } => {
+            let a = most_recent_leaf(first, stamps);
+            let b = most_recent_leaf(second, stamps);
+            let stamp = |id| stamps.get(id).copied().unwrap_or(0);
+            if stamp(&b) > stamp(&a) {
+                b
+            } else {
+                a
+            }
+        }
     }
 }
 
@@ -933,6 +955,35 @@ mod tests {
             Some(b2),
             "no history → center-aligned pane"
         );
+    }
+
+    #[test]
+    fn focus_most_recent_returns_to_the_last_worked_pane() {
+        // Regression: leaving the panes for the sidebar (Nav::ExitLeft) doesn't touch the tree's
+        // focus, so coming back must land on the pane last worked in — not the first leaf.
+        let (mut t, _top, [b1, _, _]) = top_over_three();
+        let a = area();
+        assert_eq!(t.navigate(Dir::Left, a), Nav::Moved); // b3 → b2
+        assert_eq!(t.navigate(Dir::Left, a), Nav::Moved); // b2 → b1
+        assert_eq!(t.navigate(Dir::Left, a), Nav::ExitLeft); // hand off to the sidebar
+        assert_eq!(t.focused_payload(), Some(b1), "exit-left leaves focus put");
+        t.focus_most_recent(); // return from the sidebar
+        assert_eq!(
+            t.focused_payload(),
+            Some(b1),
+            "back to where I was, not the first pane"
+        );
+    }
+
+    #[test]
+    fn focus_most_recent_falls_back_to_first_leaf_without_history() {
+        // A restored layout has no per-pane history beyond its initial focus, so focus_most_recent
+        // lands on the first leaf.
+        let (t, top, _) = top_over_three();
+        let saved = t.to_layout().expect("non-empty");
+        let mut restored = PaneTree::<TerminalId>::from_layout(&saved);
+        restored.focus_most_recent();
+        assert_eq!(restored.focused_payload(), Some(top));
     }
 
     #[test]
