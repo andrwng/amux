@@ -11,7 +11,7 @@
 
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use anyhow::Result;
 use chrono::{DateTime, Utc};
@@ -81,6 +81,9 @@ const MINI_ROWS: u16 = 14;
 /// freeze it (e.g. "45s ago" staying "45s" forever). Coarse enough to be free.
 const AGE_TICK_INTERVAL: Duration = Duration::from_secs(30);
 
+/// Two left-presses on the same cell within this window are a double-click (token select + copy).
+const DOUBLE_CLICK: Duration = Duration::from_millis(400);
+
 type Sink = SplitSink<Framed<UnixStream, ClientCodec>, ClientMsg>;
 
 /// One selectable line in the sidebar: a repo header or an agent under it.
@@ -106,17 +109,15 @@ struct Selection {
     inner: Rect,
     anchor: (u16, u16),
     head: (u16, u16),
-    /// Set once a `Drag` event arrives — a real drag gesture, even one confined to the anchor
-    /// cell — as distinct from a bare click. Gates the highlight and the copy-on-release.
-    dragged: bool,
+    /// Whether this is a committed selection — a real drag gesture (even one confined to the
+    /// anchor cell) or a double-click token — as distinct from a bare click. Gates the highlight
+    /// and the copy. A plain click (press with no drag) stays false: no highlight, no copy.
+    active: bool,
 }
 
 impl Selection {
-    /// Whether a drag gesture occurred (a `Drag` event since the press), as opposed to a bare
-    /// click. True even for a drag that never leaves the anchor cell, so a one-character selection
-    /// still copies; a plain click (no pointer movement) stays false — no highlight, no copy.
-    fn is_dragged(&self) -> bool {
-        self.dragged
+    fn is_active(&self) -> bool {
+        self.active
     }
 }
 
@@ -386,6 +387,8 @@ struct App {
     scroll: Option<Scroll>,
     /// The active mouse selection (drag in progress or last completed), if any.
     selection: Option<Selection>,
+    /// Last left-press (time, col, row, pane) — the first half of a possible double-click.
+    last_click: Option<(Instant, u16, u16, TerminalId)>,
     /// Branch buffer (both `n` and `N`); repo-path buffer (`N` only); task buffer (`n` only).
     create_buf: String,
     dir_buf: String,
@@ -430,6 +433,7 @@ impl App {
             resize_mode: false,
             scroll: None,
             selection: None,
+            last_click: None,
             create_buf: String::new(),
             dir_buf: String::new(),
             task_buf: String::new(),
@@ -1520,13 +1524,14 @@ impl App {
             MouseEventKind::Drag(MouseButton::Left) => {
                 if let Some(sel) = &mut self.selection {
                     sel.head = clamp_to(sel.inner, me.column, me.row);
-                    sel.dragged = true; // a real gesture, even if it never leaves the anchor cell
+                    sel.active = true; // a real gesture, even if it never leaves the anchor cell
                 }
+                self.last_click = None; // a drag isn't the first half of a double-click
                 return Ok(());
             }
             MouseEventKind::Up(MouseButton::Left) => {
-                // Only a real drag copies; a bare click (no pointer movement) selected nothing.
-                if self.selection.is_some_and(|s| s.is_dragged()) {
+                // Only a committed selection copies; a bare click (no drag) selected nothing.
+                if self.selection.is_some_and(|s| s.is_active()) {
                     if let Some(text) = self.selection_text() {
                         if !text.trim().is_empty() {
                             copy_to_clipboard(&text);
@@ -1595,6 +1600,23 @@ impl App {
                 if self.tree.focus_payload(terminal) {
                     self.focus = Focus::Panes;
                 }
+                // A second press on the same cell within the window is a double-click: select the
+                // token under it and let the following `Up` copy it via the active-selection path.
+                let now = Instant::now();
+                let double = self.last_click.is_some_and(|(t, c, r, term)| {
+                    term == terminal
+                        && (c, r) == (me.column, me.row)
+                        && now.duration_since(t) <= DOUBLE_CLICK
+                });
+                if double {
+                    self.last_click = None; // consume, so a third press isn't a fresh double
+                    if let Some(sel) = self.token_selection(terminal, inner, me.column, me.row) {
+                        self.selection = Some(sel);
+                        return Ok(()); // whitespace under the cursor leaves no selection
+                    }
+                    return Ok(());
+                }
+                self.last_click = Some((now, me.column, me.row, terminal));
                 // Always own the left-drag for a pane-isolated text selection, even when the pane's
                 // app tracks the mouse (Claude, vim, less). amux never forwards left-clicks to pane
                 // apps — only the wheel — so this takes away no interaction they had, and it makes
@@ -1605,7 +1627,7 @@ impl App {
                     inner,
                     anchor: p,
                     head: p,
-                    dragged: false,
+                    active: false,
                 });
             }
             MouseEventKind::ScrollUp | MouseEventKind::ScrollDown => {
@@ -1657,6 +1679,37 @@ impl App {
             }
         }
         Some(out)
+    }
+
+    /// The token (word plus path/URL punctuation) under screen point `(col, row)` in pane `inner`,
+    /// as a one-row [`Selection`] ready to highlight and copy. `None` if the cell is blank or the
+    /// point isn't over the pane's parser — a double-click on whitespace selects nothing.
+    fn token_selection(
+        &self,
+        terminal: TerminalId,
+        inner: Rect,
+        col: u16,
+        row: u16,
+    ) -> Option<Selection> {
+        let screen = self.parsers.get(&terminal)?.screen();
+        let cy = row.checked_sub(inner.y)?;
+        let cx = col.checked_sub(inner.x)?;
+        let cells: Vec<String> = (0..inner.width)
+            .map(|x| {
+                screen
+                    .cell(cy, x)
+                    .map(|c| c.contents().to_string())
+                    .unwrap_or_default()
+            })
+            .collect();
+        let (x0, x1) = token_span(&cells, cx as usize)?;
+        Some(Selection {
+            terminal,
+            inner,
+            anchor: (inner.x + x0 as u16, row),
+            head: (inner.x + x1 as u16, row),
+            active: true,
+        })
     }
 
     /// The mini index (and its inner content area) under screen point `(col, row)`, if any. Minis
@@ -2146,6 +2199,34 @@ fn clamp_to(inner: Rect, col: u16, row: u16) -> (u16, u16) {
     (x, y)
 }
 
+/// Whether a cell's contents belong to a token: alphanumerics plus the punctuation that keeps
+/// paths, URLs, flags and dotted identifiers whole. Empty cells (blanks, the trailing half of a
+/// wide glyph) are boundaries.
+fn is_token_char(contents: &str) -> bool {
+    !contents.is_empty()
+        && contents
+            .chars()
+            .all(|c| c.is_alphanumeric() || "._-/~:@".contains(c))
+}
+
+/// The `[x0, x1]` inclusive cell span of the token containing cell `x` in `row` (a pane row's
+/// per-cell contents), or `None` when that cell isn't a token char. Single row; the caller maps
+/// the span back to screen columns.
+fn token_span(row: &[String], x: usize) -> Option<(usize, usize)> {
+    if row.get(x).is_none_or(|c| !is_token_char(c)) {
+        return None;
+    }
+    let mut x0 = x;
+    while x0 > 0 && is_token_char(&row[x0 - 1]) {
+        x0 -= 1;
+    }
+    let mut x1 = x;
+    while x1 + 1 < row.len() && is_token_char(&row[x1 + 1]) {
+        x1 += 1;
+    }
+    Some((x0, x1))
+}
+
 /// Order two points in reading order (top-to-bottom, then left-to-right).
 fn ordered(a: (u16, u16), b: (u16, u16)) -> ((u16, u16), (u16, u16)) {
     if (a.1, a.0) <= (b.1, b.0) {
@@ -2157,8 +2238,8 @@ fn ordered(a: (u16, u16), b: (u16, u16)) -> ((u16, u16), (u16, u16)) {
 
 /// Reverse-video the selected cells of `sel` in the frame buffer (drawn over the pane's content).
 fn highlight_selection(buf: &mut Buffer, sel: Selection) {
-    // A bare click (no drag gesture) selected nothing — draw no highlight.
-    if !sel.is_dragged() {
+    // A bare click (no drag, no token) selected nothing — draw no highlight.
+    if !sel.is_active() {
         return;
     }
     let (start, end) = ordered(sel.anchor, sel.head);
@@ -3222,9 +3303,92 @@ mod tests {
             inner,
             anchor: (1, 1), // 'a' of alpha (screen col 1 = pane col 0, row 1 = pane row 0)
             head: (1 + 4, 1 + 1), // 'o' of bravo (pane row 1, col 4)
-            dragged: true,
+            active: true,
         });
         assert_eq!(app.selection_text().unwrap(), "alpha\nbravo");
+    }
+
+    #[test]
+    fn token_span_grabs_words_paths_and_flags() {
+        let row: Vec<String> = "/home/awong/foo.rs --all a"
+            .chars()
+            .map(|c| c.to_string())
+            .collect();
+        // A click anywhere in the path grabs the whole path (cells 0..17), slashes and dot kept.
+        assert_eq!(token_span(&row, 6), Some((0, 17)));
+        assert_eq!(token_span(&row, 0), Some((0, 17)));
+        // The space between path and flag is a boundary.
+        assert_eq!(token_span(&row, 18), None);
+        // The flag keeps its leading dashes (cells 19..23).
+        assert_eq!(token_span(&row, 21), Some((19, 23)));
+        // A lone trailing letter is a one-cell token.
+        assert_eq!(token_span(&row, 25), Some((25, 25)));
+
+        // Punctuation outside the class ends the token: `foo.baz()` stops before `(`.
+        let paren: Vec<String> = "foo.baz()".chars().map(|c| c.to_string()).collect();
+        assert_eq!(token_span(&paren, 0), Some((0, 6)));
+        assert_eq!(token_span(&paren, 7), None);
+
+        // An empty cell (a blank, or a wide glyph's far half) is a boundary.
+        let gapped = vec!["a".to_string(), String::new(), "b".to_string()];
+        assert_eq!(token_span(&gapped, 0), Some((0, 0)));
+        assert_eq!(token_span(&gapped, 1), None);
+        // Out of range is not a token.
+        assert_eq!(token_span(&gapped, 9), None);
+    }
+
+    #[test]
+    fn token_selection_maps_the_word_to_screen_cells() {
+        let mut app = App::new(100, 40);
+        let t = TerminalId::new();
+        app.tree.open(t);
+        let mut parser = vt100::Parser::new(6, 40, 100);
+        parser.process(b"run /home/awong/foo.rs now\r\n");
+        app.parsers.insert(t, parser);
+        // Pane content anchored at screen (1,1); the path sits at cells 4..21 → screen cols 5..22.
+        let inner = Rect::new(1, 1, 40, 6);
+        let sel = app
+            .token_selection(t, inner, 11, 1) // screen col 11 = cell 10, the 'a' of awong
+            .expect("a token under the cursor");
+        assert_eq!((sel.anchor, sel.head), ((5, 1), (22, 1)));
+        assert!(sel.is_active());
+        app.selection = Some(sel);
+        assert_eq!(app.selection_text().unwrap(), "/home/awong/foo.rs");
+        // Double-clicking the space after "run" (cell 3 → screen col 4) selects nothing.
+        assert!(app.token_selection(t, inner, 4, 1).is_none());
+    }
+
+    #[tokio::test]
+    async fn double_click_commits_a_token_a_single_click_does_not() {
+        let mut app = App::new(100, 40);
+        let t = TerminalId::new();
+        app.tree.open(t);
+        let mut parser = vt100::Parser::new(6, 40, 100);
+        parser.process(b"hello world\r\n");
+        app.parsers.insert(t, parser);
+        let (mut sink, _server) = test_server();
+
+        let (_, inner) = app.pane_at(40, 10).expect("mouse is over the pane");
+        let (col, row) = (inner.x + 2, inner.y); // the third cell of "hello"
+        let press = |c, r| MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column: c,
+            row: r,
+            modifiers: KeyModifiers::NONE,
+        };
+
+        // First press: a bare click selects nothing (no highlight, no copy).
+        app.on_mouse(press(col, row), &mut sink).await.unwrap();
+        assert!(
+            app.selection.is_some_and(|s| !s.is_active()),
+            "a single click is not a committed selection"
+        );
+
+        // Second press on the same cell within the window: a double-click commits the token.
+        app.on_mouse(press(col, row), &mut sink).await.unwrap();
+        let sel = app.selection.expect("double-click made a selection");
+        assert!(sel.is_active(), "double-click commits a selection");
+        assert_eq!(app.selection_text().unwrap(), "hello");
     }
 
     #[tokio::test]
@@ -3384,26 +3548,26 @@ mod tests {
             any_reversed(&buf)
         };
 
-        // No-drag click (dragged == false): nothing highlighted, even over a cell.
+        // No-drag click (active == false): nothing highlighted, even over a cell.
         assert!(
             !paints(Selection {
                 terminal: t,
                 inner,
                 anchor: (2, 2),
                 head: (2, 2),
-                dragged: false,
+                active: false,
             }),
             "a no-drag click must not paint a highlight"
         );
 
-        // A drag confined to one cell (dragged, head == anchor): that single cell is highlighted.
+        // A drag confined to one cell (active, head == anchor): that single cell is highlighted.
         assert!(
             paints(Selection {
                 terminal: t,
                 inner,
                 anchor: (2, 2),
                 head: (2, 2),
-                dragged: true,
+                active: true,
             }),
             "a single-cell drag must paint its one cell"
         );
@@ -3415,7 +3579,7 @@ mod tests {
                 inner,
                 anchor: (2, 2),
                 head: (5, 2),
-                dragged: true,
+                active: true,
             }),
             "a drag selection must paint its span"
         );
@@ -3474,11 +3638,11 @@ mod tests {
             inner: Rect::new(31, 1, 40, 20),
             anchor: (31, 1),
             head: (35, 1),
-            dragged: true,
+            active: true,
         });
         assert!(
-            app.selection.is_some_and(|s| s.is_dragged()),
-            "precondition: a live dragged selection"
+            app.selection.is_some_and(|s| s.is_active()),
+            "precondition: a live active selection"
         );
 
         // A left-press on the sidebar (column < SIDEBAR_W, outside any pane) must dismiss it.
@@ -3583,7 +3747,7 @@ mod tests {
         let sel = app.selection.expect("the drag keeps the selection");
         assert_eq!(sel.anchor, sel.head, "the pointer never left the cell");
         assert!(
-            sel.is_dragged(),
+            sel.is_active(),
             "a drag within one cell still counts as a drag (so its one character copies)"
         );
     }

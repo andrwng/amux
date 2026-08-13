@@ -144,9 +144,9 @@ through output from before you got there. Unavailable in panes running a full-sc
 scrollback on the alternate screen).
 
 **Mouse:** click focuses; the wheel scrolls back through history (wheel down to the bottom returns to
-live), or is forwarded to apps that take the mouse (vim, less, Claude); drag to select and copy from a
-single pane (via OSC 52, works over SSH); hold `Shift` to bypass amux and use your terminal's native
-selection.
+live), or is forwarded to apps that take the mouse (vim, less, Claude); drag to select — or
+double-click a word (paths, URLs and flags stay whole) — and copy from a single pane (via OSC 52,
+works over SSH); hold `Shift` to bypass amux and use your terminal's native selection.
 
 ## Command line
 
