@@ -42,10 +42,14 @@ use crate::theme::Theme;
 const SIDEBAR_W_FULL: u16 = 30;
 /// Minimized sidebar width for narrow terminals: cursor + unread bar + glyph + a few name chars.
 const SIDEBAR_W_MIN: u16 = 12;
+/// The narrowest pane an agent CLI can lay its own UI out in: a boxed prompt, a diff and a tool
+/// call all assume roughly this much, and below it every line wraps. Not a floor on a pane — a
+/// shell pane is fine narrower, and `pane::MIN_PANE_W` is that floor. This is what chrome yields to.
+const AGENT_UI_W_MIN: u16 = 60;
 /// Keep at least this many columns of main area: when a full sidebar would squeeze the panes
-/// below this, the sidebar minimizes to the rail instead. The panes are the workspace, the
-/// sidebar is chrome — a CLI in fewer than ~40 columns wraps everything and is barely usable.
-const MAIN_W_MIN: u16 = 40;
+/// below this, the sidebar minimizes to the rail instead. The panes are the workspace, the sidebar
+/// is chrome, so the chrome goes first — `AGENT_UI_W_MIN` plus the pane's two border cells.
+const MAIN_W_MIN: u16 = AGENT_UI_W_MIN + 2;
 
 /// The sidebar's width for a given total terminal width: full, unless that would leave the main
 /// area under `MAIN_W_MIN` columns. The single source of truth shared by `main_area` (which
@@ -3933,6 +3937,32 @@ mod tests {
         assert_eq!(sidebar_width(boundary - 1), SIDEBAR_W_MIN);
         assert_eq!(sidebar_width(boundary), SIDEBAR_W_FULL);
         assert_eq!(sidebar_width(200), SIDEBAR_W_FULL);
+    }
+
+    /// Regression: the sidebar used to keep its full 30 columns down to an 80-column terminal,
+    /// leaving the pane 48 columns — narrow enough that an agent CLI wraps its whole UI. The
+    /// chrome yields first: whenever the full sidebar is shown, the pane can hold an agent UI.
+    #[test]
+    fn a_full_sidebar_never_squeezes_the_pane_below_a_usable_width() {
+        for cols in 40u16..=220 {
+            let pty = pane_size(main_area(cols, 40));
+            if sidebar_width(cols) == SIDEBAR_W_FULL {
+                assert!(
+                    pty.cols >= AGENT_UI_W_MIN,
+                    "{cols}-column terminal keeps the full sidebar but leaves the pane {} columns",
+                    pty.cols
+                );
+            }
+        }
+        assert_eq!(
+            sidebar_width(80),
+            SIDEBAR_W_MIN,
+            "an 80-column terminal spends its width on the pane, not the sidebar"
+        );
+        assert!(
+            pane_size(main_area(80, 24)).cols >= AGENT_UI_W_MIN,
+            "…and that leaves the pane a usable width"
+        );
     }
 
     /// A full mini is half the available band width, clamped to a floor of today's fixed

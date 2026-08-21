@@ -614,11 +614,29 @@ fn layout_node<P: Copy>(node: &Node<P>, rect: Rect, focus: PaneId, out: &mut Vec
     }
 }
 
+/// The narrowest pane worth handing a PTY, in cells. The ratio clamp in [`resize_toward`] is a
+/// *fraction* (0.1..0.9), so on a small terminal a tenth of the area is a single column — a size
+/// that wraps an agent's UI into one unreadable column and sticks, because saved scrollback rows
+/// keep the width they were recorded at.
+const MIN_PANE_W: u16 = 20;
+/// The row counterpart of [`MIN_PANE_W`].
+const MIN_PANE_H: u16 = 5;
+
+/// Where a split's boundary falls within `extent`, keeping `floor` cells on both sides. When the
+/// slot cannot hold two floored panes the floor collapses to half of it, so a cramped slot splits
+/// evenly instead of stranding one side at a single cell.
+fn split_at(extent: u16, ratio: f32, floor: u16) -> u16 {
+    let floor = floor.min(extent / 2).max(1);
+    ((extent as f32 * ratio).round() as u16).clamp(floor, extent.saturating_sub(floor).max(floor))
+}
+
+/// The two rects a split's `ratio` divides `rect` into. The single place a ratio becomes cells, so
+/// the [`MIN_PANE_W`]/[`MIN_PANE_H`] floor applied here is one rendering and PTY sizing cannot
+/// disagree about — both read the same [`PaneTree::layout`].
 fn split_rect(rect: Rect, axis: Axis, ratio: f32) -> (Rect, Rect) {
     match axis {
         Axis::LeftRight => {
-            let w1 = ((rect.width as f32 * ratio).round() as u16)
-                .clamp(1, rect.width.saturating_sub(1).max(1));
+            let w1 = split_at(rect.width, ratio, MIN_PANE_W);
             (
                 Rect::new(rect.x, rect.y, w1, rect.height),
                 Rect::new(
@@ -630,8 +648,7 @@ fn split_rect(rect: Rect, axis: Axis, ratio: f32) -> (Rect, Rect) {
             )
         }
         Axis::TopBottom => {
-            let h1 = ((rect.height as f32 * ratio).round() as u16)
-                .clamp(1, rect.height.saturating_sub(1).max(1));
+            let h1 = split_at(rect.height, ratio, MIN_PANE_H);
             (
                 Rect::new(rect.x, rect.y, rect.width, h1),
                 Rect::new(
@@ -1073,6 +1090,80 @@ mod tests {
                 "snap_ratio({ratio}, grow={grow}) = {got}, want {want}"
             );
         }
+    }
+
+    /// Both sides of a split keep at least `MIN_PANE_W` columns, and when the slot cannot hold two
+    /// floored panes the floor collapses to half of it — an even split rather than one starved side.
+    #[test]
+    fn split_rect_floors_both_sides_to_a_usable_size() {
+        let cases = [
+            // extent, ratio, expected first width
+            (100u16, 0.1f32, MIN_PANE_W), // ratio would give 10
+            (100, 0.9, 100 - MIN_PANE_W), // ratio would give 90
+            (100, 0.5, 50),               // comfortable: ratio wins
+            (48, 0.1, MIN_PANE_W),        // exactly two floors fit
+            (28, 0.1, 14),                // too small: floor collapses to half
+            (28, 0.9, 14),                // ...from either side
+            (2, 0.1, 1),                  // degenerate: a cell each
+        ];
+        for (extent, ratio, want) in cases {
+            let (a, b) = split_rect(Rect::new(0, 0, extent, 40), Axis::LeftRight, ratio);
+            assert_eq!(
+                a.width, want,
+                "split_rect(extent {extent}, ratio {ratio}) gave {} | {}",
+                a.width, b.width
+            );
+            assert_eq!(a.width + b.width, extent, "the split covers the slot");
+        }
+    }
+
+    /// Regression: the ratio clamp in `resize_toward` is a *fraction* (0.1..0.9), so on a small
+    /// terminal repeated snapping used to drive a pane down to a single column — and `pane_size`
+    /// handed that to a real PTY, which wrapped the agent's UI into one unreadable column. The
+    /// floor lives in `split_rect`, the one place a ratio becomes cells, so rendering and PTY
+    /// sizing cannot disagree about it.
+    #[test]
+    fn snapping_cannot_starve_a_pane_below_the_floor() {
+        // The measured main area of an 80x24 terminal (sidebar 30, one row of status chrome).
+        let a = Rect::new(0, 0, 50, 23);
+        let mut t = PaneTree::new();
+        t.open(TerminalId::new());
+        t.split(Axis::LeftRight);
+        t.open(TerminalId::new());
+        for _ in 0..6 {
+            t.resize_snap(Dir::Left); // hold capital H: every press pushes the boundary left
+        }
+        let widths: Vec<u16> = t.layout(a).into_iter().map(|p| p.rect.width).collect();
+        assert_eq!(
+            widths,
+            vec![MIN_PANE_W, 50 - MIN_PANE_W],
+            "pinned at the floor"
+        );
+        for _ in 0..6 {
+            t.resize_snap(Dir::Right); // and the other way
+        }
+        let widths: Vec<u16> = t.layout(a).into_iter().map(|p| p.rect.width).collect();
+        assert_eq!(
+            widths,
+            vec![50 - MIN_PANE_W, MIN_PANE_W],
+            "pinned at the other floor"
+        );
+    }
+
+    /// The same floor applies on the vertical axis, where a 0.1 ratio of a short terminal used to
+    /// leave a pane one or two rows tall.
+    #[test]
+    fn snapping_cannot_starve_a_pane_below_the_row_floor() {
+        let a = Rect::new(0, 0, 80, 23);
+        let mut t = PaneTree::new();
+        t.open(TerminalId::new());
+        t.split(Axis::TopBottom);
+        t.open(TerminalId::new());
+        for _ in 0..6 {
+            t.resize_snap(Dir::Up);
+        }
+        let heights: Vec<u16> = t.layout(a).into_iter().map(|p| p.rect.height).collect();
+        assert_eq!(heights, vec![MIN_PANE_H, 23 - MIN_PANE_H]);
     }
 
     #[test]

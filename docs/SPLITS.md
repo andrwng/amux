@@ -81,6 +81,13 @@ mode so you can keep nudging without re-prefixing — matching tmux's `bind -r H
 arrows) resize by adjusting the nearest ancestor split's ratio (clamped 0.1–0.9); `Esc`/`Enter`
 exits.
 
+The ratio clamp is a *fraction*, so it alone let a small terminal shrink a pane to a couple of
+columns — a size that wraps an agent's UI into one unreadable column, and one that sticks, because
+saved scrollback rows keep the width they were recorded at. `split_rect` therefore also floors both
+sides of a split in **cells** (20 columns / 5 rows), collapsing that floor to half the slot when the
+slot cannot hold two. It lives there because that is the one place a ratio becomes rectangles, so
+rendering and PTY sizing cannot disagree about it — both read `PaneTree::layout`.
+
 ### Per-agent workspaces
 Each **agent owns its own tiled layout** — the main area shows exactly one agent's workspace at a
 time. Opening an agent from the sidebar **swaps** the whole main area to that agent's tree
