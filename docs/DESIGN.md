@@ -341,6 +341,20 @@ the proven mosh/agentapi-style split:
 This keeps the client a near-dumb renderer, avoids a bespoke cell-diff protocol, and makes
 multi-client attach fall out naturally.
 
+**The daemon-side parser also has to answer terminal queries** (`Queries` in `pty.rs`). A pane's
+terminal *is* that parser, so a program asking it a question has nobody else to ask: it blocks
+reading a reply that never comes, swallowing the user's keystrokes while it waits — how
+`gh auth login` came to freeze a pane at its first text prompt. vt100's `unhandled_csi` callback is
+the seam (vte owns the escape state machine, so split-across-chunks sequences are handled for us);
+the reply is written to the PTY *after* the parser lock is released, so a child that has stopped
+reading its input cannot stall parsing.
+
+The whitelist is deliberately tiny — DSR-CPR (`ESC[6n`), DSR status (`ESC[5n`), DECXCPR
+(`ESC[?6n`), DA1 (`ESC[c`) — because a wrong answer is worse than none: identity replies (DA2,
+XTVERSION) invite apps to enable capabilities we lack, and colour replies (OSC 10/11) would have us
+inventing a background colour and flipping app themes. Everything else stays silently ignored. Known
+gap, shared with tmux: vt100 has no DECOM, so CPR is absolute even under origin mode.
+
 ### 5.4 The mailbox (exact status, no scraping)
 
 The elegant part, and the payoff of the whole status thread:

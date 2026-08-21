@@ -5,7 +5,8 @@
 //! `Child` mutably while others read/write. See `docs/DESIGN.md` §5.
 //!
 //! Load-bearing details (§11): reader on a dedicated thread, drop the slave after spawn, and
-//! treat both `Ok(0)` (macOS EOF) and `Err` (Linux EIO) as "closed".
+//! treat both `Ok(0)` (macOS EOF) and `Err` (Linux EIO) as "closed". The parser is also the pane's
+//! terminal for *queries*, not just for rendering — see [`query_reply`] and §5.3.
 
 use std::io::{Read, Write};
 use std::path::Path;
@@ -114,15 +115,80 @@ pub struct ScrollFrame {
 /// Broadcast backlog per session (chunks). On overflow a lagging client resyncs via snapshot.
 const OUTPUT_BACKLOG: usize = 1024;
 
+/// The reply to a terminal query, or `None` for anything we do not answer.
+///
+/// A pane's terminal is the daemon's vt100 parser, so *it* has to answer the queries a real
+/// terminal would — an unanswered query is not a cosmetic gap: the asking program blocks reading
+/// the reply and swallows the user's keystrokes while it waits. `gh auth login` hung exactly this
+/// way at its first text prompt (survey asks DSR-CPR before drawing an editable line).
+///
+/// The whitelist is deliberately tiny: reply only to what we can answer truthfully, and leave every
+/// other query as silently ignored (which is what it was before). `cursor` is vt100's 0-based
+/// `(row, col)`; every reply is 1-based.
+///
+/// Known gap, shared with tmux: vt100 has no DECOM, so CPR is absolute even under origin mode.
+fn query_reply(
+    intermediate: Option<u8>,
+    params: &[&[u16]],
+    c: char,
+    cursor: (u16, u16),
+) -> Option<Vec<u8>> {
+    let first = params.first().and_then(|p| p.first().copied());
+    let (row, col) = (cursor.0 + 1, cursor.1 + 1);
+    match (intermediate, c, first) {
+        // DSR-CPR — "where is the cursor?"
+        (None, 'n', Some(6)) => Some(format!("\x1b[{row};{col}R").into_bytes()),
+        // DSR — "are you there?"; 0 means "ready, no malfunction".
+        (None, 'n', Some(5)) => Some(b"\x1b[0n".to_vec()),
+        // DECXCPR — CPR plus a page number; we have one page, so it is always 1.
+        (Some(b'?'), 'n', Some(6)) => Some(format!("\x1b[?{row};{col};1R").into_bytes()),
+        // DA1 — "what are you?". `ESC[c` and `ESC[0c` are the same request. VT100 with AVO, the
+        // same identity tmux reports.
+        (None, 'c', None | Some(0)) => Some(b"\x1b[?1;2c".to_vec()),
+        _ => None,
+    }
+}
+
+/// Query replies collected while parsing, drained by the reader thread.
+///
+/// The callback only *queues* — it runs with the parser lock held, and writing to the PTY there
+/// would let a child that has stopped reading its input stall parsing (and every snapshot with it).
+#[derive(Default)]
+struct Queries {
+    pending: Vec<u8>,
+}
+
+impl vt100::Callbacks for Queries {
+    fn unhandled_csi(
+        &mut self,
+        screen: &mut vt100::Screen,
+        i1: Option<u8>,
+        i2: Option<u8>,
+        params: &[&[u16]],
+        c: char,
+    ) {
+        if i2.is_some() {
+            return;
+        }
+        if let Some(reply) = query_reply(i1, params, c, screen.cursor_position()) {
+            self.pending.extend_from_slice(&reply);
+        }
+    }
+}
+
 struct SessionIo {
     master: Box<dyn MasterPty + Send>,
-    writer: Box<dyn Write + Send>,
 }
+
+/// The PTY's input side. Shared, because query replies originate on the reader thread while user
+/// input arrives on tokio tasks; the mutex keeps a reply from interleaving into a keystroke.
+type Writer = Arc<Mutex<Box<dyn Write + Send>>>;
 
 /// A live PTY session. Cheap to `Arc`-share; all methods take `&self`.
 pub struct Session {
     io: Mutex<SessionIo>,
-    parser: Arc<Mutex<vt100::Parser>>,
+    writer: Writer,
+    parser: Arc<Mutex<vt100::Parser<Queries>>>,
     output_tx: broadcast::Sender<Vec<u8>>,
     pid: Option<u32>,
     exit_rx: watch::Receiver<bool>,
@@ -168,8 +234,12 @@ impl Session {
 
         let mut reader = pair.master.try_clone_reader().context("clone reader")?;
         let writer = pair.master.take_writer().context("take writer")?;
-        let parser = Arc::new(Mutex::new(vt100::Parser::new(
-            size.rows, size.cols, SCROLLBACK,
+        let writer: Writer = Arc::new(Mutex::new(writer));
+        let parser = Arc::new(Mutex::new(vt100::Parser::new_with_callbacks(
+            size.rows,
+            size.cols,
+            SCROLLBACK,
+            Queries::default(),
         )));
         let (output_tx, _) = broadcast::channel::<Vec<u8>>(OUTPUT_BACKLOG);
         let (exit_tx, exit_rx) = watch::channel(false);
@@ -178,6 +248,7 @@ impl Session {
         // Reader thread: pump PTY output into the parser and the broadcast.
         let reader_parser = Arc::clone(&parser);
         let reader_tx = output_tx.clone();
+        let reader_writer = Arc::clone(&writer);
         let reader_thread = thread::spawn(move || {
             let mut buf = [0u8; 8192];
             loop {
@@ -185,8 +256,17 @@ impl Session {
                     Ok(0) => break,
                     Ok(n) => {
                         let chunk = &buf[..n];
+                        // Answer any terminal query in this chunk, but write the reply *after*
+                        // dropping the parser lock — see `Queries`.
+                        let mut reply = Vec::new();
                         if let Ok(mut parser) = reader_parser.lock() {
                             parser.process(chunk);
+                            reply.append(&mut parser.callbacks_mut().pending);
+                        }
+                        if !reply.is_empty() {
+                            if let Ok(mut writer) = reader_writer.lock() {
+                                let _ = writer.write_all(&reply).and_then(|()| writer.flush());
+                            }
                         }
                         let _ = reader_tx.send(chunk.to_vec()); // Err only means "no attached client"
                     }
@@ -209,8 +289,8 @@ impl Session {
         Ok(Arc::new(Self {
             io: Mutex::new(SessionIo {
                 master: pair.master,
-                writer,
             }),
+            writer,
             parser,
             output_tx,
             pid,
@@ -330,9 +410,9 @@ impl Session {
     }
 
     pub fn write_input(&self, bytes: &[u8]) -> Result<()> {
-        let mut io = self.io.lock().unwrap();
-        io.writer.write_all(bytes).context("write to pty")?;
-        io.writer.flush().context("flush pty")?;
+        let mut writer = self.writer.lock().unwrap();
+        writer.write_all(bytes).context("write to pty")?;
+        writer.flush().context("flush pty")?;
         Ok(())
     }
 
@@ -655,5 +735,90 @@ mod tests {
         .expect("spawn cat");
         let frame = session.scroll_step(None, 3);
         assert_eq!((frame.offset, frame.available), (0, 0));
+    }
+
+    /// End-to-end proof that a query is *answered*, not merely parsed: the child asks for the
+    /// cursor position and reads the reply back off its own stdin. Before the daemon answered
+    /// queries this read blocked forever — which is how `gh auth login` froze a pane, its prompt
+    /// silently eating every keystroke while it waited for a report that never came.
+    ///
+    /// `-icanon` because the reply arrives without a newline, and the line discipline would
+    /// otherwise hold it until one; real apps put the terminal in raw mode themselves.
+    #[test]
+    fn a_cursor_position_query_is_answered_to_the_child() {
+        let script = "stty -echo -icanon; printf '\\033[3;7H\\033[6n'; \
+                      r=$(head -c 6 | tr -d '\\033'); printf 'GOT<%s>' \"$r\"";
+        let session = Session::spawn(
+            &["sh".to_string(), "-c".to_string(), script.to_string()],
+            Path::new("/"),
+            &[],
+            Size { rows: 10, cols: 40 },
+        )
+        .expect("spawn sh");
+
+        for _ in 0..100 {
+            if let Ok(parser) = session.parser.lock() {
+                if parser.screen().contents().contains("GOT<") {
+                    break;
+                }
+            }
+            thread::sleep(Duration::from_millis(20));
+        }
+        let contents = session.parser.lock().unwrap().screen().contents();
+        assert!(
+            contents.contains("GOT<[3;7R>"),
+            "child never read a DSR-CPR reply; screen was {contents:?}"
+        );
+    }
+}
+
+#[cfg(test)]
+mod query_tests {
+    use super::*;
+
+    /// `(row, col)` is vt100's 0-based cursor; replies are 1-based, as every terminal reports them.
+    const CURSOR: (u16, u16) = (2, 6);
+
+    /// A query as `csi_dispatch` hands it over: leading intermediate, params, final byte.
+    type Query<'a> = (Option<u8>, &'a [&'a [u16]], char);
+
+    #[test]
+    fn answers_the_whitelisted_queries() {
+        let cases: &[(Query, &[u8])] = &[
+            // DSR-CPR: the one that hung `gh auth login` — survey asks where the cursor is and
+            // blocks reading the reply, swallowing keystrokes until it arrives.
+            ((None, &[&[6]], 'n'), b"\x1b[3;7R"),
+            ((None, &[&[5]], 'n'), b"\x1b[0n"),
+            ((Some(b'?'), &[&[6]], 'n'), b"\x1b[?3;7;1R"),
+            // DA1: bare `ESC[c` parses as no params at all, `ESC[0c` as an explicit 0.
+            ((None, &[&[0]], 'c'), b"\x1b[?1;2c"),
+            ((None, &[], 'c'), b"\x1b[?1;2c"),
+        ];
+        for ((i1, params, c), want) in cases {
+            assert_eq!(
+                query_reply(*i1, params, *c, CURSOR).as_deref(),
+                Some(*want),
+                "query {i1:?} {params:?} {c}"
+            );
+        }
+    }
+
+    #[test]
+    fn stays_silent_for_everything_else() {
+        let cases: &[Query] = &[
+            (None, &[&[3]], 'n'),       // DSR-3, printer status: not ours to answer
+            (None, &[&[1]], 'c'),       // DA1 with a param we don't recognize
+            (Some(b'>'), &[], 'c'),     // DA2 — deliberately out of scope
+            (Some(b'>'), &[], 'q'),     // XTVERSION — deliberately out of scope
+            (Some(b'?'), &[&[5]], 'n'), // no DECDSR-5 in the whitelist
+            (None, &[&[1]], 'z'),       // not a query at all
+        ];
+        for (i1, params, c) in cases {
+            assert_eq!(
+                query_reply(*i1, params, *c, CURSOR),
+                None,
+                "query {i1:?} {params:?} {c}"
+            );
+        }
     }
 }
