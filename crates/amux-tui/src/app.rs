@@ -51,6 +51,29 @@ const AGENT_UI_W_MIN: u16 = 60;
 /// is chrome, so the chrome goes first — `AGENT_UI_W_MIN` plus the pane's two border cells.
 const MAIN_W_MIN: u16 = AGENT_UI_W_MIN + 2;
 
+/// How many rows of the sidebar list a wheel notch scrolls, matching the pane wheel.
+const SIDEBAR_WHEEL_ROWS: usize = 3;
+
+/// A stored `sidebar_top` clamped to what the list can actually show: never past the last
+/// screenful, and never non-zero for a list that fits. Applied at render, so a top left behind by
+/// agents deleted underneath it corrects itself instead of showing a blank sidebar.
+fn clamp_top(top: usize, len: usize, height: usize) -> usize {
+    top.min(len.saturating_sub(height))
+}
+
+/// `top` moved the *minimum* distance that puts row `sel` on screen. Minimal, not centred, so `j`
+/// at the bottom edge scrolls one row and the list doesn't jump under the cursor.
+fn top_showing(top: usize, sel: usize, height: usize) -> usize {
+    // A zero-height sidebar has no window to speak of; treat it as one row so the selection still
+    // anchors the view instead of the arithmetic running past it.
+    let height = height.max(1);
+    if sel < top {
+        sel
+    } else {
+        top.max(sel + 1 - height.min(sel + 1))
+    }
+}
+
 /// The sidebar's width for a given total terminal width: full, unless that would leave the main
 /// area under `MAIN_W_MIN` columns. The single source of truth shared by `main_area` (which
 /// drives the pane region and mouse hit-testing) and `render`'s layout — the two must agree or
@@ -347,6 +370,9 @@ struct App {
     repos: Vec<RepoInfo>,
     agents: Vec<AgentInfo>,
     sidebar_sel: Option<Row>,
+    /// First visible sidebar row. Stored rather than derived from the selection so a wheel scroll
+    /// survives a redraw; moving the selection pulls it back (`scroll_sel_into_view`).
+    sidebar_top: usize,
     /// The **active** agent's live pane layout (what the main area shows). Each agent owns its own
     /// workspace: opening an agent swaps this out, and splits belong to that agent.
     tree: PaneTree<TerminalId>,
@@ -415,6 +441,7 @@ impl App {
             repos: Vec::new(),
             agents: Vec::new(),
             sidebar_sel: None,
+            sidebar_top: 0,
             tree: PaneTree::new(),
             trees: HashMap::new(),
             saved_layouts: HashMap::new(),
@@ -915,6 +942,19 @@ impl App {
             KeyCode::Char('q') => return Ok(Flow::Quit),
             KeyCode::Char('j') | KeyCode::Down => self.move_sidebar_sel(1),
             KeyCode::Char('k') | KeyCode::Up => self.move_sidebar_sel(-1),
+            // A list taller than the terminal needs more than one row at a time. These move the
+            // *selection* (the view follows it); the wheel scrolls the view on its own. `u`/`d` are
+            // spoken for here — `d` deletes — so the half-page keys are the Ctrl pair only.
+            KeyCode::PageDown => self.move_sidebar_sel(self.sidebar_page() as i32),
+            KeyCode::PageUp => self.move_sidebar_sel(-(self.sidebar_page() as i32)),
+            KeyCode::Char('d') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                self.move_sidebar_sel((self.sidebar_page() / 2).max(1) as i32)
+            }
+            KeyCode::Char('u') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                self.move_sidebar_sel(-((self.sidebar_page() / 2).max(1) as i32))
+            }
+            KeyCode::Char('g') => self.move_sidebar_sel(i32::MIN),
+            KeyCode::Char('G') => self.move_sidebar_sel(i32::MAX),
             // `n`: new agent in the repo under the cursor (branch-only prompt).
             KeyCode::Char('n') => {
                 if let Some(repo) = self.selected_repo() {
@@ -1560,12 +1600,23 @@ impl App {
         // selection), mirroring how clicking a pane focuses it. The sidebar occupies every column
         // left of the main area (`self.area.x` is the sidebar width) down to the status bar
         // (`self.area.bottom()`), an x-range disjoint from the minis and panes — both live in
-        // `self.area` — so it's safe to resolve first. The sidebar has no scrollback, so only the
-        // click matters; wheel and drag over it do nothing.
-        if let MouseEventKind::Down(MouseButton::Left) = me.kind {
-            if me.column < self.area.x && me.row < self.area.bottom() {
-                self.focus = Focus::Sidebar;
-                return Ok(());
+        // `self.area` — so it's safe to resolve first. The wheel scrolls the agent list (the view
+        // only, leaving the selection where it is); drag over it still does nothing.
+        if me.column < self.area.x && me.row < self.area.bottom() {
+            match me.kind {
+                MouseEventKind::Down(MouseButton::Left) => {
+                    self.focus = Focus::Sidebar;
+                    return Ok(());
+                }
+                MouseEventKind::ScrollUp => {
+                    self.scroll_sidebar(-(SIDEBAR_WHEEL_ROWS as i32));
+                    return Ok(());
+                }
+                MouseEventKind::ScrollDown => {
+                    self.scroll_sidebar(SIDEBAR_WHEEL_ROWS as i32);
+                    return Ok(());
+                }
+                _ => {}
             }
         }
 
@@ -2091,8 +2142,12 @@ impl App {
             .sidebar_sel
             .and_then(|s| rows.iter().position(|&r| r == s))
             .unwrap_or(0) as i32;
-        let next = (current + delta).clamp(0, rows.len() as i32 - 1) as usize;
+        // Saturating because `g`/`G` pass `i32::MIN`/`i32::MAX` as "as far as it goes".
+        let next = current
+            .saturating_add(delta)
+            .clamp(0, rows.len() as i32 - 1) as usize;
         self.sidebar_sel = Some(rows[next]);
+        self.scroll_sel_into_view();
     }
 
     /// Move the sidebar selection to the next **unread** agent in `dir` (down = `true`), skipping
@@ -2116,6 +2171,7 @@ impl App {
         };
         if let Some(i) = found {
             self.sidebar_sel = Some(rows[i]);
+            self.scroll_sel_into_view();
         }
     }
 
@@ -2124,6 +2180,40 @@ impl App {
         if !self.sidebar_sel.is_some_and(|s| rows.contains(&s)) {
             self.sidebar_sel = rows.first().copied();
         }
+        self.scroll_sel_into_view();
+    }
+
+    /// Rows of sidebar list the terminal can show: the sidebar spans the main area's height (both
+    /// come from `main_area`, so they cannot disagree) less its two borders. Also the page size for
+    /// `PageUp`/`PageDown`.
+    fn sidebar_page(&self) -> usize {
+        self.area.height.saturating_sub(2).max(1) as usize
+    }
+
+    /// Pull the view onto the selection. Called wherever the selection moves — never from render,
+    /// so an explicit wheel scroll stays put until the user moves the cursor again.
+    fn scroll_sel_into_view(&mut self) {
+        let rows = self.sidebar_rows();
+        let Some(sel) = self
+            .sidebar_sel
+            .and_then(|s| rows.iter().position(|&r| r == s))
+        else {
+            self.sidebar_top = 0;
+            return;
+        };
+        let height = self.sidebar_page();
+        self.sidebar_top = clamp_top(
+            top_showing(self.sidebar_top, sel, height),
+            rows.len(),
+            height,
+        );
+    }
+
+    /// Scroll the sidebar view by `delta` rows without touching the selection — what the wheel does.
+    fn scroll_sidebar(&mut self, delta: i32) {
+        let len = self.sidebar_rows().len();
+        let top = (self.sidebar_top as i32 + delta).max(0) as usize;
+        self.sidebar_top = clamp_top(top, len, self.sidebar_page());
     }
 }
 
@@ -2453,13 +2543,34 @@ fn render_sidebar(frame: &mut Frame, area: Rect, app: &App) {
     // Derived from the rect we're handed so there's no separate state to keep in sync.
     let minimized = area.width < SIDEBAR_W_FULL;
     let unread = app.agents.iter().filter(|a| a.unread).count();
+    // How much of the list is off-screen, so a clipped sidebar says so instead of just ending. The
+    // same numbers slice `lines` below — one `clamp_top` call, so the hint cannot contradict the
+    // view. `rows()` counts what will be listed; the empty state is one unscrollable line.
+    let height = area.height.saturating_sub(2) as usize;
+    let len = if app.repos.is_empty() {
+        1
+    } else {
+        app.sidebar_rows().len()
+    };
+    let top = clamp_top(app.sidebar_top, len, height);
+    let below = len.saturating_sub(top + height);
     // The full title ("agents · N unread") won't fit the minimized rail, so it drops to a bare
-    // unread badge — just the count when something's waiting, otherwise nothing.
+    // unread badge — just the count when something's waiting, otherwise nothing. The rail has no
+    // room for counts either, so there the hint is bare arrows.
+    let hidden = match (minimized, top, below) {
+        (_, 0, 0) => String::new(),
+        (false, 0, b) => format!("\u{2193}{b} "),
+        (false, a, 0) => format!("\u{2191}{a} "),
+        (false, a, b) => format!("\u{2191}{a}\u{2193}{b} "),
+        (true, 0, _) => "\u{2193}".to_string(),
+        (true, _, 0) => "\u{2191}".to_string(),
+        (true, _, _) => "\u{2195}".to_string(),
+    };
     let title = match (minimized, unread) {
-        (false, 0) => " agents ".to_string(),
-        (false, n) => format!(" agents · {n} unread "),
-        (true, 0) => String::new(),
-        (true, n) => format!(" {n} "),
+        (false, 0) => format!(" agents {hidden}"),
+        (false, n) => format!(" agents · {n} unread {hidden}"),
+        (true, 0) => hidden.clone(),
+        (true, n) => format!(" {n} {hidden}"),
     };
     let border = if app.focus == Focus::Sidebar {
         Style::default().fg(app.theme.focus)
@@ -2633,7 +2744,10 @@ fn render_sidebar(frame: &mut Frame, area: Rect, app: &App) {
             }
         }
     }
-    frame.render_widget(Paragraph::new(lines), inner);
+    // Only the visible window is handed to the paragraph: a list taller than the sidebar was
+    // silently clipped at the border before, which could hide the selection itself.
+    let visible: Vec<Line> = lines.into_iter().skip(top).take(height.max(1)).collect();
+    frame.render_widget(Paragraph::new(visible), inner);
 }
 
 /// Compact "time since" for the sidebar's last-opened column: 45s, 12m, 3h, 2d.
@@ -4145,6 +4259,204 @@ mod tests {
 
     /// An app with `n` idle agents in one repo, staggered so the sidebar order is deterministic
     /// (MRU — newest `last_opened` first). Returns the app plus the agent ids in sidebar order.
+    /// The view never hangs past the end of the list, and a list that fits is never scrolled —
+    /// `clamp_top` is what keeps a stale `sidebar_top` (agents deleted under it) honest at render.
+    #[test]
+    fn clamp_top_never_scrolls_past_the_last_row() {
+        // (top, len, height, want)
+        let cases = [
+            (0usize, 30usize, 10usize, 0usize),
+            (5, 30, 10, 5),
+            (25, 30, 10, 20), // the last screenful, not one row of it
+            (99, 30, 10, 20), // a stale top from a list that shrank
+            (5, 8, 10, 0),    // fits entirely → never scrolled
+            (5, 0, 10, 0),    // empty list
+            (5, 30, 0, 5),    // no room to render: nothing to clamp against
+        ];
+        for (top, len, height, want) in cases {
+            assert_eq!(
+                clamp_top(top, len, height),
+                want,
+                "clamp_top({top}, {len}, {height})"
+            );
+        }
+    }
+
+    /// Moving the selection pulls the view the *minimum* distance needed to show it, so `j` at the
+    /// bottom edge scrolls one row rather than re-centring and making the whole list jump.
+    #[test]
+    fn top_showing_pulls_the_view_the_minimum_distance() {
+        // (top, sel, height, want)
+        let cases = [
+            (0usize, 3usize, 10usize, 0usize), // already visible → untouched
+            (0, 9, 10, 0),                     // last visible row
+            (0, 10, 10, 1),                    // one past the bottom → scroll exactly one
+            (0, 29, 10, 20),                   // a jump to the end
+            (20, 4, 10, 4),                    // above the view → the selection becomes the top row
+            (20, 20, 10, 20),
+            (7, 0, 10, 0), // `g`
+            (0, 5, 0, 5),  // degenerate height: keep the selection at the top
+        ];
+        for (top, sel, height, want) in cases {
+            assert_eq!(
+                top_showing(top, sel, height),
+                want,
+                "top_showing({top}, {sel}, {height})"
+            );
+        }
+    }
+
+    /// A sidebar taller than the terminal is navigable: the paging keys move the selection and the
+    /// view follows it. Regression — the sidebar had no viewport at all, so rows past the bottom
+    /// border were clipped and `sidebar_sel` could sit somewhere invisible.
+    #[tokio::test]
+    async fn paging_keys_walk_a_sidebar_taller_than_the_terminal() {
+        // A 12-row terminal: one status row, two borders → 9 visible sidebar rows for 1 repo
+        // header + 30 agents.
+        let (mut app, ids) = app_with_agents(30);
+        app.area = main_area(100, 12);
+        app.focus = Focus::Sidebar;
+        app.sidebar_sel = Some(Row::Agent(ids[0]));
+        app.scroll_sel_into_view();
+        let (mut sink, _server) = test_server();
+        let page = app.sidebar_page();
+        assert_eq!(page, 9, "9 rows of sidebar body in a 12-row terminal");
+
+        let sel_index = |app: &App| {
+            let rows = app.sidebar_rows();
+            app.sidebar_sel
+                .and_then(|s| rows.iter().position(|&r| r == s))
+                .expect("a selection")
+        };
+
+        app.on_key(key(KeyCode::PageDown), &mut sink).await.unwrap();
+        assert_eq!(sel_index(&app), 1 + page, "PageDown moves a full page");
+        assert!(
+            app.sidebar_top > 0 && sel_index(&app) < app.sidebar_top + page,
+            "the view followed: top {}, selection {}",
+            app.sidebar_top,
+            sel_index(&app)
+        );
+
+        app.on_key(ctrl('d'), &mut sink).await.unwrap();
+        assert_eq!(
+            sel_index(&app),
+            1 + page + page / 2,
+            "Ctrl+d is half a page"
+        );
+
+        app.on_key(key(KeyCode::Char('G')), &mut sink)
+            .await
+            .unwrap();
+        let rows = app.sidebar_rows();
+        assert_eq!(sel_index(&app), rows.len() - 1, "G goes to the last row");
+        assert_eq!(
+            app.sidebar_top,
+            rows.len() - page,
+            "…and the view shows the final screenful"
+        );
+
+        app.on_key(key(KeyCode::Char('g')), &mut sink)
+            .await
+            .unwrap();
+        assert_eq!(sel_index(&app), 0, "g goes back to the first row");
+        assert_eq!(app.sidebar_top, 0);
+    }
+
+    /// The wheel scrolls the *view* and leaves the selection alone — and the scroll survives a
+    /// redraw, which is why `sidebar_top` is stored rather than derived from the selection.
+    #[tokio::test]
+    async fn a_wheel_over_the_sidebar_scrolls_the_view_only() {
+        let (mut app, ids) = app_with_agents(30);
+        app.area = main_area(100, 12);
+        app.focus = Focus::Sidebar;
+        app.sidebar_sel = Some(Row::Agent(ids[0]));
+        let (mut sink, _server) = test_server();
+
+        let wheel = |kind: MouseEventKind| MouseEvent {
+            kind,
+            column: 2, // inside the sidebar: left of the main area
+            row: 4,
+            modifiers: KeyModifiers::NONE,
+        };
+        app.on_mouse(wheel(MouseEventKind::ScrollDown), &mut sink)
+            .await
+            .unwrap();
+        assert_eq!(app.sidebar_top, 3, "three rows per notch");
+        assert_eq!(
+            app.sidebar_sel,
+            Some(Row::Agent(ids[0])),
+            "the selection stays put"
+        );
+
+        // A redraw must not yank the view back to the selection.
+        let mut term = ratatui::Terminal::new(ratatui::backend::TestBackend::new(30, 12)).unwrap();
+        term.draw(|f| render_sidebar(f, f.area(), &app)).unwrap();
+        assert_eq!(app.sidebar_top, 3);
+
+        // But the next `j` does — minimally, so the selection lands on the top visible row rather
+        // than the view snapping all the way back to where it started.
+        app.on_key(key(KeyCode::Char('j')), &mut sink)
+            .await
+            .unwrap();
+        assert_eq!(
+            app.sidebar_top, 2,
+            "moving the selection pulls the view to it"
+        );
+
+        app.on_mouse(wheel(MouseEventKind::ScrollUp), &mut sink)
+            .await
+            .unwrap();
+        assert_eq!(app.sidebar_top, 0, "already at the top: nothing to scroll");
+    }
+
+    /// What the user actually sees: the selected agent is on screen even when it sits well past the
+    /// bottom of a short terminal, and the title says how many rows are hidden each way.
+    #[test]
+    fn a_short_sidebar_renders_the_selection_and_says_what_is_hidden() {
+        use ratatui::{backend::TestBackend, Terminal};
+        let mut app = App::new(100, 12);
+        let repo = RepoId::from_canonical_path(std::path::Path::new("/r"));
+        app.repos = vec![RepoInfo {
+            id: repo,
+            name: "r".into(),
+            path: "/r".into(),
+        }];
+        app.agents = (0..30)
+            .map(|i| {
+                let mut a = agent_with(AgentState::Idle, false);
+                a.name = format!("agent{i:02}");
+                a.last_opened = Utc::now() - chrono::Duration::seconds(i);
+                a
+            })
+            .collect();
+        let ids = app.ordered_agent_ids();
+        app.sidebar_sel = Some(Row::Agent(ids[25]));
+        app.scroll_sel_into_view();
+
+        let mut term = Terminal::new(TestBackend::new(SIDEBAR_W_FULL, 12)).unwrap();
+        term.draw(|f| render_sidebar(f, f.area(), &app)).unwrap();
+        let content: String = term
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|c| c.symbol())
+            .collect();
+        assert!(
+            content.contains("agent25"),
+            "the selected agent must be on screen, got: {content}"
+        );
+        assert!(
+            !content.contains("agent00"),
+            "the top of the list has scrolled off, got: {content}"
+        );
+        assert!(
+            content.contains('\u{2191}'),
+            "the title reports the rows hidden above, got: {content}"
+        );
+    }
+
     fn app_with_agents(n: usize) -> (App, Vec<AgentId>) {
         let mut app = App::new(100, 40);
         let repo = RepoId::from_canonical_path(std::path::Path::new("/r"));

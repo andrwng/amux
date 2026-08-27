@@ -91,6 +91,8 @@ Two deliberate exceptions:
 
 - In the **sidebar**, `Ctrl+j`/`Ctrl+k` jump to the next/previous **unread** agent (there is
   nothing above or below the sidebar to move into).
+- A list longer than the terminal is tall scrolls: the view follows the selection, the mouse wheel
+  scrolls it on its own, and the sidebar title shows `↑`/`↓` counts for the rows out of sight.
 - A vim-like app that announces it handles splits gets `Ctrl+h/j/k/l` passed through; when it
   hits its own edge it hands navigation back to amux, so one motion works across both. See
   [`contrib/README.md`](contrib/README.md) to install the vim plugin.
@@ -104,6 +106,9 @@ Everywhere: `Ctrl+Q` quit · `Ctrl+h/j/k/l` move focus · `Ctrl+B` command prefi
 | Key | Action |
 | --- | --- |
 | `j`/`k` or arrows | move the selection |
+| `PageUp`/`PageDown` | move the selection a page |
+| `Ctrl+u`/`Ctrl+d` | move the selection half a page |
+| `g`/`G` | first/last row |
 | `Enter` or `l` | open the agent in the main area |
 | `m` | open the agent as a mini |
 | `n` | new agent in the selected repo (prompts for a branch, and an optional task to start it on) |
