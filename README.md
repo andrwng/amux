@@ -93,6 +93,9 @@ Two deliberate exceptions:
   nothing above or below the sidebar to move into).
 - A list longer than the terminal is tall scrolls: the view follows the selection, the mouse wheel
   scrolls it on its own, and the sidebar title shows `↑`/`↓` counts for the rows out of sight.
+- With more than one repo in play, a **recent** block tops the sidebar: the three agents you last
+  opened, named `repo/branch`, holding the first numeric shortcuts. Rows behave like any other agent
+  row (`Enter` opens, `d` deletes); each agent still appears under its repo below.
 - A vim-like app that announces it handles splits gets `Ctrl+h/j/k/l` passed through; when it
   hits its own edge it hands navigation back to amux, so one motion works across both. See
   [`contrib/README.md`](contrib/README.md) to install the vim plugin.

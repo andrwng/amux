@@ -51,6 +51,47 @@ const AGENT_UI_W_MIN: u16 = 60;
 /// is chrome, so the chrome goes first — `AGENT_UI_W_MIN` plus the pane's two border cells.
 const MAIN_W_MIN: u16 = AGENT_UI_W_MIN + 2;
 
+/// Agents in the "recent" block at the top of the sidebar. Fixed: the block is a shortcut, and a
+/// fourth row costs more than the fourth-most-recent agent is worth.
+const RECENT_ROWS: usize = 3;
+/// Rows the block occupies in total: its header, the agents, and the divider under it.
+const RECENT_BLOCK_ROWS: usize = RECENT_ROWS + 2;
+
+/// The agents to list in the recent block: global MRU by `last_opened`, newest first.
+///
+/// Deliberately *not* `sort_for_sidebar`, which floats blocked agents to the top — under that order
+/// "recent" would mean "recent, unless something is waiting", which is the roster's job, not this
+/// block's. The point of the block is the one thing the roster cannot say: recency **across** repos,
+/// since the roster is grouped by repo and only MRU within a group.
+fn recent_ids(agents: &[AgentInfo], n: usize) -> Vec<AgentId> {
+    let mut by_recency: Vec<&AgentInfo> = agents.iter().collect();
+    // `last_activity` breaks ties (`AgentId` is not ordered); a stable sort keeps the rest as-is.
+    by_recency.sort_by(|a, b| {
+        b.last_opened
+            .cmp(&a.last_opened)
+            .then(b.last_activity.cmp(&a.last_activity))
+    });
+    by_recency.into_iter().take(n).map(|a| a.id).collect()
+}
+
+/// Whether the recent block earns its rows. Every guard exists to keep it from being noise:
+///
+/// - One repo with agents: that group is already MRU, so the block would copy its own top.
+/// - Not more agents than the block holds: same, for the whole list.
+/// - A sidebar too short to leave the roster room: the roster is the thing being navigated.
+/// - The minimized rail: no width for the `repo/branch` names that make the block readable.
+fn show_recent(
+    repos_with_agents: usize,
+    agents: usize,
+    body_height: usize,
+    minimized: bool,
+) -> bool {
+    !minimized
+        && repos_with_agents > 1
+        && agents > RECENT_ROWS
+        && body_height >= RECENT_BLOCK_ROWS + RECENT_ROWS + 2
+}
+
 /// How many rows of the sidebar list a wheel notch scrolls, matching the pane wheel.
 const SIDEBAR_WHEEL_ROWS: usize = 3;
 
@@ -118,6 +159,12 @@ type Sink = SplitSink<Framed<UnixStream, ClientCodec>, ClientMsg>;
 /// apart and scroll the selection off-screen. That is why the dim trailer lines are rows too.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum Row {
+    /// The "recent" label above the MRU block.
+    RecentHeader,
+    /// An agent in the MRU block — the same agent also appears under its repo below.
+    Recent(AgentId),
+    /// The rule between the recent block and the repo groups.
+    Divider,
     Repo(RepoId),
     /// The "no agents — press n" hint under an empty repo header.
     EmptyRepo(RepoId),
@@ -132,7 +179,7 @@ impl Row {
     /// Whether the cursor can land here. The trailer rows are context for the row above, so `j`/`k`
     /// step over them.
     fn selectable(&self) -> bool {
-        matches!(self, Row::Repo(_) | Row::Agent(_))
+        matches!(self, Row::Repo(_) | Row::Agent(_) | Row::Recent(_))
     }
 }
 
@@ -2044,6 +2091,24 @@ impl App {
         let mut repos: Vec<&RepoInfo> = self.repos.iter().collect();
         repos.sort_by(|a, b| a.name.cmp(&b.name).then(a.id.cmp(&b.id)));
         let mut rows = Vec::new();
+        let with_agents = repos
+            .iter()
+            .filter(|r| self.agents.iter().any(|a| a.repo == r.id))
+            .count();
+        if show_recent(
+            with_agents,
+            self.agents.len(),
+            self.sidebar_page(),
+            minimized,
+        ) {
+            rows.push(Row::RecentHeader);
+            rows.extend(
+                recent_ids(&self.agents, RECENT_ROWS)
+                    .into_iter()
+                    .map(Row::Recent),
+            );
+            rows.push(Row::Divider);
+        }
         for repo in repos {
             rows.push(Row::Repo(repo.id));
             let ids = self.agent_ids_for(repo.id);
@@ -2074,17 +2139,17 @@ impl App {
     fn selected_repo(&self) -> Option<RepoId> {
         match self.sidebar_sel? {
             Row::Repo(id) | Row::EmptyRepo(id) => Some(id),
-            Row::Agent(id) | Row::Attention(id) => {
+            Row::Agent(id) | Row::Attention(id) | Row::Recent(id) => {
                 self.agents.iter().find(|a| a.id == id).map(|a| a.repo)
             }
-            Row::NoRepos => None,
+            Row::RecentHeader | Row::Divider | Row::NoRepos => None,
         }
     }
 
     /// The selected agent, if the cursor is on an agent row (not a repo header).
     fn selected_agent(&self) -> Option<AgentId> {
         match self.sidebar_sel? {
-            Row::Agent(id) => Some(id),
+            Row::Agent(id) | Row::Recent(id) => Some(id),
             _ => None,
         }
     }
@@ -2092,12 +2157,16 @@ impl App {
     /// Agent ids in sidebar order (agent rows only, repo headers dropped) — the numbering the
     /// numeric overlay draws and the numeric shortcut selects from.
     fn ordered_agent_ids(&self) -> Vec<AgentId> {
+        let mut seen = HashSet::new();
         self.sidebar_rows()
             .into_iter()
             .filter_map(|row| match row {
-                Row::Agent(id) => Some(id),
+                Row::Agent(id) | Row::Recent(id) => Some(id),
                 _ => None,
             })
+            // An agent in the recent block also has a row under its repo. Numbering it once — at its
+            // first, i.e. recent, row — keeps "the digit you see is the digit you press" true.
+            .filter(|id| seen.insert(*id))
             .collect()
     }
 
@@ -2705,6 +2774,67 @@ fn render_sidebar(frame: &mut Frame, area: Rect, app: &App) {
                         Span::styled(format!("({count})"), Style::default().fg(Color::DarkGray)),
                     ]));
                 }
+            }
+            Row::RecentHeader => lines.push(Line::from(Span::styled(
+                " recent",
+                Style::default()
+                    .fg(Color::DarkGray)
+                    .add_modifier(Modifier::BOLD),
+            ))),
+            Row::Divider => lines.push(Line::from(Span::styled(
+                // Inset one cell each side so the rule reads as a separator inside the sidebar
+                // rather than a second border.
+                format!(
+                    " {} ",
+                    "\u{2500}".repeat((inner.width as usize).saturating_sub(2))
+                ),
+                Style::default().fg(Color::DarkGray),
+            ))),
+            Row::Recent(id) => {
+                let Some(agent) = by_id.get(&id) else {
+                    lines.push(Line::default());
+                    continue;
+                };
+                // Qualified `repo/branch`, because the block's whole job is spanning repos — an
+                // unqualified name here would be ambiguous in a way the grouped rows never are.
+                let repo = repo_names.get(&agent.repo).copied().unwrap_or("repo");
+                let name = format!("{repo}/{}", agent.name);
+                let name_style = if agent.unread || selected {
+                    Style::default().add_modifier(Modifier::BOLD)
+                } else {
+                    Style::default()
+                };
+                let glyph_span = match overlay_digits.get(&id) {
+                    Some(&digit) => Span::styled(
+                        format!(" {digit} "),
+                        Style::default()
+                            .fg(Color::Black)
+                            .bg(app.theme.focus)
+                            .add_modifier(Modifier::BOLD),
+                    ),
+                    None => Span::styled(
+                        format!(" {} ", agent.state.glyph()),
+                        Style::default().fg(color_for(&agent.state)),
+                    ),
+                };
+                // The same columns as a roster row — cursor (1) + unread bar (1) + " glyph " (3) +
+                // open marker (1) = 6 — so the two lists line up and `*` means the same in both.
+                let open_marker = if open.contains(&id) { "*" } else { " " };
+                let age = age_short(agent.last_opened);
+                let name_w = (inner.width as usize).saturating_sub(6 + age.len() + 1);
+                lines.push(Line::from(vec![
+                    Span::styled(marker.to_string(), Style::default().fg(app.theme.focus)),
+                    Span::styled(
+                        if agent.unread { "\u{258c}" } else { " " },
+                        Style::default()
+                            .fg(app.theme.focus)
+                            .add_modifier(Modifier::BOLD),
+                    ),
+                    glyph_span,
+                    Span::styled(open_marker, name_style),
+                    Span::styled(format!("{name:<name_w$.name_w$}"), name_style),
+                    Span::styled(format!(" {age}"), Style::default().fg(Color::DarkGray)),
+                ]));
             }
             Row::EmptyRepo(_) => lines.push(Line::from(Span::styled(
                 "      no agents — press n",
@@ -4640,6 +4770,213 @@ mod tests {
         for stop in stops {
             assert!(seen.contains(&stop), "{stop:?} was never reachable");
         }
+    }
+
+    /// Two repos, `a` agents in one and `b` in the other, opened newest-first across both so the
+    /// recent block interleaves them.
+    fn app_with_two_repos(a: usize, b: usize) -> (App, Vec<AgentId>) {
+        let mut app = App::new(100, 40);
+        let r = RepoId::from_canonical_path(std::path::Path::new("/r"));
+        let z = RepoId::from_canonical_path(std::path::Path::new("/z"));
+        app.repos = vec![
+            RepoInfo {
+                id: r,
+                name: "r".into(),
+                path: "/r".into(),
+            },
+            RepoInfo {
+                id: z,
+                name: "z".into(),
+                path: "/z".into(),
+            },
+        ];
+        app.agents = (0..(a + b))
+            .map(|i| {
+                let mut agent = agent_with(AgentState::Idle, false);
+                agent.name = format!("agent{i:02}");
+                agent.repo = if i < a { r } else { z };
+                agent.last_opened = Utc::now() - chrono::Duration::minutes(i as i64);
+                agent
+            })
+            .collect();
+        let ids = app.ordered_agent_ids();
+        (app, ids)
+    }
+
+    /// The recent block is global MRU by `last_opened` — deliberately not `sort_for_sidebar`, whose
+    /// blocked-first rule would make "recent" mean something else.
+    #[test]
+    fn recent_ids_are_global_mru() {
+        let repo_a = RepoId::from_canonical_path(std::path::Path::new("/a"));
+        let repo_b = RepoId::from_canonical_path(std::path::Path::new("/b"));
+        let mut agents: Vec<AgentInfo> = (0..5)
+            .map(|i| {
+                let mut a = agent_with(AgentState::Idle, false);
+                a.name = format!("a{i}");
+                a.repo = if i % 2 == 0 { repo_a } else { repo_b };
+                // a0 newest … a4 oldest.
+                a.last_opened = Utc::now() - chrono::Duration::minutes(i);
+                a
+            })
+            .collect();
+        // A blocked agent that was opened long ago must not be dragged to the front.
+        agents[4].state = AgentState::NeedsAttention {
+            kind: amux_core::agent::AttentionKind::Permission,
+            message: None,
+        };
+        let names = |ids: Vec<AgentId>| -> Vec<String> {
+            ids.into_iter()
+                .map(|id| {
+                    agents
+                        .iter()
+                        .find(|a| a.id == id)
+                        .map(|a| a.name.clone())
+                        .unwrap()
+                })
+                .collect()
+        };
+        assert_eq!(names(recent_ids(&agents, 3)), vec!["a0", "a1", "a2"]);
+        assert_eq!(
+            names(recent_ids(&agents, 9)),
+            vec!["a0", "a1", "a2", "a3", "a4"],
+            "asking for more than exist yields all of them"
+        );
+        assert!(recent_ids(&agents, 0).is_empty());
+        assert!(recent_ids(&[], 3).is_empty());
+    }
+
+    /// The block earns its five rows or it does not appear: with one repo the roster is already MRU,
+    /// with three agents it would copy its own top, on a short sidebar the roster matters more, and
+    /// the rail has no room for `repo/branch` names.
+    #[test]
+    fn show_recent_only_when_it_earns_its_rows() {
+        // (repos_with_agents, agents, body_height, minimized, want)
+        let cases = [
+            (2usize, 8usize, 20usize, false, true),
+            (1, 8, 20, false, false), // single repo: the roster is already MRU
+            (2, 3, 20, false, false), // it would duplicate the whole list
+            (2, 4, 20, false, true),  // one more than the block holds
+            (2, 8, 9, false, false),  // too short: 5 rows of block, 4 of roster
+            (2, 8, 10, false, true),
+            (2, 8, 20, true, false), // the rail
+        ];
+        for (repos, agents, height, minimized, want) in cases {
+            assert_eq!(
+                show_recent(repos, agents, height, minimized),
+                want,
+                "show_recent({repos}, {agents}, {height}, {minimized})"
+            );
+        }
+    }
+
+    /// A two-repo sidebar leads with the recent block, then the repo groups unchanged. The header
+    /// and divider are trailer rows, so the cursor steps over them.
+    #[test]
+    fn the_recent_block_leads_the_sidebar() {
+        let (app, _ids) = app_with_two_repos(4, 4);
+        let rows = app.sidebar_rows();
+        let kinds: Vec<&str> = rows
+            .iter()
+            .take(5)
+            .map(|r| match r {
+                Row::RecentHeader => "header",
+                Row::Recent(_) => "recent",
+                Row::Divider => "divider",
+                Row::Repo(_) => "repo",
+                _ => "other",
+            })
+            .collect();
+        assert_eq!(
+            kinds,
+            vec!["header", "recent", "recent", "recent", "divider"],
+            "rows were {rows:?}"
+        );
+        assert!(matches!(rows[5], Row::Repo(_)), "then the first repo group");
+        assert!(
+            rows.iter().any(|r| matches!(r, Row::Agent(_))),
+            "the grouped roster is still there in full"
+        );
+        assert!(
+            !Row::RecentHeader.selectable() && !Row::Divider.selectable(),
+            "the block's chrome is not a cursor stop"
+        );
+    }
+
+    /// A recent row is a real agent row: `Enter` opens it, and the agent commands read it the same
+    /// way they read a grouped row.
+    #[test]
+    fn a_recent_row_is_actionable() {
+        let (mut app, _ids) = app_with_two_repos(4, 4);
+        let rows = app.sidebar_rows();
+        let Row::Recent(id) = rows[1] else {
+            panic!("row 1 is a recent row, got {:?}", rows[1])
+        };
+        app.sidebar_sel = Some(rows[1]);
+        assert_eq!(app.selected_agent(), Some(id));
+        assert_eq!(
+            app.selected_repo(),
+            app.agents.iter().find(|a| a.id == id).map(|a| a.repo)
+        );
+    }
+
+    /// Digits number what you see, top-down, and an agent listed twice is numbered once — in the
+    /// recent block. So `1` is the agent you last opened, and the roster continues from there.
+    #[test]
+    fn digits_number_the_recent_block_first_and_never_twice() {
+        let (app, _ids) = app_with_two_repos(4, 4);
+        let recent = recent_ids(&app.agents, RECENT_ROWS);
+        let ordered = app.ordered_agent_ids();
+        assert_eq!(
+            ordered[..RECENT_ROWS],
+            recent[..],
+            "the first digits are the recent block"
+        );
+        let mut seen = std::collections::HashSet::new();
+        for id in &ordered {
+            assert!(seen.insert(*id), "agent numbered twice");
+        }
+        assert_eq!(ordered.len(), app.agents.len(), "every agent gets a number");
+        assert_eq!(app.numbered_agent('1'), Some(recent[0]));
+    }
+
+    /// What the user sees: the block, its `repo/branch` names, and no block at all in a
+    /// single-repo sidebar.
+    #[test]
+    fn the_recent_block_renders_qualified_names() {
+        use ratatui::{backend::TestBackend, Terminal};
+        let (app, _ids) = app_with_two_repos(4, 4);
+        let mut term = Terminal::new(TestBackend::new(SIDEBAR_W_FULL, 24)).unwrap();
+        term.draw(|f| render_sidebar(f, f.area(), &app)).unwrap();
+        let content: String = term
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|c| c.symbol())
+            .collect();
+        assert!(
+            content.contains("recent"),
+            "the block's header, got: {content}"
+        );
+        assert!(
+            content.contains("r/agent") || content.contains("z/agent"),
+            "recent rows name the repo, got: {content}"
+        );
+
+        let (single, _) = app_with_agents(8);
+        let mut term = Terminal::new(TestBackend::new(SIDEBAR_W_FULL, 24)).unwrap();
+        term.draw(|f| render_sidebar(f, f.area(), &single)).unwrap();
+        let content: String = term
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|c| c.symbol())
+            .collect();
+        assert!(
+            !content.contains("recent"),
+            "one repo is already MRU — no block, got: {content}"
+        );
     }
 
     fn app_with_agents(n: usize) -> (App, Vec<AgentId>) {
