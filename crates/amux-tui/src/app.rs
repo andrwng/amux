@@ -462,6 +462,11 @@ struct App {
     repos: Vec<RepoInfo>,
     agents: Vec<AgentInfo>,
     sidebar_sel: Option<Row>,
+    /// Whether anything has *deliberately* placed the sidebar cursor — a keypress, a shortcut, a
+    /// freshly created agent. Until then the cursor is only parked wherever the roster so far
+    /// allowed, and `ensure_sidebar_sel` re-homes it as better rows arrive: the daemon sends repos
+    /// before agents, so the first roster is bare headers and the recent block does not exist yet.
+    sidebar_placed: bool,
     /// First visible sidebar row. Stored rather than derived from the selection so a wheel scroll
     /// survives a redraw; moving the selection pulls it back (`scroll_sel_into_view`).
     sidebar_top: usize,
@@ -533,6 +538,7 @@ impl App {
             repos: Vec::new(),
             agents: Vec::new(),
             sidebar_sel: None,
+            sidebar_placed: false,
             sidebar_top: 0,
             tree: PaneTree::new(),
             trees: HashMap::new(),
@@ -733,7 +739,7 @@ impl App {
                 // Select the freshly-created agent so the next Enter opens it.
                 let id = info.id;
                 self.agents.push(info);
-                self.sidebar_sel = Some(Row::Agent(id));
+                self.place_sidebar_sel(Row::Agent(id));
                 self.ensure_sidebar_sel();
             }
             DaemonMsg::AgentRemoved { id } => {
@@ -2221,7 +2227,7 @@ impl App {
     /// Jump to an agent's session: select its sidebar row and open it in the main area. This is
     /// what the numeric (`Ctrl+B <digit>` / `Cmd+digit`) and previous (`Ctrl+B -`) shortcuts do.
     async fn open_agent(&mut self, id: AgentId, sink: &mut Sink) -> Result<()> {
-        self.sidebar_sel = Some(Row::Agent(id));
+        self.place_sidebar_sel(Row::Agent(id));
         self.activate(id, sink).await
     }
 
@@ -2274,7 +2280,7 @@ impl App {
             .map(|k| order[(start + k) % n])
             .find(|id| is_unread(id));
         if let Some(id) = next {
-            self.sidebar_sel = Some(Row::Agent(id));
+            self.place_sidebar_sel(Row::Agent(id));
             self.open_selected(sink).await?;
         }
         Ok(())
@@ -2298,8 +2304,7 @@ impl App {
             .unwrap_or(0) as i32;
         // Saturating because `g`/`G` pass `i32::MIN`/`i32::MAX` as "as far as it goes".
         let next = here.saturating_add(delta).clamp(0, stops.len() as i32 - 1) as usize;
-        self.sidebar_sel = Some(rows[stops[next]]);
-        self.scroll_sel_into_view();
+        self.place_sidebar_sel(rows[stops[next]]);
     }
 
     /// Move the sidebar selection to the next **unread** agent in `dir` (down = `true`), skipping
@@ -2332,17 +2337,28 @@ impl App {
             (0..cur).rev().find(|&i| is_unread_agent(&rows[i]))
         };
         if let Some(i) = found {
-            self.sidebar_sel = Some(rows[i]);
-            self.scroll_sel_into_view();
+            self.place_sidebar_sel(rows[i]);
         }
     }
 
+    /// Put the cursor on `row` because the user (or their shortcut) asked for it — which also means
+    /// the roster stops moving it on its own.
+    fn place_sidebar_sel(&mut self, row: Row) {
+        self.sidebar_sel = Some(row);
+        self.sidebar_placed = true;
+        self.scroll_sel_into_view();
+    }
+
+    /// Keep the cursor on a row that exists. Until the user has placed it themselves it homes to the
+    /// **first** selectable row on every roster change, which is what lands it on the newest recent
+    /// agent at startup: repos arrive first, so the cursor is briefly parked on a repo header, and
+    /// the recent block only appears above it once the agents follow.
     fn ensure_sidebar_sel(&mut self) {
         let rows = self.sidebar_rows();
         let valid = self
             .sidebar_sel
             .is_some_and(|s| s.selectable() && rows.contains(&s));
-        if !valid {
+        if !valid || !self.sidebar_placed {
             self.sidebar_sel = rows.iter().copied().find(|r| r.selectable());
         }
         self.scroll_sel_into_view();
@@ -4953,6 +4969,53 @@ mod tests {
             names,
             vec!["a0", "a1", "a2", "a3", "a4"],
             "three inside the window, then the floor tops it up to {RECENT_MIN}"
+        );
+    }
+
+    /// On startup the cursor lands on the newest recent agent, not on a repo header. The daemon
+    /// sends repos before agents, so the first `ensure_sidebar_sel` sees a sidebar of bare headers;
+    /// once the agents arrive the block appears *above* the selection, and an untouched cursor has
+    /// to follow it.
+    #[tokio::test]
+    async fn the_cursor_starts_on_the_newest_recent_agent() {
+        let (reference, _ids) = app_with_two_repos(4, 4);
+        let mut app = App::new(100, 40);
+        let (mut sink, _server) = test_server();
+
+        // Startup order: repos first, then the roster.
+        app.on_daemon(DaemonMsg::Repos(reference.repos.clone()), &mut sink)
+            .await
+            .unwrap();
+        assert!(
+            matches!(app.sidebar_sel, Some(Row::Repo(_))),
+            "with no agents yet, a repo header is all there is"
+        );
+        app.on_daemon(DaemonMsg::Agents(reference.agents.clone()), &mut sink)
+            .await
+            .unwrap();
+
+        let newest = recent_ids(&app.agents, Utc::now())[0];
+        assert_eq!(
+            app.sidebar_sel,
+            Some(Row::Recent(newest)),
+            "the cursor moved to the top of the recent block"
+        );
+        assert_eq!(app.sidebar_top, 0, "and the view is at the top");
+
+        // Once the user has moved the cursor, a roster update must not yank it back.
+        app.on_key(key(KeyCode::Char('j')), &mut sink)
+            .await
+            .unwrap();
+        app.on_key(key(KeyCode::Char('j')), &mut sink)
+            .await
+            .unwrap();
+        let chosen = app.sidebar_sel;
+        app.on_daemon(DaemonMsg::Agents(reference.agents.clone()), &mut sink)
+            .await
+            .unwrap();
+        assert_eq!(
+            app.sidebar_sel, chosen,
+            "a refresh must not steal the cursor"
         );
     }
 
