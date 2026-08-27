@@ -2281,9 +2281,19 @@ impl App {
     /// `Ctrl+j`/`Ctrl+k` in the sidebar (distinct from `Ctrl+B Tab`, which cycles *and opens*).
     fn jump_unread(&mut self, down: bool) {
         let rows = self.sidebar_rows();
-        let is_unread_agent = |r: &Row| match r {
-            Row::Agent(id) => self.agents.iter().any(|a| a.id == *id && a.unread),
-            _ => false,
+        // The recent block counts: it is where a cross-repo unread agent is easiest to reach.
+        let agent_of = |r: &Row| match r {
+            Row::Agent(id) | Row::Recent(id) => Some(*id),
+            _ => None,
+        };
+        let here = self.sidebar_sel.as_ref().and_then(agent_of);
+        // An agent in the block has a row there *and* under its repo. Skipping rows that name the
+        // agent already under the cursor makes it one stop instead of two, so a jump always lands on
+        // a different agent rather than stuttering on the same one.
+        let is_unread_agent = |r: &Row| {
+            agent_of(r).is_some_and(|id| {
+                Some(id) != here && self.agents.iter().any(|a| a.id == id && a.unread)
+            })
         };
         let cur = self
             .sidebar_sel
@@ -2775,12 +2785,22 @@ fn render_sidebar(frame: &mut Frame, area: Rect, app: &App) {
                     ]));
                 }
             }
-            Row::RecentHeader => lines.push(Line::from(Span::styled(
-                " recent",
-                Style::default()
-                    .fg(Color::DarkGray)
-                    .add_modifier(Modifier::BOLD),
-            ))),
+            // Styled as a repo header for a repo named "recent" — same caret, colour, and count
+            // column — so the block reads as another group rather than a separate widget. It is
+            // still not a cursor stop: there is no repo behind it for `n`/`h`/`P` to act on.
+            Row::RecentHeader => lines.push(Line::from(vec![
+                Span::styled("  \u{25be} ", Style::default().fg(app.theme.focus)),
+                Span::styled(
+                    "recent ",
+                    Style::default()
+                        .fg(app.theme.focus)
+                        .add_modifier(Modifier::BOLD),
+                ),
+                Span::styled(
+                    format!("({})", RECENT_ROWS.min(app.agents.len())),
+                    Style::default().fg(Color::DarkGray),
+                ),
+            ])),
             Row::Divider => lines.push(Line::from(Span::styled(
                 // Inset one cell each side so the rule reads as a separator inside the sidebar
                 // rather than a second border.
@@ -4774,6 +4794,59 @@ mod tests {
 
     /// Two repos, `a` agents in one and `b` in the other, opened newest-first across both so the
     /// recent block interleaves them.
+    /// `Ctrl+j`/`Ctrl+k` reach the recent block, and an unread agent listed in *both* the block and
+    /// its repo group is one stop, not two — jumping row by row would stutter on the same agent.
+    #[tokio::test]
+    async fn jumping_unread_covers_the_recent_block_without_repeating_an_agent() {
+        let (mut app, _ids) = app_with_two_repos(4, 4);
+        app.focus = Focus::Sidebar;
+        // agent01 is in the recent block; agent05 is only in a repo group.
+        let recent_unread = app.agents.iter().find(|a| a.name == "agent01").unwrap().id;
+        let grouped_unread = app.agents.iter().find(|a| a.name == "agent05").unwrap().id;
+        for a in app.agents.iter_mut() {
+            a.unread = a.id == recent_unread || a.id == grouped_unread;
+        }
+        let rows = app.sidebar_rows();
+        assert!(
+            rows.contains(&Row::Recent(recent_unread)) && rows.contains(&Row::Agent(recent_unread)),
+            "the unread agent must appear twice for this test to mean anything"
+        );
+
+        // Start above everything, then walk down through every unread stop.
+        app.sidebar_sel = Some(Row::RecentHeader);
+        let (mut sink, _server) = test_server();
+        let mut visited = Vec::new();
+        for _ in 0..6 {
+            app.on_key(ctrl('j'), &mut sink).await.unwrap();
+            let sel = app.sidebar_sel.unwrap();
+            if visited.last() != Some(&sel) {
+                visited.push(sel);
+            }
+        }
+        assert_eq!(
+            visited,
+            vec![Row::Recent(recent_unread), Row::Agent(grouped_unread)],
+            "down: the block's row, then the other repo's — and no second visit to agent01"
+        );
+
+        // Up from agent05 the *nearest* unread stop is agent01's row under its repo — its recent
+        // row is further away — and from there the second press finds nothing, because both of
+        // agent01's rows name the agent already under the cursor.
+        let mut back = Vec::new();
+        for _ in 0..6 {
+            app.on_key(ctrl('k'), &mut sink).await.unwrap();
+            let sel = app.sidebar_sel.unwrap();
+            if back.last() != Some(&sel) {
+                back.push(sel);
+            }
+        }
+        assert_eq!(
+            back,
+            vec![Row::Agent(recent_unread)],
+            "up: the nearest of the agent's two rows, then no further"
+        );
+    }
+
     fn app_with_two_repos(a: usize, b: usize) -> (App, Vec<AgentId>) {
         let mut app = App::new(100, 40);
         let r = RepoId::from_canonical_path(std::path::Path::new("/r"));
