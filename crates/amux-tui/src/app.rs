@@ -113,11 +113,27 @@ const DOUBLE_CLICK: Duration = Duration::from_millis(400);
 
 type Sink = SplitSink<Framed<UnixStream, ClientCodec>, ClientMsg>;
 
-/// One selectable line in the sidebar: a repo header or an agent under it.
+/// One rendered line of the sidebar. **Exactly one line each** — the viewport indexes rows while
+/// `render_sidebar` slices lines, so a row that drew two lines (or none) would pull the two spaces
+/// apart and scroll the selection off-screen. That is why the dim trailer lines are rows too.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum Row {
     Repo(RepoId),
+    /// The "no agents — press n" hint under an empty repo header.
+    EmptyRepo(RepoId),
     Agent(AgentId),
+    /// The dim message under a blocked agent, when it has one.
+    Attention(AgentId),
+    /// The "no repos yet…" placeholder, the only row of a sidebar with nothing in it.
+    NoRepos,
+}
+
+impl Row {
+    /// Whether the cursor can land here. The trailer rows are context for the row above, so `j`/`k`
+    /// step over them.
+    fn selectable(&self) -> bool {
+        matches!(self, Row::Repo(_) | Row::Agent(_))
+    }
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -2006,16 +2022,49 @@ impl App {
         items.into_iter().map(|i| i.id).collect()
     }
 
-    /// The flat, ordered list of selectable rows: each repo header followed by its agents.
-    /// Repos are sorted by name so the layout is stable.
+    /// Whether the sidebar is drawn as the narrow rail. Derived from the width `main_area` gave the
+    /// panes, the same width `render_sidebar` measures its own rect by — so the two agree.
+    fn sidebar_minimized(&self) -> bool {
+        self.area.x < SIDEBAR_W_FULL
+    }
+
+    /// The flat, ordered rows: each repo header followed by its agents. Repos are sorted by name so
+    /// the layout is stable.
     fn sidebar_rows(&self) -> Vec<Row> {
+        self.sidebar_rows_for(self.sidebar_minimized())
+    }
+
+    /// `sidebar_rows` for a known width. The rail has no room for the dim trailer lines, so they are
+    /// not rows there either — `minimized` is a parameter so render can pass what it measured and
+    /// keep rows and lines in lockstep.
+    fn sidebar_rows_for(&self, minimized: bool) -> Vec<Row> {
+        if self.repos.is_empty() {
+            return vec![Row::NoRepos];
+        }
         let mut repos: Vec<&RepoInfo> = self.repos.iter().collect();
         repos.sort_by(|a, b| a.name.cmp(&b.name).then(a.id.cmp(&b.id)));
         let mut rows = Vec::new();
         for repo in repos {
             rows.push(Row::Repo(repo.id));
-            for id in self.agent_ids_for(repo.id) {
+            let ids = self.agent_ids_for(repo.id);
+            if ids.is_empty() && !minimized {
+                rows.push(Row::EmptyRepo(repo.id));
+            }
+            for id in ids {
                 rows.push(Row::Agent(id));
+                let has_message = self.agents.iter().any(|a| {
+                    a.id == id
+                        && matches!(
+                            &a.state,
+                            AgentState::NeedsAttention {
+                                message: Some(_),
+                                ..
+                            }
+                        )
+                });
+                if has_message && !minimized {
+                    rows.push(Row::Attention(id));
+                }
             }
         }
         rows
@@ -2024,8 +2073,11 @@ impl App {
     /// The repo the cursor is in: the selected repo header, or the selected agent's repo.
     fn selected_repo(&self) -> Option<RepoId> {
         match self.sidebar_sel? {
-            Row::Repo(id) => Some(id),
-            Row::Agent(id) => self.agents.iter().find(|a| a.id == id).map(|a| a.repo),
+            Row::Repo(id) | Row::EmptyRepo(id) => Some(id),
+            Row::Agent(id) | Row::Attention(id) => {
+                self.agents.iter().find(|a| a.id == id).map(|a| a.repo)
+            }
+            Row::NoRepos => None,
         }
     }
 
@@ -2033,7 +2085,7 @@ impl App {
     fn selected_agent(&self) -> Option<AgentId> {
         match self.sidebar_sel? {
             Row::Agent(id) => Some(id),
-            Row::Repo(_) => None,
+            _ => None,
         }
     }
 
@@ -2044,7 +2096,7 @@ impl App {
             .into_iter()
             .filter_map(|row| match row {
                 Row::Agent(id) => Some(id),
-                Row::Repo(_) => None,
+                _ => None,
             })
             .collect()
     }
@@ -2108,7 +2160,7 @@ impl App {
             .into_iter()
             .filter_map(|r| match r {
                 Row::Agent(id) => Some(id),
-                Row::Repo(_) => None,
+                _ => None,
             })
             .collect();
         let is_unread = |id: &AgentId| self.agents.iter().any(|a| a.id == *id && a.unread);
@@ -2132,21 +2184,25 @@ impl App {
         Ok(())
     }
 
+    /// Move the cursor `delta` **selectable** rows, clamped at the ends. Counting selectable rows
+    /// rather than raw rows is what makes the dim trailer lines invisible to `j`/`k`.
     fn move_sidebar_sel(&mut self, delta: i32) {
         let rows = self.sidebar_rows();
-        if rows.is_empty() {
+        let stops: Vec<usize> = (0..rows.len()).filter(|&i| rows[i].selectable()).collect();
+        if stops.is_empty() {
             self.sidebar_sel = None;
             return;
         }
-        let current = self
+        // Where the cursor sits among the stops. A cursor on a non-selectable row (or none at all)
+        // counts as the first stop, so the next `j` moves one row rather than jumping.
+        let here = self
             .sidebar_sel
             .and_then(|s| rows.iter().position(|&r| r == s))
+            .and_then(|i| stops.iter().position(|&stop| stop >= i))
             .unwrap_or(0) as i32;
         // Saturating because `g`/`G` pass `i32::MIN`/`i32::MAX` as "as far as it goes".
-        let next = current
-            .saturating_add(delta)
-            .clamp(0, rows.len() as i32 - 1) as usize;
-        self.sidebar_sel = Some(rows[next]);
+        let next = here.saturating_add(delta).clamp(0, stops.len() as i32 - 1) as usize;
+        self.sidebar_sel = Some(rows[stops[next]]);
         self.scroll_sel_into_view();
     }
 
@@ -2158,7 +2214,7 @@ impl App {
         let rows = self.sidebar_rows();
         let is_unread_agent = |r: &Row| match r {
             Row::Agent(id) => self.agents.iter().any(|a| a.id == *id && a.unread),
-            Row::Repo(_) => false,
+            _ => false,
         };
         let cur = self
             .sidebar_sel
@@ -2177,8 +2233,11 @@ impl App {
 
     fn ensure_sidebar_sel(&mut self) {
         let rows = self.sidebar_rows();
-        if !self.sidebar_sel.is_some_and(|s| rows.contains(&s)) {
-            self.sidebar_sel = rows.first().copied();
+        let valid = self
+            .sidebar_sel
+            .is_some_and(|s| s.selectable() && rows.contains(&s));
+        if !valid {
+            self.sidebar_sel = rows.iter().copied().find(|r| r.selectable());
         }
         self.scroll_sel_into_view();
     }
@@ -2547,11 +2606,8 @@ fn render_sidebar(frame: &mut Frame, area: Rect, app: &App) {
     // same numbers slice `lines` below — one `clamp_top` call, so the hint cannot contradict the
     // view. `rows()` counts what will be listed; the empty state is one unscrollable line.
     let height = area.height.saturating_sub(2) as usize;
-    let len = if app.repos.is_empty() {
-        1
-    } else {
-        app.sidebar_rows().len()
-    };
+    let rows = app.sidebar_rows_for(minimized);
+    let len = rows.len();
     let top = clamp_top(app.sidebar_top, len, height);
     let below = len.saturating_sub(top + height);
     // The full title ("agents · N unread") won't fit the minimized rail, so it drops to a bare
@@ -2614,15 +2670,9 @@ fn render_sidebar(frame: &mut Frame, area: Rect, app: &App) {
             }
         }
     }
+    // One line pushed per row, no exceptions — see `Row`.
     let mut lines = Vec::new();
-    if app.repos.is_empty() {
-        lines.push(Line::from(Span::styled(
-            " no repos yet…",
-            Style::default().fg(Color::DarkGray),
-        )));
-    }
-
-    for row in app.sidebar_rows() {
+    for row in rows {
         let selected = app.sidebar_sel == Some(row);
         let marker = if selected { "\u{25b8}" } else { " " };
         match row {
@@ -2654,16 +2704,21 @@ fn render_sidebar(frame: &mut Frame, area: Rect, app: &App) {
                         Span::styled(format!("{name} "), style),
                         Span::styled(format!("({count})"), Style::default().fg(Color::DarkGray)),
                     ]));
-                    if count == 0 {
-                        lines.push(Line::from(Span::styled(
-                            "      no agents — press n",
-                            Style::default().fg(Color::DarkGray),
-                        )));
-                    }
                 }
             }
+            Row::EmptyRepo(_) => lines.push(Line::from(Span::styled(
+                "      no agents — press n",
+                Style::default().fg(Color::DarkGray),
+            ))),
+            Row::NoRepos => lines.push(Line::from(Span::styled(
+                " no repos yet…",
+                Style::default().fg(Color::DarkGray),
+            ))),
             Row::Agent(id) => {
                 let Some(agent) = by_id.get(&id) else {
+                    // Unreachable (rows are built from `self.agents`), but a skipped line would
+                    // desynchronise rows from lines, so spend one blank instead.
+                    lines.push(Line::default());
                     continue;
                 };
                 let is_open = open.contains(&id);
@@ -2730,17 +2785,22 @@ fn render_sidebar(frame: &mut Frame, area: Rect, app: &App) {
                     Span::styled(name, name_style),
                     Span::styled(format!(" {age}"), Style::default().fg(Color::DarkGray)),
                 ]));
-                if let AgentState::NeedsAttention {
-                    message: Some(msg), ..
-                } = &agent.state
-                {
-                    lines.push(Line::from(Span::styled(
-                        format!("       {msg}"),
-                        Style::default()
-                            .fg(Color::Yellow)
-                            .add_modifier(Modifier::DIM),
-                    )));
-                }
+            }
+            Row::Attention(id) => {
+                let msg = match by_id.get(&id).map(|a| &a.state) {
+                    Some(AgentState::NeedsAttention {
+                        message: Some(msg), ..
+                    }) => msg.clone(),
+                    // The row is only emitted for a blocked agent with a message; keep the line
+                    // anyway rather than break the one-row-one-line invariant.
+                    _ => String::new(),
+                };
+                lines.push(Line::from(Span::styled(
+                    format!("       {msg}"),
+                    Style::default()
+                        .fg(Color::Yellow)
+                        .add_modifier(Modifier::DIM),
+                )));
             }
         }
     }
@@ -4185,7 +4245,7 @@ mod tests {
             .into_iter()
             .filter_map(|r| match r {
                 Row::Agent(id) => Some(id),
-                Row::Repo(_) => None,
+                _ => None,
             })
             .collect();
         assert_eq!(
@@ -4455,6 +4515,131 @@ mod tests {
             content.contains('\u{2191}'),
             "the title reports the rows hidden above, got: {content}"
         );
+    }
+
+    /// Every sidebar row must occupy exactly one rendered line, because the viewport indexes rows
+    /// while `render_sidebar` slices lines. An attention message used to push an extra line, so the
+    /// two spaces drifted apart and the selection could scroll off-screen anyway — the bug the
+    /// viewport was supposed to fix.
+    #[test]
+    fn a_selected_row_is_on_screen_even_below_an_attention_message() {
+        use amux_core::agent::AttentionKind;
+        use ratatui::{backend::TestBackend, Terminal};
+        let mut app = App::new(100, 12);
+        let repo = RepoId::from_canonical_path(std::path::Path::new("/r"));
+        app.repos = vec![RepoInfo {
+            id: repo,
+            name: "r".into(),
+            path: "/r".into(),
+        }];
+        app.agents = (0..30)
+            .map(|i| {
+                let mut a = agent_with(
+                    if i % 4 == 0 {
+                        AgentState::NeedsAttention {
+                            kind: AttentionKind::Permission,
+                            message: Some(format!("waiting {i:02}")),
+                        }
+                    } else {
+                        AgentState::Idle
+                    },
+                    false,
+                );
+                a.name = format!("agent{i:02}");
+                a.last_opened = Utc::now() - chrono::Duration::seconds(i);
+                a
+            })
+            .collect();
+        let ids = app.ordered_agent_ids();
+        app.sidebar_sel = Some(Row::Agent(ids[14]));
+        app.scroll_sel_into_view();
+
+        let name = app
+            .agents
+            .iter()
+            .find(|a| a.id == ids[14])
+            .map(|a| a.name.clone())
+            .unwrap();
+        let mut term = Terminal::new(TestBackend::new(SIDEBAR_W_FULL, 12)).unwrap();
+        term.draw(|f| render_sidebar(f, f.area(), &app)).unwrap();
+        let content: String = term
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|c| c.symbol())
+            .collect();
+        assert!(
+            content.contains(&name),
+            "the selected row {name} must be visible, got: {content}"
+        );
+    }
+
+    /// `j`/`k` step over the dim trailer rows: an attention message and an empty repo's hint are
+    /// context for the row above, not places the cursor can land.
+    #[tokio::test]
+    async fn moving_the_cursor_skips_the_trailer_rows() {
+        use amux_core::agent::AttentionKind;
+        let mut app = App::new(100, 40);
+        let with_agents = RepoId::from_canonical_path(std::path::Path::new("/r"));
+        let empty = RepoId::from_canonical_path(std::path::Path::new("/z"));
+        app.repos = vec![
+            RepoInfo {
+                id: with_agents,
+                name: "r".into(),
+                path: "/r".into(),
+            },
+            RepoInfo {
+                id: empty,
+                name: "z".into(),
+                path: "/z".into(),
+            },
+        ];
+        let mut blocked = agent_with(
+            AgentState::NeedsAttention {
+                kind: AttentionKind::Permission,
+                message: Some("may I".into()),
+            },
+            false,
+        );
+        blocked.name = "blocked".into();
+        let mut idle = agent_with(AgentState::Idle, false);
+        idle.name = "idle".into();
+        app.agents = vec![blocked, idle];
+        app.focus = Focus::Sidebar;
+        app.ensure_sidebar_sel();
+
+        // Both trailer rows really are in the row list, so the skipping is load-bearing.
+        let rows = app.sidebar_rows();
+        assert!(
+            rows.iter().any(|r| matches!(r, Row::Attention(_)))
+                && rows.iter().any(|r| matches!(r, Row::EmptyRepo(_))),
+            "expected both trailer rows, got {rows:?}"
+        );
+
+        let (mut sink, _server) = test_server();
+        let mut seen = vec![app.sidebar_sel.unwrap()];
+        for _ in 0..rows.len() {
+            app.on_key(key(KeyCode::Char('j')), &mut sink)
+                .await
+                .unwrap();
+            seen.push(app.sidebar_sel.unwrap());
+        }
+        for _ in 0..rows.len() {
+            app.on_key(key(KeyCode::Char('k')), &mut sink)
+                .await
+                .unwrap();
+            seen.push(app.sidebar_sel.unwrap());
+        }
+        assert!(
+            seen.iter().all(|r| r.selectable()),
+            "the cursor landed on a trailer row: {seen:?}"
+        );
+        // And every selectable row is reachable by walking down.
+        let stops: Vec<Row> = rows.into_iter().filter(|r| r.selectable()).collect();
+        for stop in stops {
+            assert!(seen.contains(&stop), "{stop:?} was never reachable");
+        }
     }
 
     fn app_with_agents(n: usize) -> (App, Vec<AgentId>) {
