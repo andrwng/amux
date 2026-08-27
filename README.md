@@ -94,9 +94,12 @@ Two deliberate exceptions:
 - A list longer than the terminal is tall scrolls: the view follows the selection, the mouse wheel
   scrolls it on its own, and the sidebar title shows `↑`/`↓` counts for the rows out of sight.
 - With more than one repo in play, a **recent** group tops the sidebar — styled like a repo of that
-  name — holding the three agents you last opened, named `repo/branch`, with the first numeric
-  shortcuts. Rows behave like any other agent row (`Enter` opens, `d` deletes, `Ctrl+j`/`Ctrl+k`
-  reach them); each agent still appears under its own repo below.
+  name — holding the agents you last opened, named `repo/branch`, with the first numeric shortcuts.
+  An agent is recent if it is one of the last five you opened or you opened it in the past 24 hours,
+  up to ten agents.
+  Rows behave like any other agent row (`Enter` opens, `d` deletes, `Ctrl+j`/`Ctrl+k` reach them);
+  each agent still appears under its own repo below. The group is hidden when it would hold every
+  agent you have (it would just be the list twice) or when the sidebar is too short to show both.
 - A vim-like app that announces it handles splits gets `Ctrl+h/j/k/l` passed through; when it
   hits its own edge it hands navigation back to amux, so one motion works across both. See
   [`contrib/README.md`](contrib/README.md) to install the vim plugin.

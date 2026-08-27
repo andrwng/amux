@@ -53,17 +53,40 @@ const MAIN_W_MIN: u16 = AGENT_UI_W_MIN + 2;
 
 /// Agents in the "recent" block at the top of the sidebar. Fixed: the block is a shortcut, and a
 /// fourth row costs more than the fourth-most-recent agent is worth.
-const RECENT_ROWS: usize = 3;
-/// Rows the block occupies in total: its header, the agents, and the divider under it.
-const RECENT_BLOCK_ROWS: usize = RECENT_ROWS + 2;
+const RECENT_MIN: usize = 5;
+/// …and anything opened inside this window is recent, so a busy day is represented rather than cut
+/// off at the floor.
+const RECENT_WINDOW: chrono::Duration = chrono::Duration::hours(24);
+/// …but never more than this, whatever the window says. A shortcut you have to scan is not a
+/// shortcut, and ten is also where the numeric shortcuts run out (`1`..`9`, `0`).
+const RECENT_MAX: usize = 10;
+/// Rows of repo-grouped roster the block must leave visible: a repo header plus a few agents.
+const ROSTER_MIN_ROWS: usize = 5;
 
-/// The agents to list in the recent block: global MRU by `last_opened`, newest first.
+/// How many agents the recent block holds: the last `RECENT_MIN` opened, **plus** everything opened
+/// inside `RECENT_WINDOW`, capped at `RECENT_MAX`.
+///
+/// A union of the two rules, which collapses to a count because both cut on the same key: sorted by
+/// `last_opened` descending, an agent inside the window cannot sit below one outside it, so the
+/// union is always a prefix of that order and `max` of the two sizes names it. The floor wins over
+/// the window, the ceiling wins over both, and the agent count wins over everything.
+fn recent_count(agents: &[AgentInfo], now: DateTime<Utc>) -> usize {
+    let in_window = agents
+        .iter()
+        .filter(|a| now.signed_duration_since(a.last_opened) < RECENT_WINDOW)
+        .count();
+    in_window.clamp(RECENT_MIN, RECENT_MAX).min(agents.len())
+}
+
+/// The agents to list in the recent block: global MRU by `last_opened`, newest first, as many as
+/// [`recent_count`] allows.
 ///
 /// Deliberately *not* `sort_for_sidebar`, which floats blocked agents to the top — under that order
 /// "recent" would mean "recent, unless something is waiting", which is the roster's job, not this
 /// block's. The point of the block is the one thing the roster cannot say: recency **across** repos,
 /// since the roster is grouped by repo and only MRU within a group.
-fn recent_ids(agents: &[AgentInfo], n: usize) -> Vec<AgentId> {
+fn recent_ids(agents: &[AgentInfo], now: DateTime<Utc>) -> Vec<AgentId> {
+    let n = recent_count(agents, now);
     let mut by_recency: Vec<&AgentInfo> = agents.iter().collect();
     // `last_activity` breaks ties (`AgentId` is not ordered); a stable sort keeps the rest as-is.
     by_recency.sort_by(|a, b| {
@@ -77,19 +100,25 @@ fn recent_ids(agents: &[AgentInfo], n: usize) -> Vec<AgentId> {
 /// Whether the recent block earns its rows. Every guard exists to keep it from being noise:
 ///
 /// - One repo with agents: that group is already MRU, so the block would copy its own top.
-/// - Not more agents than the block holds: same, for the whole list.
-/// - A sidebar too short to leave the roster room: the roster is the thing being navigated.
+/// - It holds every agent there is: then it *is* the list, printed twice. This is the guard that
+///   matters now that the 24-hour window is unbounded — a day spent touching everything would
+///   otherwise double the sidebar.
+/// - A sidebar too short to leave the roster room: the roster is the thing being navigated. The
+///   block costs its agents plus a header and a divider, and `ROSTER_MIN_ROWS` is what must be left
+///   over — a repo header and a few agents under it, or the block has crowded out the list it is a
+///   shortcut into.
 /// - The minimized rail: no width for the `repo/branch` names that make the block readable.
 fn show_recent(
     repos_with_agents: usize,
     agents: usize,
+    recent: usize,
     body_height: usize,
     minimized: bool,
 ) -> bool {
     !minimized
         && repos_with_agents > 1
-        && agents > RECENT_ROWS
-        && body_height >= RECENT_BLOCK_ROWS + RECENT_ROWS + 2
+        && recent < agents
+        && body_height >= recent + 2 + ROSTER_MIN_ROWS
 }
 
 /// How many rows of the sidebar list a wheel notch scrolls, matching the pane wheel.
@@ -2095,18 +2124,16 @@ impl App {
             .iter()
             .filter(|r| self.agents.iter().any(|a| a.repo == r.id))
             .count();
+        let recent = recent_ids(&self.agents, Utc::now());
         if show_recent(
             with_agents,
             self.agents.len(),
+            recent.len(),
             self.sidebar_page(),
             minimized,
         ) {
             rows.push(Row::RecentHeader);
-            rows.extend(
-                recent_ids(&self.agents, RECENT_ROWS)
-                    .into_iter()
-                    .map(Row::Recent),
-            );
+            rows.extend(recent.into_iter().map(Row::Recent));
             rows.push(Row::Divider);
         }
         for repo in repos {
@@ -2749,6 +2776,8 @@ fn render_sidebar(frame: &mut Frame, area: Rect, app: &App) {
             }
         }
     }
+    // The header's count comes from the rows themselves, so it cannot disagree with the block.
+    let recent_shown = rows.iter().filter(|r| matches!(r, Row::Recent(_))).count();
     // One line pushed per row, no exceptions — see `Row`.
     let mut lines = Vec::new();
     for row in rows {
@@ -2797,7 +2826,7 @@ fn render_sidebar(frame: &mut Frame, area: Rect, app: &App) {
                         .add_modifier(Modifier::BOLD),
                 ),
                 Span::styled(
-                    format!("({})", RECENT_ROWS.min(app.agents.len())),
+                    format!("({recent_shown})"),
                     Style::default().fg(Color::DarkGray),
                 ),
             ])),
@@ -4793,7 +4822,9 @@ mod tests {
     }
 
     /// Two repos, `a` agents in one and `b` in the other, opened newest-first across both so the
-    /// recent block interleaves them.
+    /// recent block interleaves them. Opens are spread six hours apart, so the first four fall
+    /// inside `RECENT_WINDOW` and the rest are older — a list the block is a shortcut *into* rather
+    /// than a copy of.
     /// `Ctrl+j`/`Ctrl+k` reach the recent block, and an unread agent listed in *both* the block and
     /// its repo group is one stop, not two — jumping row by row would stutter on the same agent.
     #[tokio::test]
@@ -4847,6 +4878,84 @@ mod tests {
         );
     }
 
+    /// Recency is the union of two rules — the last `RECENT_MIN` opened, plus anything opened inside
+    /// `RECENT_WINDOW`. Because both are cut on `last_opened`, the union is a prefix of the MRU
+    /// list: if the seventh-most-recent is inside the window, the sixth necessarily is too.
+    #[test]
+    fn recent_count_unions_the_floor_and_the_window() {
+        let now = Utc::now();
+        let hours = |h: i64| now - chrono::Duration::hours(h);
+        // (last_opened ages in hours, want)
+        let cases: &[(&[i64], usize)] = &[
+            // Nothing inside 24h: the floor of 5 carries the block.
+            (&[48, 50, 52, 54, 56, 58, 60], RECENT_MIN),
+            // Everything stale and fewer than the floor: all of them, not a padded 5.
+            (&[48, 50], 2),
+            // Eight inside the window beats the floor.
+            (&[1, 2, 3, 4, 5, 6, 7, 8, 40, 44], 8),
+            // Exactly at the floor either way.
+            (&[1, 2, 3, 4, 5, 90], RECENT_MIN),
+            // The window boundary is exclusive of older-than-24h.
+            (&[1, 23, 25, 30, 40, 50, 60], RECENT_MIN),
+            // The ceiling caps a busy day: fourteen inside the window, ten listed.
+            (&[1, 1, 2, 2, 3, 3, 4, 4, 5, 5, 6, 6, 7, 7], RECENT_MAX),
+            (&[1, 2, 3, 4, 5, 6, 7, 8, 9, 10], RECENT_MAX),
+            (&[1, 2, 3, 4, 5, 6, 7, 8, 9], 9),
+            (&[] as &[i64], 0),
+        ];
+        for (ages, want) in cases {
+            let agents: Vec<AgentInfo> = ages
+                .iter()
+                .map(|&h| {
+                    let mut a = agent_with(AgentState::Idle, false);
+                    a.last_opened = hours(h);
+                    a
+                })
+                .collect();
+            assert_eq!(
+                recent_count(&agents, now),
+                *want,
+                "recent_count for ages {ages:?}"
+            );
+        }
+    }
+
+    /// The block lists exactly the newest `recent_count` agents, newest first — and a stale agent
+    /// only makes it in on the floor, never on the window.
+    #[test]
+    fn recent_ids_take_the_newest_of_the_union() {
+        let now = Utc::now();
+        let mut agents: Vec<AgentInfo> = (0..8)
+            .map(|i| {
+                let mut a = agent_with(AgentState::Idle, false);
+                a.name = format!("a{i}");
+                // a0..a2 inside the window; a3..a7 days old.
+                a.last_opened = if i < 3 {
+                    now - chrono::Duration::hours(i + 1)
+                } else {
+                    now - chrono::Duration::days(i)
+                };
+                a
+            })
+            .collect();
+        agents.reverse(); // insertion order must not matter
+        let names: Vec<String> = recent_ids(&agents, now)
+            .into_iter()
+            .map(|id| {
+                agents
+                    .iter()
+                    .find(|a| a.id == id)
+                    .map(|a| a.name.clone())
+                    .unwrap()
+            })
+            .collect();
+        assert_eq!(
+            names,
+            vec!["a0", "a1", "a2", "a3", "a4"],
+            "three inside the window, then the floor tops it up to {RECENT_MIN}"
+        );
+    }
+
     fn app_with_two_repos(a: usize, b: usize) -> (App, Vec<AgentId>) {
         let mut app = App::new(100, 40);
         let r = RepoId::from_canonical_path(std::path::Path::new("/r"));
@@ -4868,7 +4977,7 @@ mod tests {
                 let mut agent = agent_with(AgentState::Idle, false);
                 agent.name = format!("agent{i:02}");
                 agent.repo = if i < a { r } else { z };
-                agent.last_opened = Utc::now() - chrono::Duration::minutes(i as i64);
+                agent.last_opened = Utc::now() - chrono::Duration::hours(6 * i as i64);
                 agent
             })
             .collect();
@@ -4908,14 +5017,12 @@ mod tests {
                 })
                 .collect()
         };
-        assert_eq!(names(recent_ids(&agents, 3)), vec!["a0", "a1", "a2"]);
         assert_eq!(
-            names(recent_ids(&agents, 9)),
+            names(recent_ids(&agents, Utc::now())),
             vec!["a0", "a1", "a2", "a3", "a4"],
-            "asking for more than exist yields all of them"
+            "strict MRU: the long-idle blocked agent stays last"
         );
-        assert!(recent_ids(&agents, 0).is_empty());
-        assert!(recent_ids(&[], 3).is_empty());
+        assert!(recent_ids(&[], Utc::now()).is_empty());
     }
 
     /// The block earns its five rows or it does not appear: with one repo the roster is already MRU,
@@ -4923,21 +5030,29 @@ mod tests {
     /// the rail has no room for `repo/branch` names.
     #[test]
     fn show_recent_only_when_it_earns_its_rows() {
-        // (repos_with_agents, agents, body_height, minimized, want)
+        // (repos_with_agents, agents, recent, body_height, minimized, want)
         let cases = [
-            (2usize, 8usize, 20usize, false, true),
-            (1, 8, 20, false, false), // single repo: the roster is already MRU
-            (2, 3, 20, false, false), // it would duplicate the whole list
-            (2, 4, 20, false, true),  // one more than the block holds
-            (2, 8, 9, false, false),  // too short: 5 rows of block, 4 of roster
-            (2, 8, 10, false, true),
-            (2, 8, 20, true, false), // the rail
+            (2usize, 8usize, 5usize, 20usize, false, true),
+            (1, 8, 5, 20, false, false), // single repo: the roster is already MRU
+            // The block holds every agent there is — it *is* the list, printed twice. The guard
+            // that carries the unbounded 24-hour window.
+            (2, 5, 5, 20, false, false),
+            (2, 20, 20, 40, false, false),
+            (2, 6, 5, 20, false, true), // one agent the block does not hold
+            // Height: the block costs recent + 2, and ROSTER_MIN_ROWS must be left over.
+            (2, 8, 5, 11, false, false),
+            (2, 8, 5, 12, false, true),
+            // A bigger block needs a taller sidebar for the same roster allowance. `recent` never
+            // exceeds RECENT_MAX, so a full block is the tallest this gets.
+            (2, 30, RECENT_MAX, 16, false, false),
+            (2, 30, RECENT_MAX, 17, false, true),
+            (2, 8, 5, 20, true, false), // the rail
         ];
-        for (repos, agents, height, minimized, want) in cases {
+        for (repos, agents, recent, height, minimized, want) in cases {
             assert_eq!(
-                show_recent(repos, agents, height, minimized),
+                show_recent(repos, agents, recent, height, minimized),
                 want,
-                "show_recent({repos}, {agents}, {height}, {minimized})"
+                "show_recent({repos}, {agents}, {recent}, {height}, {minimized})"
             );
         }
     }
@@ -4948,9 +5063,11 @@ mod tests {
     fn the_recent_block_leads_the_sidebar() {
         let (app, _ids) = app_with_two_repos(4, 4);
         let rows = app.sidebar_rows();
+        let n = recent_ids(&app.agents, Utc::now()).len();
+        assert_eq!(n, RECENT_MIN, "four inside the window, floored up to five");
         let kinds: Vec<&str> = rows
             .iter()
-            .take(5)
+            .take(n + 2)
             .map(|r| match r {
                 Row::RecentHeader => "header",
                 Row::Recent(_) => "recent",
@@ -4959,12 +5076,14 @@ mod tests {
                 _ => "other",
             })
             .collect();
-        assert_eq!(
-            kinds,
-            vec!["header", "recent", "recent", "recent", "divider"],
-            "rows were {rows:?}"
+        let mut want = vec!["header"];
+        want.extend(std::iter::repeat_n("recent", n));
+        want.push("divider");
+        assert_eq!(kinds, want, "rows were {rows:?}");
+        assert!(
+            matches!(rows[n + 2], Row::Repo(_)),
+            "then the first repo group"
         );
-        assert!(matches!(rows[5], Row::Repo(_)), "then the first repo group");
         assert!(
             rows.iter().any(|r| matches!(r, Row::Agent(_))),
             "the grouped roster is still there in full"
@@ -4997,10 +5116,10 @@ mod tests {
     #[test]
     fn digits_number_the_recent_block_first_and_never_twice() {
         let (app, _ids) = app_with_two_repos(4, 4);
-        let recent = recent_ids(&app.agents, RECENT_ROWS);
+        let recent = recent_ids(&app.agents, Utc::now());
         let ordered = app.ordered_agent_ids();
         assert_eq!(
-            ordered[..RECENT_ROWS],
+            ordered[..recent.len()],
             recent[..],
             "the first digits are the recent block"
         );
