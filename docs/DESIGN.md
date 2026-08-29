@@ -341,6 +341,13 @@ the proven mosh/agentapi-style split:
 This keeps the client a near-dumb renderer, avoids a bespoke cell-diff protocol, and makes
 multi-client attach fall out naturally.
 
+One thing the client cannot leave to the outer terminal: **hyperlinks**. A terminal detects URLs on
+its own grid, where a URL that wrapped inside a pane is two fragments with a pane border between
+them — so clicking one opened a truncated address. `mark_links` therefore wraps each run of a URL's
+cells in OSC 8 after the content is drawn (`ForcedWidth`, so ratatui's diffing still measures one
+cell), every run carrying the full URI and a shared `id=` so hover treats the rows as one link. The
+wrap flags come from `row_wrapped`, the same fact `token_selection` uses to copy a wrapped URL whole.
+
 **The daemon-side parser also has to answer terminal queries** (`Queries` in `pty.rs`). A pane's
 terminal *is* that parser, so a program asking it a question has nobody else to ask: it blocks
 reading a reply that never comes, swallowing the user's keystrokes while it waits — how

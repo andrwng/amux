@@ -21,7 +21,9 @@ use crossterm::event::{
 };
 use futures::stream::SplitSink;
 use futures::{SinkExt, StreamExt};
-use ratatui::buffer::Buffer;
+use std::num::NonZeroU16;
+
+use ratatui::buffer::{Buffer, CellDiffOption};
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
@@ -2517,6 +2519,179 @@ fn clamp_to(inner: Rect, col: u16, row: u16) -> (u16, u16) {
     (x, y)
 }
 
+/// The cells a symbol occupies on screen, for `ForcedWidth` — a wide glyph is two, anything else
+/// one. Needed because the symbol we store also holds escape sequences, whose printable width is
+/// zero and which ratatui would otherwise measure as text.
+fn cell_width(symbol: &str) -> NonZeroU16 {
+    let wide = symbol.chars().next().is_some_and(|c| {
+        // The CJK/emoji ranges vt100 itself treats as double-width.
+        matches!(c as u32,
+            0x1100..=0x115F | 0x2E80..=0xA4CF | 0xAC00..=0xD7A3 | 0xF900..=0xFAFF
+            | 0xFE30..=0xFE6F | 0xFF00..=0xFF60 | 0xFFE0..=0xFFE6 | 0x1F300..=0x1F64F
+            | 0x1F900..=0x1F9FF | 0x20000..=0x3FFFD)
+    });
+    NonZeroU16::new(if wide { 2 } else { 1 }).expect("nonzero")
+}
+
+/// The URL schemes amux marks as hyperlinks. Deliberately short: a false positive turns ordinary
+/// text into something clickable, which is worse than leaving a rare scheme unmarked.
+const LINK_SCHEMES: [&str; 2] = ["https://", "http://"];
+
+/// Characters trimmed from the end of a detected URL. All of them are legal inside a URI, but at the
+/// *end* of one on a terminal they are almost always the sentence's punctuation rather than the
+/// address's — `see https://example.com/x.` should not copy the period.
+const URL_TRAILING_TRIM: &str = ".,;:!?'\")]}>";
+
+/// The byte ranges of the URLs in one logical line of text. A URL starts at a scheme and runs to
+/// whitespace, less any trailing punctuation (see [`URL_TRAILING_TRIM`]).
+///
+/// Works on a *logical* line — one that has had the terminal's wrapping undone — because that is the
+/// only place a wrapped URL is contiguous.
+fn urls_in_line(line: &str) -> Vec<std::ops::Range<usize>> {
+    let mut out: Vec<std::ops::Range<usize>> = Vec::new();
+    let mut at = 0;
+    while at < line.len() {
+        // The earliest scheme at or after `at`.
+        let Some(start) = LINK_SCHEMES
+            .iter()
+            .filter_map(|s| line[at..].find(s).map(|i| at + i))
+            .min()
+        else {
+            break;
+        };
+        let after_scheme = start
+            + LINK_SCHEMES
+                .iter()
+                .find(|s| line[start..].starts_with(**s))
+                .map_or(0, |s| s.len());
+        let mut end = line[after_scheme..]
+            .find(char::is_whitespace)
+            .map_or(line.len(), |i| after_scheme + i);
+        while end > after_scheme
+            && line[..end]
+                .chars()
+                .next_back()
+                .is_some_and(|c| URL_TRAILING_TRIM.contains(c))
+        {
+            end -= line[..end].chars().next_back().map_or(0, char::len_utf8);
+        }
+        // A bare scheme with no host is not a link.
+        if end > after_scheme {
+            out.push(start..end);
+        }
+        at = end.max(after_scheme);
+    }
+    out
+}
+
+/// One hyperlink on a pane's screen: the URL, and the cell runs it occupies as
+/// `(row, first_col, last_col)` — one run per screen row, because a wrapped URL is several rows.
+#[derive(Debug, PartialEq, Eq)]
+struct PaneLink {
+    url: String,
+    runs: Vec<(u16, u16, u16)>,
+}
+
+/// Every hyperlink visible on `screen`, with its cell runs.
+///
+/// Rows are first joined into logical lines using `row_wrapped` — undoing the terminal's wrapping is
+/// what makes a long URL findable at all — then each match is mapped back to the cells it came from.
+/// The mapping is by cell count rather than by byte offset so a wide glyph earlier in the line
+/// cannot shift a run.
+fn pane_links(screen: &vt100::Screen, width: u16, height: u16) -> Vec<PaneLink> {
+    let mut links = Vec::new();
+    let mut y = 0;
+    while y < height {
+        // Gather one logical line: this row plus every row it wrapped onto.
+        let mut cells: Vec<(u16, u16, String)> = Vec::new();
+        let mut last = y;
+        loop {
+            for x in 0..width {
+                let contents = screen
+                    .cell(last, x)
+                    .map(|c| c.contents().to_string())
+                    .unwrap_or_default();
+                cells.push((last, x, contents));
+            }
+            if screen.row_wrapped(last) && last + 1 < height {
+                last += 1;
+            } else {
+                break;
+            }
+        }
+        // The logical line, plus the cell each character starts at.
+        let mut text = String::new();
+        let mut starts: Vec<usize> = Vec::new();
+        for (i, (_, _, contents)) in cells.iter().enumerate() {
+            starts.push(text.len());
+            // An empty cell is a blank on screen; it must occupy a byte so offsets stay aligned.
+            text.push_str(if contents.is_empty() { " " } else { contents });
+            let _ = i;
+        }
+        starts.push(text.len());
+        for range in urls_in_line(&text) {
+            // Cells whose character lies inside the match.
+            let hit: Vec<usize> = (0..cells.len())
+                .filter(|&i| starts[i] >= range.start && starts[i] < range.end)
+                .collect();
+            let mut runs: Vec<(u16, u16, u16)> = Vec::new();
+            for i in hit {
+                let (row, col, _) = cells[i];
+                match runs.last_mut() {
+                    Some((r, _, x1)) if *r == row && *x1 + 1 == col => *x1 = col,
+                    _ => runs.push((row, col, col)),
+                }
+            }
+            if !runs.is_empty() {
+                links.push(PaneLink {
+                    url: text[range].to_string(),
+                    runs,
+                });
+            }
+        }
+        y = last + 1;
+    }
+    links
+}
+
+/// Tell the outer terminal about the hyperlinks on a pane, by wrapping each run's cells in OSC 8.
+///
+/// Without this the terminal has to guess from its own grid, where a wrapped URL is two fragments
+/// with a pane border between them — so clicking one opens a truncated address, and hover highlights
+/// only the fragment. Each run carries the **whole** URI, so a click on any row opens the right
+/// address, and the shared `id=` lets a terminal highlight every row as one link.
+///
+/// The sequences ride along in the first and last cell of each run, with `ForcedWidth` so ratatui's
+/// diffing and width arithmetic still see one cell's worth of text.
+fn mark_links(buf: &mut Buffer, screen: &vt100::Screen, inner: Rect) {
+    for (i, link) in pane_links(screen, inner.width, inner.height)
+        .into_iter()
+        .enumerate()
+    {
+        for (row, x0, x1) in link.runs {
+            let (sx, sy) = (inner.x + x0, inner.y + row);
+            let (ex, ey) = (inner.x + x1, inner.y + row);
+            if !inner.contains((sx, sy).into()) || !inner.contains((ex, ey).into()) {
+                continue;
+            }
+            // `id` ties the rows of one wrapped link together; the index keeps two links on the
+            // same screen distinct.
+            if let Some(cell) = buf.cell_mut((sx, sy)) {
+                let sym = format!("\x1b]8;id={i};{}\x1b\\{}", link.url, cell.symbol());
+                let w = cell_width(cell.symbol());
+                cell.set_symbol(&sym);
+                cell.set_diff_option(CellDiffOption::ForcedWidth(w));
+            }
+            if let Some(cell) = buf.cell_mut((ex, ey)) {
+                let sym = format!("{}\x1b]8;;\x1b\\", cell.symbol());
+                let w = cell_width(cell.symbol());
+                cell.set_symbol(&sym);
+                cell.set_diff_option(CellDiffOption::ForcedWidth(w));
+            }
+        }
+    }
+}
+
 /// Whether a cell's contents belong to a token: alphanumerics plus the punctuation that keeps
 /// paths, URLs, flags and dotted identifiers whole. Empty cells (blanks, the trailing half of a
 /// wide glyph) are boundaries.
@@ -2757,7 +2932,10 @@ fn render_minis(frame: &mut Frame, area: Rect, app: &App) {
             continue;
         }
         match app.mini_terminal(i).and_then(|t| app.screen_for(t)) {
-            Some(screen) => frame.render_widget(PseudoTerminal::new(screen), inner),
+            Some(screen) => {
+                frame.render_widget(PseudoTerminal::new(screen), inner);
+                mark_links(frame.buffer_mut(), screen, inner);
+            }
             None => frame.render_widget(
                 Paragraph::new("  \u{2026}").style(Style::default().fg(Color::DarkGray)),
                 inner,
@@ -3129,7 +3307,11 @@ fn render_panes(frame: &mut Frame, area: Rect, app: &App) {
 
         // A scrolled-back pane renders the window the daemon served; everything else renders live.
         match place.payload.and_then(|t| app.screen_for(t)) {
-            Some(screen) => frame.render_widget(PseudoTerminal::new(screen), inner),
+            Some(screen) => {
+                frame.render_widget(PseudoTerminal::new(screen), inner);
+                // After the content, so the OSC 8 markers wrap the cells as drawn.
+                mark_links(frame.buffer_mut(), screen, inner);
+            }
             None => frame.render_widget(
                 Paragraph::new("  \u{2026}").style(Style::default().fg(Color::DarkGray)),
                 inner,
@@ -5161,6 +5343,190 @@ mod tests {
             active: true,
         });
         assert_eq!(app.selection_text().as_deref(), Some("alpha\nbeta"));
+    }
+
+    /// Finding URLs in a logical line: anchored on a scheme, ended by whitespace, with trailing
+    /// punctuation left outside — a URL at the end of a sentence must not swallow the period.
+    /// The printable text of a cell symbol, with any OSC 8 sequence removed — what the outer
+    /// terminal actually shows.
+    fn strip_osc8(symbol: &str) -> String {
+        let mut out = String::new();
+        let mut rest = symbol;
+        while let Some(i) = rest.find("\x1b]8;") {
+            out.push_str(&rest[..i]);
+            let after = &rest[i..];
+            match after.find("\x1b\\") {
+                Some(j) => rest = &after[j + 2..],
+                None => return out,
+            }
+        }
+        out.push_str(rest);
+        out
+    }
+
+    #[test]
+    fn urls_in_line_finds_schemes_and_trims_trailing_punctuation() {
+        // (line, expected matches)
+        let cases: &[(&str, &[&str])] = &[
+            ("see https://example.com/x ok", &["https://example.com/x"]),
+            (
+                "http://a.b and https://c.d/e",
+                &["http://a.b", "https://c.d/e"],
+            ),
+            // Trailing sentence punctuation is not part of the URL…
+            ("go to https://example.com/x.", &["https://example.com/x"]),
+            ("(see https://example.com/x)", &["https://example.com/x"]),
+            ("\"https://example.com/x\",", &["https://example.com/x"]),
+            // …but a path may legitimately end in one of those characters mid-URL.
+            ("https://e.com/a)b end", &["https://e.com/a)b"]),
+            // A query keeps its parameters.
+            ("https://e.com/x?a=1&b=2#f", &["https://e.com/x?a=1&b=2#f"]),
+            // Not a URL.
+            ("no links here", &[]),
+            ("ftp://unsupported.example", &[]),
+            ("say https:// alone", &[]),
+            ("", &[]),
+        ];
+        for (line, want) in cases {
+            let got: Vec<&str> = urls_in_line(line).into_iter().map(|r| &line[r]).collect();
+            assert_eq!(got, *want, "urls_in_line({line:?})");
+        }
+    }
+
+    /// A URL that wrapped maps back to one run of cells per screen row it covers — the shape OSC 8
+    /// needs, since each run has to carry the whole URI.
+    #[test]
+    fn a_wrapped_url_maps_to_one_run_per_row() {
+        let url = "https://example.com/a/very/long/path/x?q=1";
+        let (app, t, inner) = app_with_wrapped_text(&format!("see {url} ok"), 20, 6);
+        let screen = app.parsers[&t].screen();
+        let links = pane_links(screen, inner.width, inner.height);
+
+        assert_eq!(links.len(), 1, "one link, got {links:?}");
+        let link = &links[0];
+        assert_eq!(link.url, url);
+        assert_eq!(
+            link.runs,
+            // row 0 from col 4 to the edge, then the two continuation rows.
+            vec![(0u16, 4u16, 19u16), (1, 0, 19), (2, 0, 5)],
+            "runs were {:?}",
+            link.runs
+        );
+        // The runs must cover exactly the URL's characters and nothing else.
+        let covered: String = link
+            .runs
+            .iter()
+            .flat_map(|&(y, x0, x1)| (x0..=x1).map(move |x| (y, x)))
+            .map(|(y, x)| {
+                screen
+                    .cell(y, x)
+                    .map(|c| c.contents().to_string())
+                    .unwrap_or_default()
+            })
+            .collect();
+        assert_eq!(covered, url, "the runs cover exactly the URL");
+    }
+
+    /// The rendered buffer carries OSC 8 sequences so the outer terminal knows the link exists
+    /// rather than guessing from its own grid — where a wrapped URL is two fragments with a pane
+    /// border between them, which is why clicking one opened a truncated address.
+    #[test]
+    fn a_wrapped_url_renders_as_one_osc8_hyperlink() {
+        use ratatui::{backend::TestBackend, Terminal};
+        let url = "https://example.com/a/very/long/path/x?q=1";
+        let (app, t, inner) = app_with_wrapped_text(&format!("see {url} ok"), 20, 6);
+        let mut term = Terminal::new(TestBackend::new(20, 6)).unwrap();
+        term.draw(|f| {
+            let screen = app.screen_for(t).unwrap();
+            f.render_widget(PseudoTerminal::new(screen), inner);
+            mark_links(f.buffer_mut(), screen, inner);
+        })
+        .unwrap();
+
+        let buf = term.backend().buffer();
+        let opens: Vec<String> = buf
+            .content()
+            .iter()
+            .map(|c| c.symbol().to_string())
+            .filter(|sym| sym.contains("\x1b]8;"))
+            .collect();
+        assert_eq!(
+            opens.len(),
+            6,
+            "three rows, each opening and closing a run: {opens:?}"
+        );
+        // Every run carries the *whole* URL, so clicking any row opens the same address.
+        let carrying = opens.iter().filter(|s| s.contains(url)).count();
+        assert_eq!(
+            carrying, 3,
+            "each row's opener names the full URL: {opens:?}"
+        );
+        // A shared id ties the runs together, so hover highlights all three rows as one link.
+        assert!(
+            opens.iter().filter(|s| s.contains("id=")).count() >= 3,
+            "runs share an id: {opens:?}"
+        );
+        // The visible text is unchanged: stripping the sequences back out returns the original row,
+        // so the link markers ride along with the characters rather than replacing any.
+        let row0: String = (0..20).map(|x| strip_osc8(buf[(x, 0)].symbol())).collect();
+        assert_eq!(
+            row0, "see https://example.",
+            "the row still reads as its own text"
+        );
+    }
+
+    /// Two links on one screen get distinct ids, so hovering one does not highlight the other.
+    #[test]
+    fn separate_links_get_separate_ids() {
+        let (app, t, inner) =
+            app_with_wrapped_text("a https://one.example/x b https://two.example/y", 60, 4);
+        let links = pane_links(app.parsers[&t].screen(), inner.width, inner.height);
+        assert_eq!(links.len(), 2, "got {links:?}");
+        assert_eq!(links[0].url, "https://one.example/x");
+        assert_eq!(links[1].url, "https://two.example/y");
+
+        use ratatui::{backend::TestBackend, Terminal};
+        let mut term = Terminal::new(TestBackend::new(60, 4)).unwrap();
+        term.draw(|f| {
+            let screen = app.screen_for(t).unwrap();
+            f.render_widget(PseudoTerminal::new(screen), inner);
+            mark_links(f.buffer_mut(), screen, inner);
+        })
+        .unwrap();
+        let buf = term.backend().buffer();
+        let ids: Vec<String> = buf
+            .content()
+            .iter()
+            .filter_map(|c| {
+                let sym = c.symbol();
+                sym.find("id=")
+                    .map(|i| sym[i..].split(';').next().unwrap_or_default().to_string())
+            })
+            .collect();
+        assert_eq!(ids, vec!["id=0", "id=1"], "one id per link: {ids:?}");
+    }
+
+    /// A pane with no links is left exactly as the content widget drew it — `mark_links` is only
+    /// allowed to add sequences where a URL actually is.
+    #[test]
+    fn a_pane_without_links_is_untouched() {
+        use ratatui::{backend::TestBackend, Terminal};
+        let (app, t, inner) =
+            app_with_wrapped_text("just some ordinary output\r\nno urls\r\n", 20, 5);
+
+        let render = |mark: bool| {
+            let mut term = Terminal::new(TestBackend::new(20, 5)).unwrap();
+            term.draw(|f| {
+                let screen = app.screen_for(t).unwrap();
+                f.render_widget(PseudoTerminal::new(screen), inner);
+                if mark {
+                    mark_links(f.buffer_mut(), screen, inner);
+                }
+            })
+            .unwrap();
+            term.backend().buffer().clone()
+        };
+        assert_eq!(render(false), render(true));
     }
 
     fn app_with_two_repos(a: usize, b: usize) -> (App, Vec<AgentId>) {

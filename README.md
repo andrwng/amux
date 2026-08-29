@@ -106,6 +106,10 @@ Two deliberate exceptions:
 
 ### Shortcuts
 
+URLs in pane output are marked as real hyperlinks (OSC 8), so `Cmd`/`Ctrl`+click opens the whole
+address even when it wrapped across several rows — your terminal no longer has to guess where the
+link ends. Double-clicking a wrapped URL likewise copies all of it.
+
 Everywhere: `Ctrl+Q` quit · `Ctrl+h/j/k/l` move focus · `Ctrl+B` command prefix.
 
 **Sidebar**
