@@ -1823,11 +1823,18 @@ impl App {
                     line.push_str(contents);
                 }
             }
-            while line.ends_with(' ') {
-                line.pop();
+            // A row the terminal wrapped continues on the next one, so it keeps its trailing cells
+            // and gets no separator: re-inserting a break the program never printed would corrupt a
+            // URL (or any long token) on paste. A row that ends because the program printed a
+            // newline is trimmed and separated as before.
+            let wrapped = screen.row_wrapped(y - sel.inner.y) && c1 == right;
+            if !wrapped {
+                while line.ends_with(' ') {
+                    line.pop();
+                }
             }
             out.push_str(&line);
-            if y != end.1 {
+            if y != end.1 && !wrapped {
                 out.push('\n');
             }
         }
@@ -1835,8 +1842,13 @@ impl App {
     }
 
     /// The token (word plus path/URL punctuation) under screen point `(col, row)` in pane `inner`,
-    /// as a one-row [`Selection`] ready to highlight and copy. `None` if the cell is blank or the
-    /// point isn't over the pane's parser — a double-click on whitespace selects nothing.
+    /// as a [`Selection`] ready to highlight and copy. `None` if the cell is blank or the point
+    /// isn't over the pane's parser — a double-click on whitespace selects nothing.
+    ///
+    /// Follows the terminal's wrapping: a token longer than the pane is wide occupies several rows,
+    /// and it is one token, so the span grows across the seams. Scanning a single row instead copied
+    /// whatever fragment happened to fit — a truncated URL that looks like a working copy until you
+    /// paste it.
     fn token_selection(
         &self,
         terminal: TerminalId,
@@ -1847,20 +1859,51 @@ impl App {
         let screen = self.parsers.get(&terminal)?.screen();
         let cy = row.checked_sub(inner.y)?;
         let cx = col.checked_sub(inner.x)?;
-        let cells: Vec<String> = (0..inner.width)
-            .map(|x| {
-                screen
-                    .cell(cy, x)
-                    .map(|c| c.contents().to_string())
-                    .unwrap_or_default()
-            })
-            .collect();
-        let (x0, x1) = token_span(&cells, cx as usize)?;
+        let cells = |y: u16| -> Vec<String> {
+            (0..inner.width)
+                .map(|x| {
+                    screen
+                        .cell(y, x)
+                        .map(|c| c.contents().to_string())
+                        .unwrap_or_default()
+                })
+                .collect()
+        };
+        let last = inner.width.saturating_sub(1) as usize;
+        let (x0, x1) = token_span(&cells(cy), cx as usize)?;
+
+        // Backwards over seams: this row continues the one above only if that row was wrapped, and
+        // the token has to actually reach the seam on both sides of it.
+        let mut y0 = cy;
+        let mut x0 = x0;
+        while x0 == 0 && y0 > 0 && screen.row_wrapped(y0 - 1) {
+            let above = cells(y0 - 1);
+            match token_span(&above, last) {
+                Some((ax0, _)) => {
+                    y0 -= 1;
+                    x0 = ax0;
+                }
+                None => break,
+            }
+        }
+        // Forwards over seams, symmetrically.
+        let mut y1 = cy;
+        let mut x1 = x1;
+        while x1 == last && screen.row_wrapped(y1) && y1 + 1 < inner.height {
+            let below = cells(y1 + 1);
+            match token_span(&below, 0) {
+                Some((_, bx1)) => {
+                    y1 += 1;
+                    x1 = bx1;
+                }
+                None => break,
+            }
+        }
         Some(Selection {
             terminal,
             inner,
-            anchor: (inner.x + x0 as u16, row),
-            head: (inner.x + x1 as u16, row),
+            anchor: (inner.x + x0 as u16, inner.y + y0),
+            head: (inner.x + x1 as u16, inner.y + y1),
             active: true,
         })
     }
@@ -2477,11 +2520,15 @@ fn clamp_to(inner: Rect, col: u16, row: u16) -> (u16, u16) {
 /// Whether a cell's contents belong to a token: alphanumerics plus the punctuation that keeps
 /// paths, URLs, flags and dotted identifiers whole. Empty cells (blanks, the trailing half of a
 /// wide glyph) are boundaries.
+///
+/// The query-string characters (`?=&%+#`) are in the class because a URL's query is part of the URL
+/// — without them a double-click on `…/x?q=1` copied `…/x` and silently dropped the parameters.
+/// `,` and `;` stay out: they end a token far more often in prose than they appear in a URL.
 fn is_token_char(contents: &str) -> bool {
     !contents.is_empty()
         && contents
             .chars()
-            .all(|c| c.is_alphanumeric() || "._-/~:@".contains(c))
+            .all(|c| c.is_alphanumeric() || "._-/~:@?=&%+#".contains(c))
 }
 
 /// The `[x0, x1]` inclusive cell span of the token containing cell `x` in `row` (a pane row's
@@ -3696,6 +3743,19 @@ mod tests {
         assert_eq!(token_span(&row, 21), Some((19, 23)));
         // A lone trailing letter is a one-cell token.
         assert_eq!(token_span(&row, 25), Some((25, 25)));
+
+        // A URL's query is part of the URL: `?`, `=` and friends keep it whole.
+        let q: Vec<String> = "https://h/x?a=1&b=2%20c#f end"
+            .chars()
+            .map(|c| c.to_string())
+            .collect();
+        assert_eq!(token_span(&q, 0), Some((0, 24)));
+        assert_eq!(token_span(&q, 24), Some((0, 24)));
+        assert_eq!(token_span(&q, 25), None, "the space still ends it");
+        // …but a comma or semicolon ends a token, as in prose.
+        let prose: Vec<String> = "a,b;c".chars().map(|c| c.to_string()).collect();
+        assert_eq!(token_span(&prose, 0), Some((0, 0)));
+        assert_eq!(token_span(&prose, 2), Some((2, 2)));
 
         // Punctuation outside the class ends the token: `foo.baz()` stops before `(`.
         let paren: Vec<String> = "foo.baz()".chars().map(|c| c.to_string()).collect();
@@ -5017,6 +5077,90 @@ mod tests {
             app.sidebar_sel, chosen,
             "a refresh must not steal the cursor"
         );
+    }
+
+    /// A pane whose text is too long for its width, so the terminal wrapped it. `cols` is the pane's
+    /// inner width; the returned app has one pane covering `inner`.
+    fn app_with_wrapped_text(text: &str, cols: u16, rows: u16) -> (App, TerminalId, Rect) {
+        let mut app = App::new(100, 40);
+        let t = TerminalId::new();
+        app.tree.open(t);
+        app.terminals.insert(t, AgentId::new());
+        let mut parser = vt100::Parser::new(rows, cols, 100);
+        parser.process(text.as_bytes());
+        app.parsers.insert(t, parser);
+        (app, t, Rect::new(0, 0, cols, rows))
+    }
+
+    /// A double-clicked token follows the terminal's wrap: a URL too long for the pane occupies
+    /// three rows, and clicking any of them yields the whole URL. Before this, `token_span` stopped
+    /// at the pane's right edge and copied `https://example.` — a truncation that looks like a
+    /// working copy until you paste it.
+    #[tokio::test]
+    async fn a_double_clicked_url_survives_wrapping() {
+        let url = "https://example.com/a/very/long/path/x?q=1";
+        let (mut app, t, inner) = app_with_wrapped_text(&format!("see {url} ok"), 20, 6);
+        // Confirm the premise: the URL really is spread over three wrapped rows.
+        let wrapped: Vec<bool> = (0..3)
+            .map(|y| app.parsers[&t].screen().row_wrapped(y))
+            .collect();
+        assert_eq!(wrapped, vec![true, true, false], "the text must wrap");
+
+        // Clicking the first, middle and last row of the URL all copy the same thing.
+        for (col, row) in [(8u16, 0u16), (4, 1), (2, 2)] {
+            let sel = app
+                .token_selection(t, inner, col, row)
+                .unwrap_or_else(|| panic!("a token at ({col},{row})"));
+            app.selection = Some(Selection {
+                active: true,
+                ..sel
+            });
+            assert_eq!(
+                app.selection_text().as_deref(),
+                Some(url),
+                "double-click at ({col},{row})"
+            );
+        }
+
+        // The trailing word is its own token — the wrap join must not swallow what follows.
+        let sel = app.token_selection(t, inner, 8, 2).expect("the `ok` token");
+        app.selection = Some(Selection {
+            active: true,
+            ..sel
+        });
+        assert_eq!(app.selection_text().as_deref(), Some("ok"));
+    }
+
+    /// A drag across wrapped rows copies one unbroken line: the terminal broke it to fit the pane,
+    /// and re-inserting that break would corrupt a URL (or any long token) on paste. A break the
+    /// program itself printed is still a newline.
+    #[tokio::test]
+    async fn dragging_across_a_wrap_copies_one_line() {
+        let url = "https://example.com/a/very/long/path/x?q=1";
+        let (mut app, t, inner) = app_with_wrapped_text(&format!("see {url} ok"), 20, 6);
+        app.selection = Some(Selection {
+            terminal: t,
+            inner,
+            anchor: (0, 0),
+            head: (8, 2),
+            active: true,
+        });
+        assert_eq!(
+            app.selection_text().as_deref(),
+            Some(&format!("see {url} ok")[..]),
+            "wrapped rows join with nothing between them"
+        );
+
+        // Two genuinely separate lines still get their newline.
+        let (mut app, t, inner) = app_with_wrapped_text("alpha\r\nbeta\r\n", 20, 6);
+        app.selection = Some(Selection {
+            terminal: t,
+            inner,
+            anchor: (0, 0),
+            head: (3, 1),
+            active: true,
+        });
+        assert_eq!(app.selection_text().as_deref(), Some("alpha\nbeta"));
     }
 
     fn app_with_two_repos(a: usize, b: usize) -> (App, Vec<AgentId>) {
