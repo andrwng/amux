@@ -341,27 +341,6 @@ the proven mosh/agentapi-style split:
 This keeps the client a near-dumb renderer, avoids a bespoke cell-diff protocol, and makes
 multi-client attach fall out naturally.
 
-One thing the client cannot leave to the outer terminal: **hyperlinks**. A terminal detects URLs on
-its own grid, where a URL that wrapped inside a pane is fragments with a pane border between them —
-so clicking one opens a truncated address. `mark_links` therefore re-emits links as OSC 8 after the
-content is drawn (`ForcedWidth`, so ratatui's diffing still measures one cell), from two sources in
-priority order:
-
-1. **What the pane app declared.** Well-behaved CLIs already mark their links — Claude Code emits its
-   login URL as OSC 8, once per visual row, each opener carrying the whole URI. A vt100 grid has no
-   per-cell hyperlink concept, so this was being *destroyed*: the `Links` callbacks on the client's
-   parser record each span from the cursor (opener notes where it is, closer notes where it ended)
-   and `mark_links` replays them. Nothing hooks a cell write, so a span is re-validated every frame
-   against the cells it claims — the characters under it must still appear in the URI — which drops
-   spans whose rows the app has since redrawn. Bounded at `MAX_LINK_SPANS`.
-2. **What amux detects itself**, for output that carries no markup (a URL printed by a shell command).
-   Rows are joined into logical lines with `row_wrapped`, the same fact `token_selection` uses to copy
-   a wrapped URL whole. This only sees *margin* wrapping: a TUI wraps text itself and writes each
-   visual line, so no flag is set and only source 1 can recover those links.
-
-A scrolled-back pane renders bytes the daemon rebuilt from its own grid, which likewise cannot carry
-OSC 8 — so app-declared links are live-view only.
-
 **The daemon-side parser also has to answer terminal queries** (`Queries` in `pty.rs`). A pane's
 terminal *is* that parser, so a program asking it a question has nobody else to ask: it blocks
 reading a reply that never comes, swallowing the user's keystrokes while it waits — how
