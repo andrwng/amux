@@ -21,7 +21,9 @@ use crossterm::event::{
 };
 use futures::stream::SplitSink;
 use futures::{SinkExt, StreamExt};
-use ratatui::buffer::Buffer;
+use std::num::NonZeroU16;
+
+use ratatui::buffer::{Buffer, CellDiffOption};
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
@@ -283,7 +285,7 @@ struct Scroll {
     terminal: TerminalId,
     /// The served window, parsed for rendering. Deliberately has no scrollback of its own — it is
     /// exactly what the daemon sent, nothing more.
-    parser: vt100::Parser,
+    parser: vt100::Parser<Links>,
     /// Lines back from live, and how far back history goes; both straight from the daemon, for the
     /// `↑offset/available` indicator.
     offset: usize,
@@ -485,7 +487,7 @@ struct App {
     /// has been opened. Toggles back and forth as you swap, and is cleared if that agent is removed.
     prev_active_agent: Option<AgentId>,
     terminals: HashMap<TerminalId, AgentId>,
-    parsers: HashMap<TerminalId, vt100::Parser>,
+    parsers: HashMap<TerminalId, vt100::Parser<Links>>,
     attached: HashMap<TerminalId, Size>,
     /// Terminals whose foreground app wants `Ctrl+hjkl` (vim-like), so we pass those keys through
     /// instead of navigating. Announced by the daemon via `TerminalApp`.
@@ -813,7 +815,7 @@ impl App {
             }
             DaemonMsg::OutputSnapshot { terminal, bytes } => {
                 if let Some(&size) = self.attached.get(&terminal) {
-                    let mut parser = vt100::Parser::new(size.rows, size.cols, CLIENT_SCROLLBACK);
+                    let mut parser = new_client_parser(size.rows, size.cols, CLIENT_SCROLLBACK);
                     parser.process(&bytes);
                     self.parsers.insert(terminal, parser);
                 }
@@ -1501,7 +1503,7 @@ impl App {
         };
         // A fresh parser per frame: the window is self-contained, and carrying no scrollback of our
         // own is the point — the daemon is the only place history lives.
-        let mut parser = vt100::Parser::new(size.rows, size.cols, 0);
+        let mut parser = new_client_parser(size.rows, size.cols, 0);
         parser.process(bytes);
         self.scroll = Some(Scroll {
             terminal,
@@ -1948,6 +1950,16 @@ impl App {
 
     /// What to draw for `terminal`: the served history window while it is scrolled back, else the
     /// live screen. One place decides, so panes and minis can't disagree.
+    /// The parser backing what `terminal` shows — the scrolled-back window when there is one, else
+    /// the live screen. Rendering needs the parser rather than just its screen, because the pane
+    /// app's own OSC 8 hyperlinks are recorded on it (see [`Links`]).
+    fn parser_for(&self, terminal: TerminalId) -> Option<&vt100::Parser<Links>> {
+        match self.scroll.as_ref().filter(|s| s.terminal == terminal) {
+            Some(scroll) => Some(&scroll.parser),
+            None => self.parsers.get(&terminal),
+        }
+    }
+
     fn screen_for(&self, terminal: TerminalId) -> Option<&vt100::Screen> {
         match self.scroll.as_ref().filter(|s| s.terminal == terminal) {
             Some(scroll) => Some(scroll.parser.screen()),
@@ -2070,7 +2082,7 @@ impl App {
                     None => {
                         self.parsers.insert(
                             terminal,
-                            vt100::Parser::new(size.rows, size.cols, CLIENT_SCROLLBACK),
+                            new_client_parser(size.rows, size.cols, CLIENT_SCROLLBACK),
                         );
                     }
                 }
@@ -2517,6 +2529,348 @@ fn clamp_to(inner: Rect, col: u16, row: u16) -> (u16, u16) {
     (x, y)
 }
 
+/// Link spans a pane app declared with OSC 8, kept per client parser.
+///
+/// A pane's content lives in a vt100 grid, which has no per-cell hyperlink concept — so without this
+/// the app's own hyperlinks are destroyed and the outer terminal is left guessing from its own grid,
+/// where a URL wrapped inside a pane is fragments with a border between them. Claude Code marks its
+/// login URL correctly, once per visual row with the full URI in each opener; amux only has to not
+/// lose it.
+///
+/// The span is recorded from the cursor: the opener notes where it is, the closer notes where it
+/// ended up, and the text printed between them is the link. Nothing hooks a cell write, so a span is
+/// re-validated at render against the cells it claims (see [`LinkSpan::runs_in`]).
+#[derive(Default)]
+struct Links {
+    /// The open OSC 8, if the app is mid-link.
+    pending: Option<(String, (u16, u16))>,
+    spans: Vec<LinkSpan>,
+}
+
+/// How many app-declared spans a pane remembers. Bounded like everything else (`DESIGN.md` §2): a
+/// chatty app must not grow this without limit, and the oldest spans are the ones whose cells have
+/// most likely been redrawn anyway.
+const MAX_LINK_SPANS: usize = 256;
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct LinkSpan {
+    url: String,
+    start: (u16, u16),
+    end: (u16, u16),
+}
+
+impl vt100::Callbacks for Links {
+    fn unhandled_osc(&mut self, screen: &mut vt100::Screen, params: &[&[u8]]) {
+        if params.first() != Some(&b"8".as_slice()) {
+            return;
+        }
+        // `OSC 8 ; params ; URI` — an empty URI closes the current link.
+        let uri = params.get(2).copied().unwrap_or_default();
+        let at = screen.cursor_position();
+        if uri.is_empty() {
+            if let Some((url, start)) = self.pending.take() {
+                if self.spans.len() == MAX_LINK_SPANS {
+                    self.spans.remove(0);
+                }
+                self.spans.push(LinkSpan {
+                    url,
+                    start,
+                    end: at,
+                });
+            }
+        } else if let Ok(url) = std::str::from_utf8(uri) {
+            self.pending = Some((url.to_string(), at));
+        }
+    }
+}
+
+impl LinkSpan {
+    /// The cell runs this span covers, or `None` if the cells no longer hold the link.
+    ///
+    /// Validity is decided by content because there is no hook for a cell write and the app redraws
+    /// its frame constantly: the characters under the span must still appear in the URI. That is
+    /// enough to drop a span whose row was rewritten or scrolled away, and cheap enough to do every
+    /// frame.
+    fn runs_in(
+        &self,
+        screen: &vt100::Screen,
+        width: u16,
+        height: u16,
+    ) -> Option<Vec<(u16, u16, u16)>> {
+        if self.start.0 >= height || self.start > self.end {
+            return None;
+        }
+        let mut runs = Vec::new();
+        let mut text = String::new();
+        for row in self.start.0..=self.end.0.min(height.saturating_sub(1)) {
+            let first = if row == self.start.0 { self.start.1 } else { 0 };
+            // The closer sits just past the last cell of the link, so `end.1` is exclusive.
+            let last = if row == self.end.0 {
+                self.end.1.min(width)
+            } else {
+                width
+            };
+            if last <= first {
+                continue;
+            }
+            for x in first..last {
+                let contents = screen
+                    .cell(row, x)
+                    .map(|c| c.contents().to_string())
+                    .unwrap_or_default();
+                text.push_str(&contents);
+            }
+            runs.push((row, first, last - 1));
+        }
+        if runs.is_empty() || text.is_empty() || !self.url.contains(text.trim_end()) {
+            return None;
+        }
+        Some(runs)
+    }
+}
+
+/// A client-side parser that records the pane app's own OSC 8 hyperlinks.
+fn new_client_parser(rows: u16, cols: u16, scrollback: usize) -> vt100::Parser<Links> {
+    vt100::Parser::new_with_callbacks(rows, cols, scrollback, Links::default())
+}
+
+/// The hyperlinks the pane app declared for itself, as cell runs. Stale spans are dropped.
+fn app_links(parser: &vt100::Parser<Links>, width: u16, height: u16) -> Vec<PaneLink> {
+    let screen = parser.screen();
+    parser
+        .callbacks()
+        .spans
+        .iter()
+        .filter_map(|span| {
+            span.runs_in(screen, width, height).map(|runs| PaneLink {
+                url: span.url.clone(),
+                runs,
+            })
+        })
+        .collect()
+}
+
+/// The URL schemes amux marks as hyperlinks. Deliberately short: a false positive turns ordinary
+/// text into something clickable, which is worse than leaving a rare scheme unmarked.
+const LINK_SCHEMES: [&str; 2] = ["https://", "http://"];
+
+/// Characters trimmed from the end of a detected URL. All of them are legal inside a URI, but at the
+/// *end* of one on a terminal they are almost always the sentence's punctuation rather than the
+/// address's — `see https://example.com/x.` should not copy the period.
+const URL_TRAILING_TRIM: &str = ".,;:!?'\")]}>";
+
+/// The byte ranges of the URLs in one logical line of text. A URL starts at a scheme and runs to
+/// whitespace, less any trailing punctuation (see [`URL_TRAILING_TRIM`]).
+///
+/// Works on a *logical* line — one that has had the terminal's wrapping undone — because that is the
+/// only place a wrapped URL is contiguous.
+fn urls_in_line(line: &str) -> Vec<std::ops::Range<usize>> {
+    let mut out: Vec<std::ops::Range<usize>> = Vec::new();
+    let mut at = 0;
+    while at < line.len() {
+        // The earliest scheme at or after `at`.
+        let Some(start) = LINK_SCHEMES
+            .iter()
+            .filter_map(|s| line[at..].find(s).map(|i| at + i))
+            .min()
+        else {
+            break;
+        };
+        let after_scheme = start
+            + LINK_SCHEMES
+                .iter()
+                .find(|s| line[start..].starts_with(**s))
+                .map_or(0, |s| s.len());
+        let mut end = line[after_scheme..]
+            .find(char::is_whitespace)
+            .map_or(line.len(), |i| after_scheme + i);
+        while end > after_scheme
+            && line[..end]
+                .chars()
+                .next_back()
+                .is_some_and(|c| URL_TRAILING_TRIM.contains(c))
+        {
+            end -= line[..end].chars().next_back().map_or(0, char::len_utf8);
+        }
+        // A bare scheme with no host is not a link.
+        if end > after_scheme {
+            out.push(start..end);
+        }
+        at = end.max(after_scheme);
+    }
+    out
+}
+
+/// One hyperlink on a pane's screen: the URL, and the cell runs it occupies as
+/// `(row, first_col, last_col)` — one run per screen row, because a wrapped URL is several rows.
+#[derive(Debug, PartialEq, Eq)]
+struct PaneLink {
+    url: String,
+    runs: Vec<(u16, u16, u16)>,
+}
+
+/// Every hyperlink visible on `screen`, with its cell runs.
+///
+/// Rows are first joined into logical lines using `row_wrapped` — undoing the terminal's wrapping is
+/// what makes a long URL findable at all — then each match is mapped back to the cells it came from.
+/// The mapping is by cell count rather than by byte offset so a wide glyph earlier in the line
+/// cannot shift a run.
+fn pane_links(screen: &vt100::Screen, width: u16, height: u16) -> Vec<PaneLink> {
+    let mut links = Vec::new();
+    let mut y = 0;
+    while y < height {
+        // Gather one logical line: this row plus every row it wrapped onto.
+        let mut cells: Vec<(u16, u16, String)> = Vec::new();
+        let mut last = y;
+        loop {
+            for x in 0..width {
+                let contents = screen
+                    .cell(last, x)
+                    .map(|c| c.contents().to_string())
+                    .unwrap_or_default();
+                cells.push((last, x, contents));
+            }
+            if screen.row_wrapped(last) && last + 1 < height {
+                last += 1;
+            } else {
+                break;
+            }
+        }
+        // The logical line, plus the cell each character starts at.
+        let mut text = String::new();
+        let mut starts: Vec<usize> = Vec::new();
+        for (i, (_, _, contents)) in cells.iter().enumerate() {
+            starts.push(text.len());
+            // An empty cell is a blank on screen; it must occupy a byte so offsets stay aligned.
+            text.push_str(if contents.is_empty() { " " } else { contents });
+            let _ = i;
+        }
+        starts.push(text.len());
+        for range in urls_in_line(&text) {
+            // Cells whose character lies inside the match.
+            let hit: Vec<usize> = (0..cells.len())
+                .filter(|&i| starts[i] >= range.start && starts[i] < range.end)
+                .collect();
+            let mut runs: Vec<(u16, u16, u16)> = Vec::new();
+            for i in hit {
+                let (row, col, _) = cells[i];
+                match runs.last_mut() {
+                    Some((r, _, x1)) if *r == row && *x1 + 1 == col => *x1 = col,
+                    _ => runs.push((row, col, col)),
+                }
+            }
+            if !runs.is_empty() {
+                links.push(PaneLink {
+                    url: text[range].to_string(),
+                    runs,
+                });
+            }
+        }
+        y = last + 1;
+    }
+    links
+}
+
+/// Give the outer terminal one OSC 8 hyperlink per **run of uniformly styled cells**, by moving the
+/// run's whole text into its first cell and marking the rest [`CellDiffOption::Skip`].
+///
+/// The shape matters more than the sequences. OSC 8 is *stream* state — a link is opened, cells are
+/// written, it is closed — while ratatui ships a diff of individual cells. Putting the opener in one
+/// cell and the closer in another, with plain cells between, was the first attempt and it decays: a
+/// repaint that changes a middle cell sends that cell alone, with no opener before it, so the cell
+/// loses its link and the trailing `ESC]8;;` closes whatever link the terminal did have open. A
+/// TUI repaints constantly, so links broke within a frame or two.
+///
+/// A carrier cell makes the run a single diff unit instead: any change inside it changes that cell,
+/// so the run is re-sent whole, opener included. This is what `Skip` is documented for — "prevent
+/// the buffer from overwriting a cell that is covered by something from an escape sequence, such as
+/// graphics or links" — and it costs one URI per run rather than one per cell (~2.8 KB versus
+/// ~206 KB for a 450-character login URL, since per-cell is quadratic in the URL's length).
+///
+/// Runs are split where the cell **style** changes, because a carrier cell can only carry one style.
+/// That is also what keeps a selection highlight working: `highlight_selection` runs first and
+/// restyles the selected cells, so the selection's edges simply become run boundaries.
+fn mark_links(buf: &mut Buffer, parser: &vt100::Parser<Links>, inner: Rect) {
+    let screen = parser.screen();
+    // The app's own links win: it knows the whole URI even where amux cannot reconstruct it (a TUI
+    // wraps text itself, so `row_wrapped` is false and there is no seam to join). amux's own
+    // detection then covers what the app left unmarked — a URL printed by a plain shell command.
+    let declared = app_links(parser, inner.width, inner.height);
+    let claimed: HashSet<(u16, u16)> = declared
+        .iter()
+        .flat_map(|l| l.runs.iter())
+        .flat_map(|&(y, x0, x1)| (x0..=x1).map(move |x| (y, x)))
+        .collect();
+    let detected = pane_links(screen, inner.width, inner.height)
+        .into_iter()
+        .filter(|l| {
+            !l.runs
+                .iter()
+                .any(|&(y, x0, x1)| (x0..=x1).any(|x| claimed.contains(&(y, x))))
+        });
+
+    // One `id` per *URL*, not per run. A wrapped link is several runs, and a terminal uses `id` to
+    // decide which cells form a single link — numbering runs made each row its own link, so hover
+    // highlighted only the row under the pointer.
+    let mut ids: HashMap<String, usize> = HashMap::new();
+    for link in declared.into_iter().chain(detected) {
+        let next = ids.len();
+        let id = *ids.entry(link.url.clone()).or_insert(next);
+        for (row, x0, x1) in link.runs {
+            for (sx0, sx1) in style_runs(buf, inner, row, x0, x1) {
+                mark_run(buf, inner, row, sx0, sx1, &link.url, id);
+            }
+        }
+    }
+}
+
+/// Split the cells `x0..=x1` of `row` into maximal spans that share a style — the granularity a
+/// carrier cell can represent. Coordinates are pane-relative; the returned pairs are too.
+fn style_runs(buf: &Buffer, inner: Rect, row: u16, x0: u16, x1: u16) -> Vec<(u16, u16)> {
+    let style_at = |x: u16| {
+        buf.cell((inner.x + x, inner.y + row))
+            .map(|c| c.style())
+            .unwrap_or_default()
+    };
+    let mut runs = Vec::new();
+    let mut start = x0;
+    for x in x0..=x1 {
+        if style_at(x) != style_at(start) {
+            runs.push((start, x - 1));
+            start = x;
+        }
+    }
+    runs.push((start, x1));
+    runs
+}
+
+/// Move `x0..=x1` of `row` into a single OSC 8 carrier cell at `x0`, skipping the cells it covers.
+fn mark_run(buf: &mut Buffer, inner: Rect, row: u16, x0: u16, x1: u16, url: &str, id: usize) {
+    let at = |x: u16| (inner.x + x, inner.y + row);
+    if !inner.contains(at(x0).into()) || !inner.contains(at(x1).into()) {
+        return;
+    }
+    // The run's visible text, taken from the cells rather than the URL: a wide glyph leaves its
+    // second cell empty, so concatenating symbols gives the text and the column count gives the
+    // display width.
+    let mut text = String::new();
+    for x in x0..=x1 {
+        if let Some(cell) = buf.cell(at(x)) {
+            text.push_str(cell.symbol());
+        }
+    }
+    let width = NonZeroU16::new(x1 - x0 + 1).expect("a run is at least one column");
+    if let Some(cell) = buf.cell_mut(at(x0)) {
+        cell.set_symbol(&format!("\x1b]8;id={id};{url}\x1b\\{text}\x1b]8;;\x1b\\"))
+            .set_diff_option(CellDiffOption::ForcedWidth(width));
+    }
+    for x in (x0 + 1)..=x1 {
+        if let Some(cell) = buf.cell_mut(at(x)) {
+            cell.set_diff_option(CellDiffOption::Skip);
+        }
+    }
+}
+
 /// Whether a cell's contents belong to a token: alphanumerics plus the punctuation that keeps
 /// paths, URLs, flags and dotted identifiers whole. Empty cells (blanks, the trailing half of a
 /// wide glyph) are boundaries.
@@ -2756,8 +3110,11 @@ fn render_minis(frame: &mut Frame, area: Rect, app: &App) {
             );
             continue;
         }
-        match app.mini_terminal(i).and_then(|t| app.screen_for(t)) {
-            Some(screen) => frame.render_widget(PseudoTerminal::new(screen), inner),
+        match app.mini_terminal(i).and_then(|t| app.parser_for(t)) {
+            Some(parser) => {
+                frame.render_widget(PseudoTerminal::new(parser.screen()), inner);
+                mark_links(frame.buffer_mut(), parser, inner);
+            }
             None => frame.render_widget(
                 Paragraph::new("  \u{2026}").style(Style::default().fg(Color::DarkGray)),
                 inner,
@@ -3141,6 +3498,11 @@ fn render_panes(frame: &mut Frame, area: Rect, app: &App) {
                 highlight_selection(frame.buffer_mut(), sel);
             }
         }
+        // Links last: a carrier cell holds one style, so marking after the highlight lets the
+        // selection's edges fall on run boundaries instead of being swallowed by a `Skip`.
+        if let Some(parser) = place.payload.and_then(|t| app.parser_for(t)) {
+            mark_links(frame.buffer_mut(), parser, inner);
+        }
     }
 }
 
@@ -3479,7 +3841,7 @@ mod tests {
         // A focused pane whose child turned bracketed paste on (DECSET 2004).
         let mut app = App::new(100, 40);
         let t = TerminalId::new();
-        let mut parser = vt100::Parser::new(24, 80, 0);
+        let mut parser = new_client_parser(24, 80, 0);
         parser.process(b"\x1b[?2004h");
         assert!(
             parser.screen().bracketed_paste(),
@@ -3509,7 +3871,7 @@ mod tests {
         app.tree.open(t);
         app.terminals.insert(t, AgentId::new());
         app.parsers
-            .insert(t, vt100::Parser::new(4, 20, CLIENT_SCROLLBACK));
+            .insert(t, new_client_parser(4, 20, CLIENT_SCROLLBACK));
         app.attached.insert(t, Size { cols: 20, rows: 4 });
         app.on_scroll_view(t, offset, available, b"served window");
         (app, t)
@@ -3573,7 +3935,7 @@ mod tests {
         let t = TerminalId::new();
         app.tree.open(t);
         app.terminals.insert(t, AgentId::new());
-        let mut live = vt100::Parser::new(4, 20, CLIENT_SCROLLBACK);
+        let mut live = new_client_parser(4, 20, CLIENT_SCROLLBACK);
         live.process(b"live output");
         app.parsers.insert(t, live);
         app.attached.insert(t, Size { cols: 20, rows: 4 });
@@ -3713,7 +4075,7 @@ mod tests {
         let mut app = App::new(100, 40);
         let t = TerminalId::new();
         app.tree.open(t);
-        let mut parser = vt100::Parser::new(6, 20, 100);
+        let mut parser = new_client_parser(6, 20, 100);
         parser.process(b"alpha\r\nbravo\r\ncharlie\r\n");
         app.parsers.insert(t, parser);
         // Pane inner area starting at (1,1): select rows 0..1, from col 0 across the words.
@@ -3775,7 +4137,7 @@ mod tests {
         let mut app = App::new(100, 40);
         let t = TerminalId::new();
         app.tree.open(t);
-        let mut parser = vt100::Parser::new(6, 40, 100);
+        let mut parser = new_client_parser(6, 40, 100);
         parser.process(b"run /home/awong/foo.rs now\r\n");
         app.parsers.insert(t, parser);
         // Pane content anchored at screen (1,1); the path sits at cells 4..21 → screen cols 5..22.
@@ -3796,7 +4158,7 @@ mod tests {
         let mut app = App::new(100, 40);
         let t = TerminalId::new();
         app.tree.open(t);
-        let mut parser = vt100::Parser::new(6, 40, 100);
+        let mut parser = new_client_parser(6, 40, 100);
         parser.process(b"hello world\r\n");
         app.parsers.insert(t, parser);
         let (mut sink, _server) = test_server();
@@ -3830,7 +4192,7 @@ mod tests {
         let t = TerminalId::new();
         app.tree.open(t);
         app.terminals.insert(t, AgentId::new());
-        let mut parser = vt100::Parser::new(4, 20, 100);
+        let mut parser = new_client_parser(4, 20, 100);
         for i in 0..30 {
             parser.process(format!("line {i}\r\n").as_bytes());
         }
@@ -3898,7 +4260,7 @@ mod tests {
         app.tree.open(t);
         app.terminals.insert(t, AgentId::new());
         app.parsers
-            .insert(t, vt100::Parser::new(4, 20, CLIENT_SCROLLBACK));
+            .insert(t, new_client_parser(4, 20, CLIENT_SCROLLBACK));
         app.attached.insert(t, Size { cols: 20, rows: 4 });
         let (mut sink, mut server) = test_server();
 
@@ -3931,7 +4293,7 @@ mod tests {
         let mut app = App::new(100, 40);
         let t = TerminalId::new();
         app.tree.open(t);
-        let mut parser = vt100::Parser::new(24, 80, 100);
+        let mut parser = new_client_parser(24, 80, 100);
         // Alternate screen + SGR mouse tracking — the exact combination Claude Code sets up.
         parser.process(b"\x1b[?1049h\x1b[?1000h\x1b[?1006h");
         app.parsers.insert(t, parser);
@@ -4027,7 +4389,7 @@ mod tests {
         let mut app = App::new(100, 40);
         let t = TerminalId::new();
         app.tree.open(t);
-        let mut parser = vt100::Parser::new(24, 80, 100);
+        let mut parser = new_client_parser(24, 80, 100);
         parser.process(b"hello world\r\n"); // ensure the clicked cell holds a visible glyph
         app.parsers.insert(t, parser);
 
@@ -4155,7 +4517,7 @@ mod tests {
         let mut app = App::new(100, 40);
         let t = TerminalId::new();
         app.tree.open(t);
-        let mut parser = vt100::Parser::new(24, 80, 100);
+        let mut parser = new_client_parser(24, 80, 100);
         parser.process(b"hello\r\n");
         app.parsers.insert(t, parser);
         assert!(
@@ -4240,7 +4602,7 @@ mod tests {
         let mut app = App::new(100, 40);
         let t = TerminalId::new();
         app.parsers
-            .insert(t, vt100::Parser::new(4, 20, CLIENT_SCROLLBACK));
+            .insert(t, new_client_parser(4, 20, CLIENT_SCROLLBACK));
         app.attached.insert(t, Size { cols: 20, rows: 4 });
         app.on_scroll_view(t, 10, 500, b"an old window");
 
@@ -5086,7 +5448,7 @@ mod tests {
         let t = TerminalId::new();
         app.tree.open(t);
         app.terminals.insert(t, AgentId::new());
-        let mut parser = vt100::Parser::new(rows, cols, 100);
+        let mut parser = new_client_parser(rows, cols, 100);
         parser.process(text.as_bytes());
         app.parsers.insert(t, parser);
         (app, t, Rect::new(0, 0, cols, rows))
@@ -5161,6 +5523,324 @@ mod tests {
             active: true,
         });
         assert_eq!(app.selection_text().as_deref(), Some("alpha\nbeta"));
+    }
+
+    /// The bytes a diff between two buffers puts on the wire, through the real backend.
+    fn wire(prev: &Buffer, next: &Buffer) -> String {
+        use ratatui::backend::{Backend, CrosstermBackend};
+        let mut out: Vec<u8> = Vec::new();
+        {
+            let mut backend = CrosstermBackend::new(&mut out);
+            backend.draw(prev.diff(next).into_iter()).unwrap();
+        }
+        String::from_utf8_lossy(&out).to_string()
+    }
+
+    /// A pane's content plus its link markers, in a buffer, the way rendering does it.
+    fn marked_buffer(parser: &vt100::Parser<Links>, inner: Rect) -> Buffer {
+        use ratatui::widgets::Widget;
+        let mut buf = Buffer::empty(inner);
+        PseudoTerminal::new(parser.screen()).render(inner, &mut buf);
+        mark_links(&mut buf, parser, inner);
+        buf
+    }
+
+    /// Replay a draw's bytes the way a terminal would, returning for each printed cell the URL of
+    /// the hyperlink that was open when it arrived. This is what makes the decay assertable: the
+    /// question is not which sequences appear but what the terminal *believes* about each cell.
+    fn linked_cells(wire: &str) -> HashMap<(u16, u16), Option<String>> {
+        let mut out = HashMap::new();
+        let (mut x, mut y) = (0u16, 0u16);
+        let mut open: Option<String> = None;
+        let bytes: Vec<char> = wire.chars().collect();
+        let mut i = 0;
+        while i < bytes.len() {
+            if bytes[i] == '\x1b' && bytes.get(i + 1) == Some(&'[') {
+                // A CSI sequence; only cursor positioning moves us.
+                let mut j = i + 2;
+                while j < bytes.len() && !bytes[j].is_ascii_alphabetic() {
+                    j += 1;
+                }
+                let params: String = bytes[i + 2..j].iter().collect();
+                if bytes.get(j) == Some(&'H') {
+                    let mut it = params.split(';');
+                    let row: u16 = it.next().unwrap_or("1").parse().unwrap_or(1);
+                    let col: u16 = it.next().unwrap_or("1").parse().unwrap_or(1);
+                    (x, y) = (col.saturating_sub(1), row.saturating_sub(1));
+                }
+                i = j + 1;
+            } else if bytes[i] == '\x1b' && bytes.get(i + 1) == Some(&']') {
+                // An OSC; `8;params;URI` opens a link, an empty URI closes it.
+                let mut j = i + 2;
+                let mut body = String::new();
+                while j < bytes.len() {
+                    if bytes[j] == '\x07' {
+                        j += 1;
+                        break;
+                    }
+                    if bytes[j] == '\x1b' && bytes.get(j + 1) == Some(&'\\') {
+                        j += 2;
+                        break;
+                    }
+                    body.push(bytes[j]);
+                    j += 1;
+                }
+                if let Some(rest) = body.strip_prefix("8;") {
+                    let uri = rest.split_once(';').map(|(_, u)| u).unwrap_or("");
+                    open = (!uri.is_empty()).then(|| uri.to_string());
+                }
+                i = j;
+            } else {
+                out.insert((x, y), open.clone());
+                x += 1;
+                i += 1;
+            }
+        }
+        out
+    }
+
+    /// **The property the first attempt lacked.** Every cell a repaint prints must arrive with the
+    /// terminal's link state already correct — a cell inside the URL under an open link, a cell
+    /// outside it under none.
+    ///
+    /// Splitting the sequences across a run's end cells satisfied that only on a full paint. A
+    /// repaint that restyled part of the URL (a selection, an app recolouring its own output)
+    /// re-sent the middle cells alone: the opener cell had not changed, so it was not re-sent, and
+    /// those cells arrived with no link open — while the closer that *was* re-sent shut whatever
+    /// link the terminal had. A carrier cell makes the run one diff unit, so it always travels with
+    /// its opener.
+    #[test]
+    fn every_repainted_cell_arrives_with_correct_link_state() {
+        use ratatui::widgets::Widget;
+        let url = "https://example.com/a/long/path?q=1";
+        let inner = Rect::new(0, 0, 40, 2);
+        let mut parser = new_client_parser(2, 40, CLIENT_SCROLLBACK);
+        parser.process(url.as_bytes());
+
+        let frame = |selection: Option<(u16, u16)>| {
+            let mut buf = Buffer::empty(inner);
+            PseudoTerminal::new(parser.screen()).render(inner, &mut buf);
+            if let Some((from, to)) = selection {
+                highlight_selection(
+                    &mut buf,
+                    Selection {
+                        terminal: TerminalId::new(),
+                        inner,
+                        anchor: (from, 0),
+                        head: (to, 0),
+                        active: true,
+                    },
+                );
+            }
+            mark_links(&mut buf, &parser, inner);
+            buf
+        };
+
+        let plain = frame(None);
+        // A repaint that restyles the middle of the link and nothing else.
+        let restyled = frame(Some((10, 20)));
+        let seen = linked_cells(&wire(&plain, &restyled));
+        assert!(!seen.is_empty(), "the repaint printed nothing");
+
+        let last = url.chars().count() as u16 - 1;
+        for (&(x, y), open) in &seen {
+            let inside = y == 0 && x <= last;
+            assert_eq!(
+                open.as_deref(),
+                inside.then_some(url),
+                "cell ({x},{y}) arrived with the wrong link state"
+            );
+        }
+        // The restyled cells really were among them, or the test proves nothing.
+        assert!(
+            (10..=20).any(|x| seen.contains_key(&(x, 0))),
+            "the restyled cells were not repainted: {:?}",
+            seen.keys().collect::<Vec<_>>()
+        );
+    }
+
+    /// A carrier cell carries one style, so a run is split where the style changes — which is what
+    /// keeps a selection highlight over a link visible instead of being swallowed by a `Skip`.
+    #[test]
+    fn a_selected_link_keeps_its_highlight() {
+        let url = "https://example.com/path";
+        let inner = Rect::new(0, 0, 40, 2);
+        let mut parser = new_client_parser(2, 40, CLIENT_SCROLLBACK);
+        parser.process(url.as_bytes());
+
+        use ratatui::widgets::Widget;
+        let mut buf = Buffer::empty(inner);
+        PseudoTerminal::new(parser.screen()).render(inner, &mut buf);
+        // Select the first eight columns, exactly as `render_panes` does before marking.
+        highlight_selection(
+            &mut buf,
+            Selection {
+                terminal: TerminalId::new(),
+                inner,
+                anchor: (0, 0),
+                head: (7, 0),
+                active: true,
+            },
+        );
+        mark_links(&mut buf, &parser, inner);
+
+        // Two carrier cells: the highlighted part and the rest, each keeping its own style.
+        let carriers: Vec<u16> = (0..40)
+            .filter(|&x| buf[(x, 0u16)].symbol().contains("\x1b]8;"))
+            .collect();
+        assert_eq!(carriers, vec![0, 8], "run split at the selection edge");
+        assert!(
+            buf[(0u16, 0u16)]
+                .style()
+                .add_modifier
+                .contains(Modifier::REVERSED),
+            "the selected run keeps the highlight"
+        );
+        assert!(
+            !buf[(8u16, 0u16)]
+                .style()
+                .add_modifier
+                .contains(Modifier::REVERSED),
+            "the unselected run does not"
+        );
+        // Both halves still point at the whole URL.
+        for x in carriers {
+            assert!(
+                buf[(x, 0u16)].symbol().contains(url),
+                "carrier at {x} names the full URL"
+            );
+        }
+    }
+
+    /// A pane app that marks its own hyperlinks (Claude Code does, per visual row, each opener
+    /// naming the whole URI) must have them survive into what amux draws. A vt100 grid has no
+    /// per-cell hyperlink concept, so they were being parsed and dropped.
+    #[test]
+    fn an_apps_own_hyperlink_survives_into_the_render() {
+        let url = "https://claude.com/cai/oauth/authorize?code=true&client_id=9d1c&state=C9vq";
+        // Exactly the shape captured from `claude /login`.
+        let mut bytes = Vec::new();
+        for frag in [
+            "https://claude.com/cai/oauth/",
+            "authorize?code=true&client_i",
+            "d=9d1c&state=C9vq",
+        ] {
+            bytes.extend_from_slice(b"\r");
+            bytes.extend_from_slice(format!("\x1b]8;id=b6647u;{url}\x07").as_bytes());
+            bytes.extend_from_slice(frag.as_bytes());
+            bytes.extend_from_slice(b"\x1b]8;;\x07");
+            bytes.extend_from_slice(b"\r\n");
+        }
+        let inner = Rect::new(0, 0, 30, 6);
+        let mut parser = new_client_parser(6, 30, CLIENT_SCROLLBACK);
+        parser.process(&bytes);
+
+        let links = app_links(&parser, inner.width, inner.height);
+        assert_eq!(links.len(), 3, "one span per row, got {links:?}");
+        for link in &links {
+            assert_eq!(link.url, url, "every row carries the whole URI");
+        }
+
+        let buf = marked_buffer(&parser, inner);
+        let openers: Vec<String> = buf
+            .content()
+            .iter()
+            .map(|c| c.symbol().to_string())
+            .filter(|s| s.contains("\x1b]8;") && s.contains(url))
+            .collect();
+        assert_eq!(openers.len(), 3, "all three rows link: {openers:?}");
+        // One id for one URL, or a terminal treats each row as a separate link and hover highlights
+        // only the row under the pointer.
+        assert!(
+            openers.iter().all(|s| s.contains("id=0;")),
+            "every row shares the link's id: {openers:?}"
+        );
+        // And the text is still the text. Read through the backend rather than the buffer: the
+        // covered cells keep their own symbols and only the carrier is ever drawn, so the row as
+        // *printed* is the thing worth asserting.
+        let printed = wire(&Buffer::empty(inner), &buf);
+        assert!(
+            printed.contains("\x1b\\authorize?code=true&client_i\x1b]8;;"),
+            "the row prints its own text inside the link: {printed:?}"
+        );
+    }
+
+    /// A stale span is dropped rather than mislabelling whatever now occupies those cells: the app
+    /// redraws constantly and nothing hooks a cell write, so validity is decided by whether the
+    /// cells still read as part of the URI.
+    #[test]
+    fn a_link_span_whose_cells_changed_is_dropped() {
+        let url = "https://example.com/original/path";
+        let mut parser = new_client_parser(4, 40, CLIENT_SCROLLBACK);
+        parser.process(format!("\x1b]8;id=1;{url}\x07{url}\x1b]8;;\x07").as_bytes());
+        assert_eq!(
+            app_links(&parser, 40, 4).len(),
+            1,
+            "the fresh span is honoured"
+        );
+
+        parser.process(b"\r\x1b[Kcompletely different text");
+        assert!(
+            app_links(&parser, 40, 4).is_empty(),
+            "a span over rewritten cells is dropped"
+        );
+    }
+
+    /// A pane with no links is left exactly as the content widget drew it — the pass may only add
+    /// sequences where a URL actually is.
+    #[test]
+    fn a_pane_without_links_is_untouched() {
+        let inner = Rect::new(0, 0, 20, 5);
+        let mut parser = new_client_parser(5, 20, CLIENT_SCROLLBACK);
+        parser.process(b"just some output\r\nno urls\r\n");
+
+        use ratatui::widgets::Widget;
+        let mut plain = Buffer::empty(inner);
+        PseudoTerminal::new(parser.screen()).render(inner, &mut plain);
+        assert_eq!(plain, marked_buffer(&parser, inner));
+    }
+
+    /// Two different URLs get different ids, so hovering one does not highlight the other.
+    #[test]
+    fn separate_links_get_separate_ids() {
+        let inner = Rect::new(0, 0, 60, 4);
+        let mut parser = new_client_parser(4, 60, CLIENT_SCROLLBACK);
+        parser.process(b"a https://one.example/x b https://two.example/y");
+        let buf = marked_buffer(&parser, inner);
+        let ids: Vec<String> = buf
+            .content()
+            .iter()
+            .filter_map(|c| {
+                let sym = c.symbol();
+                sym.find("id=")
+                    .map(|i| sym[i..].split(';').next().unwrap_or_default().to_string())
+            })
+            .collect();
+        assert_eq!(ids, vec!["id=0", "id=1"], "one id per URL: {ids:?}");
+    }
+
+    /// The cost of the carrier shape, pinned: one URI per run. Encoding it per *cell* is correct
+    /// too, but quadratic in the URL's length — 450 characters cost ~206 KB a paint, which over SSH
+    /// is the wrong trade even though it never decays.
+    #[test]
+    fn marking_costs_one_uri_per_run() {
+        let url = format!("https://example.com/{}", "x".repeat(230));
+        let inner = Rect::new(0, 0, 50, 8);
+        let mut parser = new_client_parser(8, 50, CLIENT_SCROLLBACK);
+        parser.process(url.as_bytes());
+        let buf = marked_buffer(&parser, inner);
+        let bytes = wire(&Buffer::empty(inner), &buf).len();
+        let rows = url.len().div_ceil(50);
+        assert!(
+            bytes < (rows + 2) * (url.len() + 64),
+            "{bytes} bytes for {rows} runs of a {}-char URL is more than one URI each",
+            url.len()
+        );
+        // Per-cell would be at least this much; the carrier shape must be far under it.
+        assert!(
+            bytes < url.len() * url.len() / 8,
+            "{bytes} bytes is in per-cell territory"
+        );
     }
 
     fn app_with_two_repos(a: usize, b: usize) -> (App, Vec<AgentId>) {

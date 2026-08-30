@@ -341,6 +341,44 @@ the proven mosh/agentapi-style split:
 This keeps the client a near-dumb renderer, avoids a bespoke cell-diff protocol, and makes
 multi-client attach fall out naturally.
 
+**Hyperlinks are the one thing the client cannot leave to the outer terminal.** A terminal detects
+URLs on its own grid, where a URL wrapped inside a pane is fragments with a border between them — so
+clicking one opens a truncated address. `mark_links` re-emits links as OSC 8 after the content is
+drawn, from two sources in priority order:
+
+1. **What the pane app declared.** Well-behaved CLIs already mark their links; Claude Code emits its
+   login URL as OSC 8, once per visual row, each opener naming the whole URI. A vt100 grid has no
+   per-cell hyperlink concept, so this was being *destroyed*: the `Links` callbacks on the client's
+   parser record each span from the cursor and `mark_links` replays them. Nothing hooks a cell write,
+   so a span is re-validated every frame against the cells it claims — the characters under it must
+   still appear in the URI — which drops spans whose rows the app has redrawn. Bounded at
+   `MAX_LINK_SPANS`.
+2. **What amux detects itself**, for output carrying no markup. Rows are joined into logical lines
+   with `row_wrapped`, the same fact `token_selection` uses to copy a wrapped URL whole. This sees
+   only *margin* wrapping: a TUI wraps text itself, so no flag is set and only source 1 recovers it.
+
+**The encoding is where the difficulty lives, and it is worth stating why.** OSC 8 is *stream* state
+— a link is opened, cells are written, it is closed — while ratatui ships a diff of individual cells.
+The obvious encoding (opener in a run's first cell, closer in its last) is correct only on a full
+paint: a repaint that restyles the middle of a link re-sends those cells alone, with no opener before
+them, and the re-sent closer shuts whatever link the terminal had open. A repainting TUI broke links
+within a frame or two, which is why an earlier attempt was reverted wholesale (c4eb2ac).
+
+So a link **run** is moved into a single carrier cell — opener, the run's whole text, closer — with
+the covered cells marked `CellDiffOption::Skip`, which is precisely what that option documents
+("prevent the buffer from overwriting a cell that is covered by something from an escape sequence,
+such as graphics or links"). The run becomes one diff unit, so it can never travel without its
+opener. Runs split where the cell **style** changes, since a carrier holds one style; that is also
+what keeps a selection highlight working, as `highlight_selection` runs first and its edges become
+run boundaries. One `id` per URL, so a terminal treats a wrapped link's rows as one link.
+
+Marking per *cell* instead would also be correct, and never decays, but it repeats the URI in every
+cell — quadratic in the URL's length, ~206 KB per paint for a 450-character login URL versus ~2.8 KB
+for the carrier shape. Over SSH that is the wrong trade.
+
+A scrolled-back pane renders bytes the daemon rebuilt from its own grid, which cannot carry OSC 8, so
+app-declared links are live-view only.
+
 **The daemon-side parser also has to answer terminal queries** (`Queries` in `pty.rs`). A pane's
 terminal *is* that parser, so a program asking it a question has nobody else to ask: it blocks
 reading a reply that never comes, swallowing the user's keystrokes while it waits — how
