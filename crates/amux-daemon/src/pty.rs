@@ -124,7 +124,12 @@ const OUTPUT_BACKLOG: usize = 1024;
 ///
 /// The whitelist is deliberately tiny: reply only to what we can answer truthfully, and leave every
 /// other query as silently ignored (which is what it was before). `cursor` is vt100's 0-based
-/// `(row, col)`; every reply is 1-based.
+/// `(row, col)` and `size` its `(rows, cols)`; every reply is 1-based and inside the screen.
+///
+/// The clamp is load-bearing. vt100 represents a pending wrap — the cursor resting at the right
+/// margin after a character landed in the last column — as `col == cols`, which is not a position
+/// any terminal reports. Answering with it gives a column one past the screen, and a full-screen app
+/// that lays out from the answer (Claude Code does) then computes nonsense and draws garbage.
 ///
 /// Known gap, shared with tmux: vt100 has no DECOM, so CPR is absolute even under origin mode.
 fn query_reply(
@@ -132,9 +137,11 @@ fn query_reply(
     params: &[&[u16]],
     c: char,
     cursor: (u16, u16),
+    size: (u16, u16),
 ) -> Option<Vec<u8>> {
     let first = params.first().and_then(|p| p.first().copied());
-    let (row, col) = (cursor.0 + 1, cursor.1 + 1);
+    let row = cursor.0.min(size.0.saturating_sub(1)) + 1;
+    let col = cursor.1.min(size.1.saturating_sub(1)) + 1;
     match (intermediate, c, first) {
         // DSR-CPR — "where is the cursor?"
         (None, 'n', Some(6)) => Some(format!("\x1b[{row};{col}R").into_bytes()),
@@ -170,7 +177,7 @@ impl vt100::Callbacks for Queries {
         if i2.is_some() {
             return;
         }
-        if let Some(reply) = query_reply(i1, params, c, screen.cursor_position()) {
+        if let Some(reply) = query_reply(i1, params, c, screen.cursor_position(), screen.size()) {
             self.pending.extend_from_slice(&reply);
         }
     }
@@ -778,9 +785,46 @@ mod query_tests {
 
     /// `(row, col)` is vt100's 0-based cursor; replies are 1-based, as every terminal reports them.
     const CURSOR: (u16, u16) = (2, 6);
+    /// A screen big enough that `CURSOR` needs no clamping — the clamp has its own test.
+    const SIZE: (u16, u16) = (24, 80);
 
     /// A query as `csi_dispatch` hands it over: leading intermediate, params, final byte.
     type Query<'a> = (Option<u8>, &'a [&'a [u16]], char);
+
+    /// A cursor sitting at the right margin with a pending wrap must be reported *at* the margin,
+    /// not one past it. vt100 tracks the pending-wrap state as `col == width`, which is not a
+    /// position any terminal reports: on a 10-column screen the answer is column 10, never 11.
+    ///
+    /// This matters far beyond tidiness. A full-screen app asks where the cursor is and lays out
+    /// from the answer — Claude Code does — so an impossible column corrupts its arithmetic and it
+    /// draws garbage. The bug shipped in the same change that started answering queries at all.
+    #[test]
+    fn a_cursor_at_the_margin_is_reported_inside_the_screen() {
+        let size = (5u16, 10u16); // rows, cols
+                                  // (chars written, expected reply) — one short of the margin, exactly at it, past it.
+        let cases = [
+            (3usize, "\x1b[1;4R"),
+            (9, "\x1b[1;10R"),
+            (10, "\x1b[1;10R"), // at the margin: clamped, not 11
+            (11, "\x1b[2;2R"),  // wrapped onto the next row
+            (20, "\x1b[2;10R"),
+        ];
+        for (n, want) in cases {
+            let mut parser =
+                vt100::Parser::new_with_callbacks(size.0, size.1, 0, Queries::default());
+            parser.process("x".repeat(n).as_bytes());
+            parser.process(b"\x1b[6n");
+            let got = String::from_utf8_lossy(&parser.callbacks().pending).to_string();
+            assert_eq!(got, want, "after {n} chars on a {size:?} screen");
+        }
+
+        // The same clamp on the last row: the cursor cannot be reported below the screen.
+        let mut parser = vt100::Parser::new_with_callbacks(size.0, size.1, 0, Queries::default());
+        parser.process("line\r\n".repeat(12).as_bytes());
+        parser.process(b"\x1b[6n");
+        let got = String::from_utf8_lossy(&parser.callbacks().pending).to_string();
+        assert_eq!(got, "\x1b[5;1R", "row is clamped to the screen height");
+    }
 
     #[test]
     fn answers_the_whitelisted_queries() {
@@ -796,7 +840,7 @@ mod query_tests {
         ];
         for ((i1, params, c), want) in cases {
             assert_eq!(
-                query_reply(*i1, params, *c, CURSOR).as_deref(),
+                query_reply(*i1, params, *c, CURSOR, SIZE).as_deref(),
                 Some(*want),
                 "query {i1:?} {params:?} {c}"
             );
@@ -815,7 +859,7 @@ mod query_tests {
         ];
         for (i1, params, c) in cases {
             assert_eq!(
-                query_reply(*i1, params, *c, CURSOR),
+                query_reply(*i1, params, *c, CURSOR, SIZE),
                 None,
                 "query {i1:?} {params:?} {c}"
             );
