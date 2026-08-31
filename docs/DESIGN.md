@@ -429,6 +429,15 @@ Why this is good:
   restart the daemon offers **resume** (`claude --resume <id>`) rather than silently losing work,
   and the tiled split you left comes back instead of collapsing to a single pane. Full
   crash-survival (re-parentable agents) is explicitly **out of scope v1**; noted as future work.
+- **Restoration is one event, not five.** The daemon's connect burst is `Repos`, `Agents`,
+  `Layouts`, `Minis`, `Active`, and the client must not act on a prefix of it. Attaching a terminal
+  tells the daemon what size to give its grid, and vt100 **cannot reflow** — so a size derived from a
+  half-restored view model does not merely look wrong, it destroys content that no later resize can
+  bring back, and `attach` snapshots the result immediately. Reconciling on `Minis` did exactly that:
+  with `Active` still unknown, the agent about to take the main pane was attached at a mini's width,
+  its grid truncated to ~42 columns, and the wreckage served to the reattaching client. Hence
+  `App::restoring`, which gates `reconcile` until `Active` arrives and ends the burst. Any new
+  restore message must extend that burst, not reconcile inside it.
 - **Restart honesty about panes**: a layout is geometry plus terminal ids, and only the *primary*
   terminal id is durable (it is persisted and reused by `resume`). Shell terminals are processes
   that die with the daemon, so their leaves are blanked on load (`blank_dead_terminals`) and the

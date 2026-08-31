@@ -464,6 +464,11 @@ struct App {
     repos: Vec<RepoInfo>,
     agents: Vec<AgentInfo>,
     sidebar_sel: Option<Row>,
+    /// True from connect until `Active` completes the daemon's restore burst (`Repos`, `Agents`,
+    /// `Layouts`, `Minis`, `Active`). While set, `reconcile` does nothing: attaching a terminal
+    /// resizes its grid in the daemon, vt100 cannot reflow, and a partial view model implies the
+    /// wrong size — so reconciling mid-restore permanently truncates the pane it is restoring.
+    restoring: bool,
     /// Whether anything has *deliberately* placed the sidebar cursor — a keypress, a shortcut, a
     /// freshly created agent. Until then the cursor is only parked wherever the roster so far
     /// allowed, and `ensure_sidebar_sel` re-homes it as better rows arrive: the daemon sends repos
@@ -539,6 +544,7 @@ impl App {
         Self {
             repos: Vec::new(),
             agents: Vec::new(),
+            restoring: true,
             sidebar_sel: None,
             sidebar_placed: false,
             sidebar_top: 0,
@@ -709,13 +715,13 @@ impl App {
                 self.saved_layouts = list.into_iter().collect();
             }
             DaemonMsg::Minis(list) => {
-                // Restore minis for agents that still exist (their terminals kept running).
+                // Restore minis for agents that still exist (their terminals kept running). No
+                // reconcile here: `Active` has not arrived, so the agent about to take the main pane
+                // still looks like a mini and would be attached at a mini's width.
                 self.minis = list
                     .into_iter()
                     .filter(|id| self.agents.iter().any(|a| a.id == *id))
-                    .filter(|id| Some(*id) != self.active_agent)
                     .collect();
-                self.reconcile(sink).await?;
             }
             DaemonMsg::Active(active) => {
                 // Restore the main pane: reopen the agent that was active. Layouts arrived first,
@@ -724,9 +730,15 @@ impl App {
                     if self.active_agent != Some(id) && self.agents.iter().any(|a| a.id == id) {
                         let restored = self.swap_to_agent(id);
                         self.spawn_restored_shells(id, restored, sink).await?;
-                        self.reconcile(sink).await?;
                     }
                 }
+                // An agent shown in the main area is not also a mini; with `Active` known, that can
+                // finally be decided.
+                self.minis.retain(|id| Some(*id) != self.active_agent);
+                // The restore burst ends here, so this is the first size any terminal is offered —
+                // and the only one, which is the point.
+                self.restoring = false;
+                self.reconcile(sink).await?;
             }
             DaemonMsg::Previous(prev) => {
                 // Seed the jump-to-previous target from persistence. Sent after `Active`, so the
@@ -2045,6 +2057,11 @@ impl App {
     /// not closed — they keep running headless in the daemon and restore when you switch back.
     /// Explicit closes (a shell pane via `Ctrl+B x`, a delete, an exit) kill terminals elsewhere.
     async fn reconcile(&mut self, sink: &mut Sink) -> Result<()> {
+        // Mid-restore the view model is partial, and every size it implies is provisional. Since a
+        // provisional size permanently truncates the daemon's grid, the only safe move is to wait.
+        if self.restoring {
+            return Ok(());
+        }
         let (pane_area, minis_area) = self.regions();
         let mut desired: HashMap<TerminalId, Size> = HashMap::new();
         for place in self.tree.layout(pane_area) {
@@ -5843,8 +5860,89 @@ mod tests {
         );
     }
 
+    /// **Restoration is one event, not five.** The daemon sends `Repos`, `Agents`, `Layouts`,
+    /// `Minis`, `Active` (server.rs:289-293), and the client used to reconcile on `Minis` too — at
+    /// which point `active_agent` is still `None` and the pane tree is empty, so the agent about to
+    /// become the main pane was attached as a ~42-column mini first.
+    ///
+    /// That is not a cosmetic double-attach: the daemon resizes the pane's grid to each size it is
+    /// given, vt100 cannot reflow, and `attach` snapshots immediately afterwards. So reattaching
+    /// destroyed the pane's content and then served the wreckage — a pane that was wrong the moment
+    /// it reattached, with no resize on the user's side at all.
+    #[tokio::test]
+    async fn restoring_attaches_each_terminal_once_at_its_final_size() {
+        use amux_proto::ServerCodec;
+        let (client_end, server_end) = UnixStream::pair().unwrap();
+        let (mut sink, _rx) = Framed::new(client_end, ClientCodec::default()).split();
+        let mut server = Framed::new(server_end, ServerCodec::default());
+
+        let (mut app, ids) = app_with_agents(3);
+        let agents = app.agents.clone();
+        // A reconnect is a fresh client, so restoration has not happened yet.
+        app.restoring = true;
+
+        // Exactly the daemon's restore order, with the previously-active agent also in the persisted
+        // minis list — the case that produced two attaches at two sizes.
+        app.on_daemon(DaemonMsg::Repos(app.repos.clone()), &mut sink)
+            .await
+            .unwrap();
+        app.on_daemon(DaemonMsg::Agents(agents.clone()), &mut sink)
+            .await
+            .unwrap();
+        app.on_daemon(DaemonMsg::Layouts(vec![]), &mut sink)
+            .await
+            .unwrap();
+        app.on_daemon(DaemonMsg::Minis(vec![ids[0], ids[1]]), &mut sink)
+            .await
+            .unwrap();
+        app.on_daemon(DaemonMsg::Active(Some(ids[0])), &mut sink)
+            .await
+            .unwrap();
+
+        let mut attaches: Vec<(TerminalId, Size)> = Vec::new();
+        while let Ok(Some(Ok(msg))) =
+            tokio::time::timeout(Duration::from_millis(150), server.next()).await
+        {
+            if let ClientMsg::Attach { terminal, size } = msg {
+                attaches.push((terminal, size));
+            }
+        }
+        assert!(!attaches.is_empty(), "restoration attached nothing");
+
+        // No terminal may be attached at two different sizes: the first size permanently truncates
+        // the daemon's grid.
+        for (i, (t, size)) in attaches.iter().enumerate() {
+            for (other, other_size) in &attaches[i + 1..] {
+                assert!(
+                    t != other || size == other_size,
+                    "terminal attached at {}x{} and then {}x{}",
+                    size.cols,
+                    size.rows,
+                    other_size.cols,
+                    other_size.rows
+                );
+            }
+        }
+        // And the sizes are the final ones: the active agent gets the main pane, not a mini cell.
+        let active_primary = agents
+            .iter()
+            .find(|a| a.id == ids[0])
+            .map(|a| a.primary_terminal)
+            .unwrap();
+        let (_, size) = attaches
+            .iter()
+            .find(|(t, _)| *t == active_primary)
+            .expect("the active agent's terminal is attached");
+        assert_eq!(
+            *size,
+            pane_size(app.regions().0),
+            "the active agent is attached at its main-pane size"
+        );
+    }
+
     fn app_with_two_repos(a: usize, b: usize) -> (App, Vec<AgentId>) {
         let mut app = App::new(100, 40);
+        app.restoring = false;
         let r = RepoId::from_canonical_path(std::path::Path::new("/r"));
         let z = RepoId::from_canonical_path(std::path::Path::new("/z"));
         app.repos = vec![
@@ -6060,6 +6158,10 @@ mod tests {
 
     fn app_with_agents(n: usize) -> (App, Vec<AgentId>) {
         let mut app = App::new(100, 40);
+        // A connected client that has finished the daemon's restore burst — the state every test
+        // below means by "an app". `restoring` gates `reconcile`, so leaving it set would make these
+        // apps attach nothing.
+        app.restoring = false;
         let repo = RepoId::from_canonical_path(std::path::Path::new("/r"));
         app.repos = vec![RepoInfo {
             id: repo,
