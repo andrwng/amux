@@ -31,6 +31,7 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 ratatui = "0.30"
 crossterm = { version = "0.29", features = ["event-stream"] }
 tui-term = "0.3"
+# Patched below: our vendored copy adds a scroll-region getter upstream lacks. See [patch].
 vt100 = "0.16"
 portable-pty = "0.9"
 git2 = { version = "0.21", default-features = false, features = ["vendored-libgit2"] }
@@ -61,3 +62,12 @@ amux-daemon = { workspace = true }
 amux-tui = { workspace = true }
 anyhow = { workspace = true }
 clap = { workspace = true }
+
+# amux vendors vt100 0.16.2 with one addition: `Screen::scroll_region()` / `Grid::scroll_region()`.
+# The reattach snapshot must restore the terminal's DECSTBM scroll region, and upstream vt100 exposes
+# no way to read it — so a client rebuilding its parser from a snapshot defaulted to a full-screen
+# region and scrolled differently from the daemon, corrupting the pane after an SSH reattach until
+# the app next repainted. The vendored source is byte-for-byte upstream plus that getter; diffing
+# against vt100 0.16.2 on crates.io shows the whole change. Drop this patch if upstream adds a getter.
+[patch.crates-io]
+vt100 = { path = "vendor/vt100" }

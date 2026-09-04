@@ -539,6 +539,81 @@ async fn reattach_snapshot_preserves_mouse_mode() {
 }
 
 #[tokio::test]
+async fn reattach_snapshot_preserves_the_scroll_region() {
+    // The SSH-drop-and-reconnect bug: a full-screen app sets a scroll region (DECSTBM), the client
+    // drops, reconnects, and rebuilds its parser from the snapshot. If the snapshot omits the
+    // region the client scrolls the whole pane where the app scrolls a sub-range, so the display
+    // drifts on the next line feed and stays wrong until the app repaints — which is why a daemon
+    // restart (a fresh app that repaints) "fixed" it. The snapshot must carry the region.
+    let tmp = tempfile::tempdir().unwrap();
+    let repo = tmp.path().join("repo");
+    std::fs::create_dir(&repo).unwrap();
+    init_repo(&repo);
+    let worktrees = WorktreeService::with_base(&repo, tmp.path().join("wt")).unwrap();
+    // Set a scroll region of rows 3..=10 (1-based), print a marker, then idle.
+    let adapter = Box::new(ClaudeAdapter::with_command(vec![
+        "sh".into(),
+        "-c".into(),
+        "printf '\\033[3;10rMARK\\n'; sleep 30".into(),
+    ]));
+    let registry = Registry::new(adapter);
+    let repo_id = registry.register(worktrees).id;
+    let socket = tmp.path().join("amuxd.sock");
+    let listener = UnixListener::bind(&socket).unwrap();
+    tokio::spawn(serve(listener, registry));
+    let mut client = handshake(&socket).await;
+    let agent = create_agent(&mut client, repo_id, "feat/region").await;
+    let term = agent.primary_terminal;
+
+    client
+        .send(ClientMsg::Attach {
+            terminal: term,
+            size: SIZE,
+        })
+        .await
+        .unwrap();
+    assert!(
+        wait_for_output(&mut client, "MARK").await,
+        "agent did not print"
+    );
+
+    // Reconnect fresh (an SSH reattach is a new connection, not just Detach/Attach).
+    client
+        .send(ClientMsg::Detach { terminal: term })
+        .await
+        .unwrap();
+    let mut c2 = handshake(&socket).await;
+    c2.send(ClientMsg::Attach {
+        terminal: term,
+        size: SIZE,
+    })
+    .await
+    .unwrap();
+
+    // Rebuild a parser from the snapshot exactly as the TUI does, and check the region took.
+    let snap = tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            match c2.next().await {
+                Some(Ok(DaemonMsg::OutputSnapshot { bytes, .. })) => return Some(bytes),
+                Some(Ok(_)) => {}
+                _ => return None,
+            }
+        }
+    })
+    .await
+    .unwrap()
+    .expect("a snapshot on reattach");
+
+    let mut parser = vt100::Parser::new(SIZE.rows, SIZE.cols, 0);
+    parser.process(&snap);
+    assert_eq!(
+        parser.screen().scroll_region(),
+        (2, 9),
+        "the reattach snapshot must reproduce the app's scroll region (0-based rows 2..=9)"
+    );
+}
+
+#[tokio::test]
 async fn hooks_drive_the_state_machine_over_the_mailbox() {
     let tmp = tempfile::tempdir().unwrap();
     let repo = tmp.path().join("repo");

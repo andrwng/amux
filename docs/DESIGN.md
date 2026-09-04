@@ -334,9 +334,16 @@ the proven mosh/agentapi-style split:
 - Each client runs its *own* `vt100::Parser` fed by `[snapshot] ++ [live stream]` and renders
   it with `tui-term`. Because all clients share the PTY's single size, they reconstruct an
   identical screen.
-- **Late-join snapshot**: on `SubscribeOutput`, the daemon sends
-  `parser.screen().contents_formatted()` (a byte dump that recreates the current screen) then
-  the live stream. No infinite history needed.
+- **Late-join snapshot**: on `SubscribeOutput`, the daemon sends a preamble of terminal state that
+  `contents_formatted()` does *not* encode — mouse mode, DECCKM, the alternate screen, and the
+  **DECSTBM scroll region** — followed by `parser.screen().contents_formatted()` (a byte dump that
+  recreates the visible cells) then the live stream. The preamble is load-bearing, not cosmetic: the
+  client rebuilds its parser from these bytes, so any state the snapshot omits is state on which the
+  client and the daemon then silently diverge. The scroll region is the sharpest case — omit it and a
+  reattaching client keeps a full-screen region while the app scrolls a sub-range, so the pane drifts
+  on the next line feed and stays wrong until the app repaints (which is why an SSH reattach corrupted
+  the display and a daemon restart appeared to "fix" it). vt100 upstream exposes no getter for the
+  region, so amux vendors a one-method patch (§11).
 
 This keeps the client a near-dumb renderer, avoids a bespoke cell-diff protocol, and makes
 multi-client attach fall out naturally.
@@ -676,7 +683,7 @@ Pinned, mutually-compatible set (verified vs crates.io/docs.rs). Note we ride th
 | crate | pin | note |
 |---|---|---|
 | portable-pty | 0.9 | PTY ownership |
-| vt100 | 0.16.2 | use tui-term's re-export to avoid skew; `contents_formatted()` = snapshot, `contents_diff()` = incremental |
+| vt100 | 0.16.2 | **vendored** at `vendor/vt100` via `[patch.crates-io]`: upstream + a `Screen::scroll_region()`/`Grid::scroll_region()` getter the reattach snapshot needs (upstream has none). Byte-identical otherwise; drop the patch if upstream adds a getter. `contents_formatted()` = snapshot body, `contents_diff()` = incremental |
 | tui-term | 0.3.4 | tracks ratatui 0.30; `PseudoTerminal::new(&screen)` |
 | ratatui | 0.30.2 | `ratatui::init()`/`restore()` (raw+altscreen+panic hook) |
 | crossterm | 0.29 | features = ["event-stream"] (ratatui only pulls it as dev-dep) |

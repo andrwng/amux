@@ -339,6 +339,17 @@ impl Session {
             vt100::MouseProtocolEncoding::Utf8 => b"\x1b[?1005h",
             vt100::MouseProtocolEncoding::Sgr => b"\x1b[?1006h",
         });
+        // The scroll region (DECSTBM), if the app set one away from the full screen. Without it a
+        // reattaching client — which rebuilds its parser from these bytes — keeps a full-screen
+        // region and scrolls the whole pane where the app scrolls a sub-range, so the display drifts
+        // on the next line feed and stays wrong until the app repaints. Emitted before
+        // `contents_formatted` (which repositions the cursor for every row), and 1-based per the
+        // escape's convention against vt100's 0-based `scroll_region`.
+        let (top, bottom) = screen.scroll_region();
+        let rows = screen.size().0;
+        if (top, bottom) != (0, rows.saturating_sub(1)) {
+            out.extend_from_slice(format!("\x1b[{};{}r", top + 1, bottom + 1).as_bytes());
+        }
         out.extend_from_slice(&screen.contents_formatted());
         out
     }
@@ -775,6 +786,53 @@ mod tests {
         assert!(
             contents.contains("GOT<[3;7R>"),
             "child never read a DSR-CPR reply; screen was {contents:?}"
+        );
+    }
+
+    /// A reattaching client rebuilds its parser from `snapshot()`, so the snapshot must carry the
+    /// terminal's scroll region (DECSTBM). Without it the client defaults to a full-screen region
+    /// while the daemon keeps the app's, and identical later output scrolls differently — the pane
+    /// goes wrong on reattach over SSH and stays wrong until the app repaints. vt100 upstream has no
+    /// getter for the region; our vendored copy adds one (see the root Cargo.toml [patch]).
+    #[test]
+    fn snapshot_restores_the_scroll_region() {
+        // A child that sets a scroll region of rows 2..=5 (1-based) and then keeps the session live.
+        let session = Session::spawn(
+            &[
+                "sh".to_string(),
+                "-c".to_string(),
+                "printf '\\033[2;5r'; exec cat".to_string(),
+            ],
+            Path::new("/"),
+            &[],
+            Size { rows: 8, cols: 20 },
+        )
+        .expect("spawn sh");
+
+        // Wait until the daemon parser has applied the region (0-based (1, 4)).
+        let mut daemon_region = (0, 0);
+        for _ in 0..100 {
+            if let Ok(parser) = session.parser.lock() {
+                daemon_region = parser.screen().scroll_region();
+                if daemon_region == (1, 4) {
+                    break;
+                }
+            }
+            thread::sleep(Duration::from_millis(20));
+        }
+        assert_eq!(
+            daemon_region,
+            (1, 4),
+            "precondition: the child set the region"
+        );
+
+        // Rebuild a client parser exactly as the TUI does on OutputSnapshot.
+        let mut client = vt100::Parser::new(8, 20, 0);
+        client.process(&session.snapshot());
+        assert_eq!(
+            client.screen().scroll_region(),
+            daemon_region,
+            "the snapshot must reproduce the daemon's scroll region"
         );
     }
 }
