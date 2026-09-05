@@ -10,6 +10,7 @@
 
 use std::io::{Read, Write};
 use std::path::Path;
+use std::sync::atomic::{AtomicU16, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::thread::{self, JoinHandle};
 use std::time::Duration;
@@ -201,6 +202,9 @@ pub struct Session {
     exit_rx: watch::Receiver<bool>,
     exit_code: Arc<Mutex<Option<i32>>>,
     threads: Mutex<Vec<JoinHandle<()>>>,
+    /// The `ws_ypixel` value currently set on the PTY (0 or 1). `request_repaint` toggles it to force
+    /// a SIGWINCH without touching rows/cols; `resize` carries it so it never toggles by accident.
+    winch_nudge: AtomicU16,
 }
 
 impl Session {
@@ -304,6 +308,7 @@ impl Session {
             exit_rx,
             exit_code,
             threads: Mutex::new(vec![reader_thread, waiter_thread]),
+            winch_nudge: AtomicU16::new(0),
         }))
     }
 
@@ -444,9 +449,43 @@ impl Session {
                 rows: size.rows,
                 cols: size.cols,
                 pixel_width: 0,
-                pixel_height: 0,
+                // Carry the current repaint nudge so a same-size resize stays a true no-op: the
+                // kernel raises SIGWINCH only when the winsize *struct* changes, and `request_repaint`
+                // owns that bit. If `resize` hard-coded 0 here it would itself toggle the struct
+                // whenever a repaint had set the nudge to 1, firing a spurious redraw.
+                pixel_height: self.winch_nudge.load(Ordering::Relaxed),
             })
             .context("resize pty")?;
+        Ok(())
+    }
+
+    /// Make the pane's app repaint its whole screen, without changing its size.
+    ///
+    /// The reattach snapshot is a best-effort reconstruction: vt100 exposes no getter for some
+    /// terminal state (origin mode, tab stops, charset), so a client parser rebuilt from a snapshot
+    /// can diverge from what the app intends, leaving a pane that reattaches blank or stale until the
+    /// app next redraws on its own. A full-screen app redraws everything on SIGWINCH, which heals any
+    /// such gap — so on attach we provoke one.
+    ///
+    /// The kernel raises SIGWINCH only when the `winsize` struct changes (`tty_do_resize` memcmp's the
+    /// whole struct, pixel fields included). We therefore toggle `ws_ypixel` between 0 and 1: rows and
+    /// cols never change, so the vt100 grid and the client's size are untouched and nothing is
+    /// truncated — the struct differs just enough to signal. **Do not "simplify" this to reissuing the
+    /// current size: that is a byte-identical struct, the kernel deduplicates it, and no signal
+    /// fires.** A plain shell ignores SIGWINCH, which is fine: its content is ordinary scrollback the
+    /// snapshot already carries in full; only full-screen apps have hidden state to redraw.
+    pub fn request_repaint(&self) -> Result<()> {
+        let nudge = self.winch_nudge.fetch_xor(1, Ordering::Relaxed) ^ 1;
+        let io = self.io.lock().unwrap();
+        let current = io.master.get_size().context("get pty size")?;
+        io.master
+            .resize(PtySize {
+                rows: current.rows,
+                cols: current.cols,
+                pixel_width: 0,
+                pixel_height: nudge,
+            })
+            .context("nudge winsize for repaint")?;
         Ok(())
     }
 

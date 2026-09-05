@@ -463,12 +463,18 @@ fn attach(
     if attached.contains_key(&terminal) {
         return;
     }
+    // Subscribe before snapshotting, and repaint only once the forwarder is live. Ordering is
+    // load-bearing: tokio's broadcast delivers only what is sent *after* a receiver subscribes, so
+    // any output produced between the snapshot and the subscribe would be lost — including the
+    // repaint's own redraw. Subscribing first can instead duplicate a few bytes into both the
+    // snapshot and the stream, which is harmless (a terminal redrawing identical cells is
+    // idempotent); a dropped byte is not.
+    let mut rx = session.subscribe();
     let _ = out_tx.send(DaemonMsg::OutputSnapshot {
         terminal,
         bytes: session.snapshot(),
     });
     let tx = out_tx.clone();
-    let mut rx = session.subscribe();
     let forwarder = tokio::spawn(async move {
         loop {
             match rx.recv().await {
@@ -483,6 +489,12 @@ fn attach(
         }
     });
     attached.insert(terminal, forwarder);
+    // The snapshot is a best-effort reconstruction — vt100 cannot expose every bit of terminal state
+    // (origin mode, tab stops, charset), so a reattaching client can render blank or stale until the
+    // app redraws. Provoke that redraw: a full-screen app repaints on SIGWINCH, healing whatever the
+    // snapshot could not carry. Done after the forwarder subscribes, so the redraw reaches this
+    // client. See `Session::request_repaint`.
+    let _ = session.request_repaint();
 }
 
 /// Where each scrolled-back terminal's view sits for *this* client, and how deep history was when

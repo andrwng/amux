@@ -334,6 +334,15 @@ the proven mosh/agentapi-style split:
 - Each client runs its *own* `vt100::Parser` fed by `[snapshot] ++ [live stream]` and renders
   it with `tui-term`. Because all clients share the PTY's single size, they reconstruct an
   identical screen.
+- **Repaint on attach**: right after the snapshot, the daemon nudges the pane's `winsize` (toggling
+  only the pixel field, so rows/cols and the grid are untouched) to raise a **SIGWINCH**. A
+  full-screen app redraws its whole screen in response, which heals anything the snapshot could not
+  carry — the snapshot is best-effort, since vt100 exposes no getter for origin mode, tab stops, or
+  charset, and a client rebuilt from it would otherwise render blank or stale until the app happened
+  to redraw. The kernel signals only when the `winsize` struct changes, so the toggle must alter it;
+  a same-size reissue is deduplicated and silent. The nudge is fired *after* the client's forwarder
+  subscribes, or the redraw would broadcast to no one. A plain shell ignores SIGWINCH, which is fine:
+  its content is ordinary scrollback the snapshot already carries in full.
 - **Late-join snapshot**: on `SubscribeOutput`, the daemon sends a preamble of terminal state that
   `contents_formatted()` does *not* encode — mouse mode, DECCKM, the alternate screen, and the
   **DECSTBM scroll region** — followed by `parser.screen().contents_formatted()` (a byte dump that

@@ -539,6 +539,68 @@ async fn reattach_snapshot_preserves_mouse_mode() {
 }
 
 #[tokio::test]
+async fn attaching_makes_a_full_screen_app_repaint() {
+    // A reattaching client rebuilds its parser from the snapshot, which cannot carry every bit of
+    // terminal state vt100 does not expose — so on attach the daemon provokes a SIGWINCH to make the
+    // app redraw and heal any gap. The signal must fire even when the size is unchanged, which is the
+    // usual reattach: a byte-identical winsize would be deduplicated by the kernel and never signal.
+    let tmp = tempfile::tempdir().unwrap();
+    let repo = tmp.path().join("repo");
+    std::fs::create_dir(&repo).unwrap();
+    init_repo(&repo);
+    let worktrees = WorktreeService::with_base(&repo, tmp.path().join("wt")).unwrap();
+    // An app that prints a distinct marker every time it receives SIGWINCH, then idles.
+    let adapter = Box::new(ClaudeAdapter::with_command(vec![
+        "sh".into(),
+        "-c".into(),
+        "trap 'printf WINCH-HIT' WINCH; printf READY; while :; do sleep 1; done".into(),
+    ]));
+    let registry = Registry::new(adapter);
+    let repo_id = registry.register(worktrees).id;
+    let socket = tmp.path().join("amuxd.sock");
+    let listener = UnixListener::bind(&socket).unwrap();
+    tokio::spawn(serve(listener, registry));
+    let mut client = handshake(&socket).await;
+    let agent = create_agent(&mut client, repo_id, "feat/winch").await;
+    let term = agent.primary_terminal;
+
+    // First attach at the session's spawn size, so `resize` is a no-op and only the deliberate
+    // repaint nudge can produce a WINCH.
+    // First attach: wait for READY, which the app prints *after* installing its WINCH trap — so once
+    // we see it, the handler is guaranteed live for the reattach below. (We don't assert a repaint on
+    // this first attach: a freshly spawned app can still be racing to install the trap.)
+    client
+        .send(ClientMsg::Attach {
+            terminal: term,
+            size: SIZE,
+        })
+        .await
+        .unwrap();
+    assert!(
+        wait_for_output(&mut client, "READY").await,
+        "app did not start"
+    );
+
+    // The real scenario: reattach at the *same* size. The redraw must still fire, because the nudge
+    // toggles the winsize struct rather than relying on a size change the kernel would deduplicate.
+    client
+        .send(ClientMsg::Detach { terminal: term })
+        .await
+        .unwrap();
+    client
+        .send(ClientMsg::Attach {
+            terminal: term,
+            size: SIZE,
+        })
+        .await
+        .unwrap();
+    assert!(
+        wait_for_output(&mut client, "WINCH-HIT").await,
+        "same-size reattach did not make the app repaint"
+    );
+}
+
+#[tokio::test]
 async fn reattach_snapshot_preserves_the_scroll_region() {
     // The SSH-drop-and-reconnect bug: a full-screen app sets a scroll region (DECSTBM), the client
     // drops, reconnects, and rebuilds its parser from the snapshot. If the snapshot omits the
