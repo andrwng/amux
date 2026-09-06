@@ -142,6 +142,12 @@ amux. Keep it that way; it drifts fast, and a stale shortcut table is worse than
   points stdio at `/dev/null` — so an auto-spawned daemon's logs go nowhere. To read them, run it
   yourself: `RUST_LOG=debug amux daemon --foreground`. Durable JSON logs under `<amux_home>/log/`
   are a design goal (`DESIGN.md` §3), not something you can go look at today.
+- **Reattach diagnostics.** Set `AMUX_RECORD=<path>` before launching the TUI to capture the daemon's
+  output stream (attach snapshot + every live chunk) for every pane to a file — off unless set, and a
+  passive tap on messages the client already receives (no extra connection, so it can't resize a
+  shared PTY). Replay a capture with `AMUX_REPLAY=<path> cargo test -p amux-tui replay_capture -- --ignored --nocapture`
+  (optionally `AMUX_REPLAY_TERM`/`_COLS`/`_ROWS`) to reconstruct exactly what a pane's parser saw and
+  find the frame where it went blank or condensed. See `crates/amux-tui/src/record.rs`.
 - **Dependencies.** Do not add an external crate without first declaring it in
   `[workspace.dependencies]` (root `Cargo.toml`) and consuming it with `{ workspace = true }`. The
   pinned set in `DESIGN.md` §11 is mutually verified and load-bearing — prefer it, and justify any

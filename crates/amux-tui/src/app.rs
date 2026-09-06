@@ -38,6 +38,7 @@ use amux_proto::{AgentInfo, ClientCodec, ClientMsg, DaemonMsg, ProtoError, RepoI
 
 use crate::input::{encode_paste, key_to_bytes};
 use crate::pane::{Axis, Dir, Nav, PaneTree};
+use crate::record::{Kind, Recorder};
 use crate::theme::Theme;
 
 /// Full sidebar width: cursor + unread bar + glyph + open marker + name + age.
@@ -463,6 +464,9 @@ fn pane_size(rect: Rect) -> Size {
 struct App {
     repos: Vec<RepoInfo>,
     agents: Vec<AgentInfo>,
+    /// Diagnostic capture of the daemon's output stream, when `AMUX_RECORD` is set (else `None`).
+    /// Off the hot path otherwise; see [`crate::record`].
+    recorder: Option<Recorder>,
     sidebar_sel: Option<Row>,
     /// True from connect until `Active` completes the daemon's restore burst (`Repos`, `Agents`,
     /// `Layouts`, `Minis`, `Active`). While set, `reconcile` does nothing: attaching a terminal
@@ -544,6 +548,7 @@ impl App {
         Self {
             repos: Vec::new(),
             agents: Vec::new(),
+            recorder: Recorder::from_env(),
             restoring: true,
             sidebar_sel: None,
             sidebar_placed: false,
@@ -653,6 +658,17 @@ impl App {
     async fn handle_daemon(&mut self, msg: Option<DaemonMsg>, sink: &mut Sink) -> Result<Flow> {
         match msg {
             Some(dm) => {
+                if let Some(rec) = &self.recorder {
+                    match &dm {
+                        DaemonMsg::OutputSnapshot { terminal, bytes } => {
+                            rec.record(*terminal, Kind::Snapshot, bytes)
+                        }
+                        DaemonMsg::Output { terminal, bytes } => {
+                            rec.record(*terminal, Kind::Output, bytes)
+                        }
+                        _ => {}
+                    }
+                }
                 self.on_daemon(dm, sink).await?;
                 Ok(Flow::Continue)
             }
