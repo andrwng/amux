@@ -27,4 +27,4 @@ pub use message::{AgentInfo, ClientMsg, DaemonMsg, Layout, RepoInfo, Size};
 /// instead of keeping a private ring, so depth no longer depends on when they attached);
 /// v20 previous-session persistence (SetPrevious, Previous — `Ctrl+B -` jump-to-previous target
 /// survives a TUI restart, restored on reconnect like the active agent).
-pub const PROTO_VERSION: u32 = 20;
+pub const PROTO_VERSION: u32 = 21;

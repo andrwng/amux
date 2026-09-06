@@ -284,6 +284,7 @@ mod tests {
         });
         roundtrip(DaemonMsg::OutputSnapshot {
             terminal: t,
+            size: Size { rows: 24, cols: 80 },
             bytes: vec![1, 2, 3],
         });
         roundtrip(DaemonMsg::ScrollView {

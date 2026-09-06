@@ -332,8 +332,18 @@ the proven mosh/agentapi-style split:
 - Daemon keeps a `vt100::Parser` (for OSC detection, heuristics, and snapshots) **and**
   broadcasts the **raw PTY output bytes** to subscribed clients.
 - Each client runs its *own* `vt100::Parser` fed by `[snapshot] ++ [live stream]` and renders
-  it with `tui-term`. Because all clients share the PTY's single size, they reconstruct an
-  identical screen.
+  it with `tui-term`.
+- **The grid size is the daemon's, not the client's, and it is grow-only.** The client's viewport
+  does not size the grid; a client that is *larger* grows it, a client that is *smaller* crops its
+  view (tui-term renders the top-left of a bigger screen). The daemon never shrinks the grid, because
+  vt100 cannot reflow and the app is a diff renderer that never repaints the lost cells — a shrink
+  would blank/truncate exactly the content the app will not redraw. So the grid's size travels *to*
+  the client (in `OutputSnapshot { size, .. }`), which sizes its parser to match; a parser sized to
+  the viewport instead would mis-parse every byte the moment the two differ. `ClientMsg::Resize`
+  grows the grid and the daemon re-snapshots so the client's parser follows; `Attach` also grows it
+  to the new client's viewport. The honest cost: a genuinely smaller terminal sees a cropped app
+  rather than a reflowed one — but nothing is ever destroyed, and growing back reveals it all.
+  (`Session::resize` is grow-only; `resize_is_grow_only_and_preserves_content` is the guard.)
 - **Late-join snapshot — and it must be a *faithful* one.** On `SubscribeOutput` the daemon sends
   `snapshot_bytes()`: a preamble of terminal state that `contents_formatted()` does not encode,
   followed by `contents_formatted()` (the visible cells), then the live stream. This is load-bearing,

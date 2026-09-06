@@ -660,9 +660,9 @@ impl App {
             Some(dm) => {
                 if let Some(rec) = &self.recorder {
                     match &dm {
-                        DaemonMsg::OutputSnapshot { terminal, bytes } => {
-                            rec.record(*terminal, Kind::Snapshot, bytes)
-                        }
+                        DaemonMsg::OutputSnapshot {
+                            terminal, bytes, ..
+                        } => rec.record(*terminal, Kind::Snapshot, bytes),
                         DaemonMsg::Output { terminal, bytes } => {
                             rec.record(*terminal, Kind::Output, bytes)
                         }
@@ -841,8 +841,17 @@ impl App {
                 // pane in that direction, exactly like a Ctrl+hjkl keypress would.
                 self.navigate(dir);
             }
-            DaemonMsg::OutputSnapshot { terminal, bytes } => {
-                if let Some(&size) = self.attached.get(&terminal) {
+            DaemonMsg::OutputSnapshot {
+                terminal,
+                size,
+                bytes,
+            } => {
+                // Size the parser to the daemon's *authoritative* grid, not our viewport. The grid
+                // is grow-only, so it may be larger than this client's pane; the renderer crops. A
+                // parser sized to the viewport instead would mis-parse every byte the moment the two
+                // disagree — the condensed/blank divergence. We render this terminal only while it is
+                // in the shown set.
+                if self.attached.contains_key(&terminal) {
                     let mut parser = new_client_parser(size.rows, size.cols, CLIENT_SCROLLBACK);
                     parser.process(&bytes);
                     self.parsers.insert(terminal, parser);
@@ -2109,27 +2118,32 @@ impl App {
         }
 
         for (&terminal, &size) in &desired {
-            if self.attached.get(&terminal) != Some(&size) {
-                match self.parsers.get_mut(&terminal) {
-                    Some(parser) => parser.screen_mut().set_size(size.rows, size.cols),
-                    None => {
-                        self.parsers.insert(
-                            terminal,
-                            new_client_parser(size.rows, size.cols, CLIENT_SCROLLBACK),
-                        );
+            match self.attached.get(&terminal).copied() {
+                // Newly shown: subscribe. `Attach` grows the (grow-only) daemon grid up to our
+                // viewport and replies with a snapshot, which is what sizes our parser — we no
+                // longer size it to the viewport here, because the authoritative grid may be larger
+                // than this client's pane and the parser must match the grid, not the pane.
+                None => {
+                    sink.send(ClientMsg::Attach { terminal, size }).await?;
+                    self.attached.insert(terminal, size);
+                }
+                // Already shown, viewport changed: ask the daemon to grow to it. Grow-only, so a
+                // smaller viewport never shrinks the grid (the renderer crops instead) — that is
+                // what stops a reconnect or a split from truncating content the app won't repaint.
+                // The daemon re-snapshots on a real change, which resizes our parser.
+                Some(prev) if prev != size => {
+                    sink.send(ClientMsg::Resize { terminal, size }).await?;
+                    self.attached.insert(terminal, size);
+                    // A scrolled-back window was rendered for its old size; re-serve it.
+                    if self
+                        .scroll
+                        .as_ref()
+                        .is_some_and(|sc| sc.terminal == terminal)
+                    {
+                        sink.send(ClientMsg::Scroll { terminal, lines: 0 }).await?;
                     }
                 }
-                sink.send(ClientMsg::Attach { terminal, size }).await?;
-                self.attached.insert(terminal, size);
-                // A served window is rendered for the size it was asked at, so a resize needs a
-                // fresh one; a zero-line step re-serves the same content at the new size.
-                if self
-                    .scroll
-                    .as_ref()
-                    .is_some_and(|sc| sc.terminal == terminal)
-                {
-                    sink.send(ClientMsg::Scroll { terminal, lines: 0 }).await?;
-                }
+                Some(_) => {}
             }
         }
 

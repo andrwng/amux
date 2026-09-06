@@ -189,10 +189,14 @@ pub enum DaemonMsg {
     Navigate { terminal: TerminalId, dir: Dir },
     /// Delete was refused because the worktree has uncommitted changes — confirm to force it.
     DeleteNeedsConfirm { id: AgentId, message: String },
-    /// Full screen of a terminal as a `contents_formatted()` dump, sent on attach. The visible screen
-    /// only — history is served on request (`ScrollView`), not shipped on attach.
+    /// Full screen of a terminal as a `contents_formatted()` dump, sent on attach and after a
+    /// resize. `size` is the daemon grid's *authoritative* size, which the client sizes its own
+    /// parser to — the client viewport may differ (the daemon grid is grow-only, so a smaller
+    /// client crops rather than shrinking and destroying content the app will not repaint). The
+    /// visible screen only — history is served on request (`ScrollView`), not shipped on attach.
     OutputSnapshot {
         terminal: TerminalId,
+        size: Size,
         bytes: Vec<u8>,
     },
     /// One screenful of scroll history, answering a [`ClientMsg::Scroll`]. `offset` is where the

@@ -420,7 +420,16 @@ fn handle_command(
         }
         ClientMsg::Resize { terminal, size } => {
             if let Some(session) = registry.session(terminal) {
-                let _ = session.resize(size);
+                // Grow-only (see `Session::resize`). If the grid actually changed, re-snapshot so
+                // this client's parser follows the new authoritative size; a client's live parser
+                // sized to the old grid would otherwise misplace every subsequent byte.
+                if let Ok(true) = session.resize(size) {
+                    let _ = out_tx.send(DaemonMsg::OutputSnapshot {
+                        terminal,
+                        size: session.size(),
+                        bytes: session.snapshot(),
+                    });
+                }
             }
         }
         ClientMsg::Scroll { terminal, lines } => {
@@ -463,15 +472,15 @@ fn attach(
     if attached.contains_key(&terminal) {
         return;
     }
-    // Subscribe before snapshotting, and repaint only once the forwarder is live. Ordering is
-    // load-bearing: tokio's broadcast delivers only what is sent *after* a receiver subscribes, so
-    // any output produced between the snapshot and the subscribe would be lost — including the
-    // repaint's own redraw. Subscribing first can instead duplicate a few bytes into both the
+    // Subscribe before snapshotting. Ordering is load-bearing: tokio's broadcast delivers only what
+    // is sent *after* a receiver subscribes, so any output produced between the snapshot and the
+    // subscribe would be lost. Subscribing first can instead duplicate a few bytes into both the
     // snapshot and the stream, which is harmless (a terminal redrawing identical cells is
     // idempotent); a dropped byte is not.
     let mut rx = session.subscribe();
     let _ = out_tx.send(DaemonMsg::OutputSnapshot {
         terminal,
+        size: session.size(),
         bytes: session.snapshot(),
     });
     let tx = out_tx.clone();

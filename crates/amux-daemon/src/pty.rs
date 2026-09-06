@@ -446,20 +446,48 @@ impl Session {
         Ok(())
     }
 
-    pub fn resize(&self, size: Size) -> Result<()> {
-        if let Ok(mut parser) = self.parser.lock() {
-            parser.screen_mut().set_size(size.rows, size.cols);
+    /// The grid's current size, `(rows, cols)` as an `amux_proto::Size`. This is authoritative for a
+    /// client: it sizes its own parser to match, and crops/pads its viewport to it.
+    pub fn size(&self) -> Size {
+        self.parser
+            .lock()
+            .map(|p| {
+                let (rows, cols) = p.screen().size();
+                Size { rows, cols }
+            })
+            .unwrap_or(Size { rows: 0, cols: 0 })
+    }
+
+    /// Resize the grid — **grow-only**. Returns whether the size actually changed.
+    ///
+    /// vt100 cannot reflow and the pane's app is a diff renderer that never repaints on demand
+    /// (ink/Claude Code answers even a real resize with "re-assert modes", no content), so shrinking
+    /// the grid destroys content nothing will ever redraw — the blank/truncated reattach. We
+    /// therefore never shrink: the size is the element-wise max of the current grid and the request.
+    /// A client smaller than the grid crops its view (tui-term renders the top-left of a larger
+    /// screen) instead of the daemon throwing content away. The cost is that a genuinely smaller
+    /// terminal sees a cropped app rather than a reflowed one — the honest price of an app that will
+    /// not repaint — and it is never destructive: growing back reveals everything.
+    pub fn resize(&self, size: Size) -> Result<bool> {
+        let mut parser = self.parser.lock().unwrap();
+        let (cur_rows, cur_cols) = parser.screen().size();
+        let rows = size.rows.max(cur_rows);
+        let cols = size.cols.max(cur_cols);
+        if (rows, cols) == (cur_rows, cur_cols) {
+            return Ok(false);
         }
+        parser.screen_mut().set_size(rows, cols);
+        drop(parser);
         let io = self.io.lock().unwrap();
         io.master
             .resize(PtySize {
-                rows: size.rows,
-                cols: size.cols,
+                rows,
+                cols,
                 pixel_width: 0,
                 pixel_height: 0,
             })
             .context("resize pty")?;
-        Ok(())
+        Ok(true)
     }
 
     /// Terminate the child by PID (SIGKILL). The waiter thread then reaps and flips the watch.
@@ -899,6 +927,58 @@ mod tests {
             session_screen(&client),
             session_screen(&daemon),
             "the snapshot did not round-trip all vt100 state"
+        );
+    }
+
+    /// Grow-only resize is what makes a reattach non-destructive. A pane holds content at its size;
+    /// a smaller client must not shrink the grid, because vt100 cannot reflow and the app (a diff
+    /// renderer) will never repaint the lost cells — that is the blank/truncated reattach. The grid
+    /// grows to fit a larger client and holds against a smaller one, which then crops its view.
+    #[test]
+    fn resize_is_grow_only_and_preserves_content() {
+        let session = session_with_lines(10, 8); // 10 rows, cols 40 (see helper), 8 lines of text
+        let before = session.parser.lock().unwrap().screen().contents();
+        assert!(before.contains("line 7"), "precondition: content present");
+        assert_eq!(session.size(), Size { rows: 10, cols: 40 });
+
+        // A smaller client attaches: the grid must not shrink and must keep every line.
+        assert!(
+            !session.resize(Size { rows: 4, cols: 20 }).unwrap(),
+            "a shrink request changes nothing"
+        );
+        assert_eq!(
+            session.size(),
+            Size { rows: 10, cols: 40 },
+            "grid held its size"
+        );
+        assert_eq!(
+            session.parser.lock().unwrap().screen().contents(),
+            before,
+            "no content was destroyed"
+        );
+
+        // A larger client grows it in both dimensions.
+        assert!(session.resize(Size { rows: 12, cols: 80 }).unwrap());
+        assert_eq!(session.size(), Size { rows: 12, cols: 80 });
+        assert!(
+            session
+                .parser
+                .lock()
+                .unwrap()
+                .screen()
+                .contents()
+                .contains("line 7"),
+            "growing keeps the content too"
+        );
+
+        // A mixed request grows each axis independently (wider but shorter → only wider).
+        assert!(session.resize(Size { rows: 6, cols: 100 }).unwrap());
+        assert_eq!(
+            session.size(),
+            Size {
+                rows: 12,
+                cols: 100
+            }
         );
     }
 }

@@ -539,6 +539,88 @@ async fn reattach_snapshot_preserves_mouse_mode() {
 }
 
 #[tokio::test]
+async fn reattaching_from_a_smaller_terminal_keeps_all_content() {
+    // The reported blank: reconnect after an SSH drop from a terminal narrower/shorter than before.
+    // A destructive resize would truncate the daemon grid (vt100 can't reflow) and the app never
+    // repaints, so content is lost. Grow-only resize must keep the grid at its larger size and let
+    // the smaller client crop — the snapshot still carries the full-width content and the true size.
+    let (mut client, repo, tmp) = setup().await; // a `cat` primary that echoes what we feed it
+    let agent = create_agent(&mut client, repo, "feat/wide").await;
+    let term = agent.primary_terminal;
+
+    // A wide client establishes a 120-col grid *before* any content, so the line lands unwrapped.
+    let wide = Size {
+        cols: 120,
+        rows: 30,
+    };
+    client
+        .send(ClientMsg::Attach {
+            terminal: term,
+            size: wide,
+        })
+        .await
+        .unwrap();
+    // Feed a 100-column line; `cat` echoes it back through the (now 120-wide) grid.
+    let line = "X".repeat(100);
+    client
+        .send(ClientMsg::Input {
+            terminal: term,
+            bytes: format!("{line}\r\n").into_bytes(),
+        })
+        .await
+        .unwrap();
+    assert!(
+        wait_for_output(&mut client, &line).await,
+        "content did not echo"
+    );
+    client
+        .send(ClientMsg::Detach { terminal: term })
+        .await
+        .unwrap();
+
+    // Reconnect from a smaller terminal, as the user did over SSH.
+    let mut c2 = handshake(&tmp.path().join("amuxd.sock")).await;
+    let small = Size { cols: 80, rows: 24 };
+    c2.send(ClientMsg::Attach {
+        terminal: term,
+        size: small,
+    })
+    .await
+    .unwrap();
+    let (size, snap) = tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            match c2.next().await {
+                Some(Ok(DaemonMsg::OutputSnapshot { size, bytes, .. })) => {
+                    return Some((size, bytes))
+                }
+                Some(Ok(_)) => {}
+                _ => return None,
+            }
+        }
+    })
+    .await
+    .unwrap()
+    .expect("a snapshot on reattach");
+
+    // The grid did not shrink to the smaller client, and the full 100-column line survived.
+    assert_eq!(
+        size, wide,
+        "grow-only: the grid keeps its larger size for the small client to crop"
+    );
+    let mut parser = vt100::Parser::new(size.rows, size.cols, 0);
+    parser.process(&snap);
+    let joined: String = parser
+        .screen()
+        .rows(0, size.cols)
+        .collect::<Vec<_>>()
+        .join("");
+    assert!(
+        joined.contains(&line),
+        "all 100 columns of content survived the smaller reattach"
+    );
+}
+
+#[tokio::test]
 async fn reattach_snapshot_preserves_the_scroll_region() {
     // The SSH-drop-and-reconnect bug: a full-screen app sets a scroll region (DECSTBM), the client
     // drops, reconnects, and rebuilds its parser from the snapshot. If the snapshot omits the
@@ -1288,7 +1370,9 @@ async fn two_terminals_stream_simultaneously() {
         loop {
             match client.next().await {
                 Some(Ok(DaemonMsg::Output { terminal, bytes }))
-                | Some(Ok(DaemonMsg::OutputSnapshot { terminal, bytes })) => {
+                | Some(Ok(DaemonMsg::OutputSnapshot {
+                    terminal, bytes, ..
+                })) => {
                     if terminal == ta {
                         sa.extend_from_slice(&bytes);
                     } else if terminal == tb {
