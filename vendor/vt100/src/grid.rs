@@ -593,6 +593,13 @@ impl Grid {
         (self.scroll_top, self.scroll_bottom)
     }
 
+    /// Whether origin mode (DECOM) is set. Added for amux: a reattach snapshot must restore it, or a
+    /// client parser defaulting to absolute positioning diverges from an app that positions relative
+    /// to its scroll region. Upstream exposes no getter.
+    pub fn origin_mode(&self) -> bool {
+        self.origin_mode
+    }
+
     pub fn set_scroll_region(&mut self, top: u16, bottom: u16) {
         let bottom = bottom.min(self.size().rows - 1);
         if top < bottom {

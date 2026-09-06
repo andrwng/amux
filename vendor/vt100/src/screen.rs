@@ -1347,6 +1347,13 @@ impl Screen {
         self.grid().scroll_region()
     }
 
+    /// Whether origin mode (DECOM) is set — the companion of [`Screen::scroll_region`] for a faithful
+    /// reattach snapshot. Added for amux; upstream vt100 exposes no getter.
+    #[must_use]
+    pub fn origin_mode(&self) -> bool {
+        self.grid().origin_mode()
+    }
+
     pub(crate) fn decstbm(&mut self, (top, bottom): (u16, u16)) {
         self.grid_mut().set_scroll_region(top - 1, bottom - 1);
     }

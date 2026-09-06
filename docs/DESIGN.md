@@ -334,25 +334,32 @@ the proven mosh/agentapi-style split:
 - Each client runs its *own* `vt100::Parser` fed by `[snapshot] ++ [live stream]` and renders
   it with `tui-term`. Because all clients share the PTY's single size, they reconstruct an
   identical screen.
-- **Repaint on attach**: right after the snapshot, the daemon nudges the pane's `winsize` (toggling
-  only the pixel field, so rows/cols and the grid are untouched) to raise a **SIGWINCH**. A
-  full-screen app redraws its whole screen in response, which heals anything the snapshot could not
-  carry — the snapshot is best-effort, since vt100 exposes no getter for origin mode, tab stops, or
-  charset, and a client rebuilt from it would otherwise render blank or stale until the app happened
-  to redraw. The kernel signals only when the `winsize` struct changes, so the toggle must alter it;
-  a same-size reissue is deduplicated and silent. The nudge is fired *after* the client's forwarder
-  subscribes, or the redraw would broadcast to no one. A plain shell ignores SIGWINCH, which is fine:
-  its content is ordinary scrollback the snapshot already carries in full.
-- **Late-join snapshot**: on `SubscribeOutput`, the daemon sends a preamble of terminal state that
-  `contents_formatted()` does *not* encode — mouse mode, DECCKM, the alternate screen, and the
-  **DECSTBM scroll region** — followed by `parser.screen().contents_formatted()` (a byte dump that
-  recreates the visible cells) then the live stream. The preamble is load-bearing, not cosmetic: the
-  client rebuilds its parser from these bytes, so any state the snapshot omits is state on which the
-  client and the daemon then silently diverge. The scroll region is the sharpest case — omit it and a
-  reattaching client keeps a full-screen region while the app scrolls a sub-range, so the pane drifts
-  on the next line feed and stays wrong until the app repaints (which is why an SSH reattach corrupted
-  the display and a daemon restart appeared to "fix" it). vt100 upstream exposes no getter for the
-  region, so amux vendors a one-method patch (§11).
+- **Late-join snapshot — and it must be a *faithful* one.** On `SubscribeOutput` the daemon sends
+  `snapshot_bytes()`: a preamble of terminal state that `contents_formatted()` does not encode,
+  followed by `contents_formatted()` (the visible cells), then the live stream. This is load-bearing,
+  not cosmetic. The client rebuilds its own parser from the snapshot and is then fed the *identical*
+  live byte stream, so if the snapshot omits any state bit, the client's parser and the daemon's
+  diverge — and the app never repairs it, because a TUI (ink/React, like Claude Code; also vim, less)
+  emits only *diffs* against its model of the screen and never a full repaint on demand. We proved
+  that: idle ink answered even a real resize with 39 bytes (re-assert modes, move cursor), zero
+  content. So divergence is permanent until the app's own content changes — the blank pane (client
+  believes the screen already shows the last frame) and the condensed text (ink emits `ESC[C` to skip
+  cells it believes blank, over cells the diverged grid left stale).
+
+  The fix is a snapshot that carries **all** of vt100's state, which is finite and closed: cells +
+  cursor (`contents_formatted`), the alternate screen (`?1049h`), the input modes — application
+  keypad/cursor, bracketed paste, mouse mode + encoding (`input_mode_formatted`), the **DECSTBM
+  scroll region**, and **DECOM origin mode**. vt100 models no charset or tab stops, so the list is
+  complete; `snapshot_round_trips_all_vt100_state` enforces it by driving a parser through every knob
+  and asserting a rebuilt parser matches. vt100 upstream exposes no getter for the scroll region or
+  origin mode, so amux vendors a two-method patch (§11). Ordering matters: DECSTBM before the
+  contents, DECOM after (it would reinterpret the contents' absolute positioning as region-relative,
+  and enabling it homes the cursor, so the cursor is re-placed region-relative afterward).
+
+  A superseded approach, recorded so it is not retried: forcing a SIGWINCH on attach to make the app
+  repaint. It does not work — ink treats a size-less SIGWINCH (and even a real resize of an unchanged
+  React tree) as "re-assert modes", never a content repaint — so the terminal *must* be a perfect
+  mirror; there is no repaint to fall back on.
 
 This keeps the client a near-dumb renderer, avoids a bespoke cell-diff protocol, and makes
 multi-client attach fall out naturally.
@@ -692,7 +699,7 @@ Pinned, mutually-compatible set (verified vs crates.io/docs.rs). Note we ride th
 | crate | pin | note |
 |---|---|---|
 | portable-pty | 0.9 | PTY ownership |
-| vt100 | 0.16.2 | **vendored** at `vendor/vt100` via `[patch.crates-io]`: upstream + a `Screen::scroll_region()`/`Grid::scroll_region()` getter the reattach snapshot needs (upstream has none). Byte-identical otherwise; drop the patch if upstream adds a getter. `contents_formatted()` = snapshot body, `contents_diff()` = incremental |
+| vt100 | 0.16.2 | **vendored** at `vendor/vt100` via `[patch.crates-io]`: upstream + two getters the faithful reattach snapshot needs and upstream lacks — `scroll_region()` and `origin_mode()` (each on `Screen` and `Grid`). Byte-identical otherwise; drop the patch if upstream adds them. `contents_formatted()` = snapshot body, `contents_diff()` = incremental |
 | tui-term | 0.3.4 | tracks ratatui 0.30; `PseudoTerminal::new(&screen)` |
 | ratatui | 0.30.2 | `ratatui::init()`/`restore()` (raw+altscreen+panic hook) |
 | crossterm | 0.29 | features = ["event-stream"] (ratatui only pulls it as dev-dep) |

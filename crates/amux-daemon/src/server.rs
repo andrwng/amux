@@ -489,12 +489,6 @@ fn attach(
         }
     });
     attached.insert(terminal, forwarder);
-    // The snapshot is a best-effort reconstruction — vt100 cannot expose every bit of terminal state
-    // (origin mode, tab stops, charset), so a reattaching client can render blank or stale until the
-    // app redraws. Provoke that redraw: a full-screen app repaints on SIGWINCH, healing whatever the
-    // snapshot could not carry. Done after the forwarder subscribes, so the redraw reaches this
-    // client. See `Session::request_repaint`.
-    let _ = session.request_repaint();
 }
 
 /// Where each scrolled-back terminal's view sits for *this* client, and how deep history was when

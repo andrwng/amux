@@ -10,7 +10,6 @@
 
 use std::io::{Read, Write};
 use std::path::Path;
-use std::sync::atomic::{AtomicU16, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::thread::{self, JoinHandle};
 use std::time::Duration;
@@ -101,6 +100,49 @@ fn window_bytes(screen: &vt100::Screen) -> Vec<u8> {
     out
 }
 
+/// Bytes that reconstruct `screen` in a fresh parser — the reattach snapshot.
+///
+/// A reattaching client rebuilds its parser from these bytes and is then fed the identical live
+/// stream, so this must restore **every** piece of vt100 state or the two parsers diverge — and the
+/// app, a diff renderer that only emits changes and never a full repaint, will never correct the
+/// difference. That divergence is the whole cause of the blank/condensed reattach bugs.
+///
+/// vt100's state surface is small and closed, and this reproduces all of it:
+///   * cells + attributes + cursor — `contents_formatted`;
+///   * alternate screen — `?1049h` (a screen switch, so not in `input_mode_formatted`);
+///   * application keypad/cursor, bracketed paste, mouse mode + encoding — `input_mode_formatted`;
+///   * scroll region (DECSTBM) and origin mode (DECOM) — emitted here.
+///
+/// vt100 models no charset or tab stops, so there is nothing else to carry;
+/// `snapshot_round_trips_all_vt100_state` is the guard that keeps this list complete.
+///
+/// Ordering is load-bearing. DECSTBM goes before the contents (it homes the cursor, but the contents
+/// reposition every row anyway). DECOM goes *after*: `contents_formatted` addresses rows with
+/// absolute CUP, which origin mode would reinterpret as region-relative, so the contents must run
+/// with DECOM off; enabling it then homes the cursor (vt100's `set_origin_mode`), so the app's cursor
+/// is re-placed region-relative afterwards to match how the app itself addresses it.
+fn snapshot_bytes(screen: &vt100::Screen) -> Vec<u8> {
+    let mut out = Vec::new();
+    if screen.alternate_screen() {
+        out.extend_from_slice(b"\x1b[?1049h");
+    }
+    out.extend_from_slice(&screen.input_mode_formatted());
+    let (top, bottom) = screen.scroll_region();
+    let rows = screen.size().0;
+    if (top, bottom) != (0, rows.saturating_sub(1)) {
+        out.extend_from_slice(format!("\x1b[{};{}r", top + 1, bottom + 1).as_bytes());
+    }
+    out.extend_from_slice(&screen.contents_formatted());
+    if screen.origin_mode() {
+        out.extend_from_slice(b"\x1b[?6h");
+        let (crow, ccol) = screen.cursor_position();
+        out.extend_from_slice(
+            format!("\x1b[{};{}H", crow.saturating_sub(top) + 1, ccol + 1).as_bytes(),
+        );
+    }
+    out
+}
+
 /// One screenful of a session's history, plus where it sits — the reply to a scroll request.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ScrollFrame {
@@ -132,7 +174,8 @@ const OUTPUT_BACKLOG: usize = 1024;
 /// any terminal reports. Answering with it gives a column one past the screen, and a full-screen app
 /// that lays out from the answer (Claude Code does) then computes nonsense and draws garbage.
 ///
-/// Known gap, shared with tmux: vt100 has no DECOM, so CPR is absolute even under origin mode.
+/// Known minor gap, shared with tmux: the CPR reply is absolute even under origin mode — we do not
+/// subtract the scroll region here, though the snapshot now restores DECOM for rendering.
 fn query_reply(
     intermediate: Option<u8>,
     params: &[&[u16]],
@@ -202,9 +245,6 @@ pub struct Session {
     exit_rx: watch::Receiver<bool>,
     exit_code: Arc<Mutex<Option<i32>>>,
     threads: Mutex<Vec<JoinHandle<()>>>,
-    /// The `ws_ypixel` value currently set on the PTY (0 or 1). `request_repaint` toggles it to force
-    /// a SIGWINCH without touching rows/cols; `resize` carries it so it never toggles by accident.
-    winch_nudge: AtomicU16,
 }
 
 impl Session {
@@ -308,7 +348,6 @@ impl Session {
             exit_rx,
             exit_code,
             threads: Mutex::new(vec![reader_thread, waiter_thread]),
-            winch_nudge: AtomicU16::new(0),
         }))
     }
 
@@ -324,39 +363,7 @@ impl Session {
         let Ok(parser) = self.parser.lock() else {
             return Vec::new();
         };
-        let mut out = Vec::new();
-        let screen = parser.screen();
-        if screen.alternate_screen() {
-            out.extend_from_slice(b"\x1b[?1049h");
-        }
-        if screen.application_cursor() {
-            out.extend_from_slice(b"\x1b[?1h");
-        }
-        out.extend_from_slice(match screen.mouse_protocol_mode() {
-            vt100::MouseProtocolMode::None => b"".as_slice(),
-            vt100::MouseProtocolMode::Press => b"\x1b[?9h",
-            vt100::MouseProtocolMode::PressRelease => b"\x1b[?1000h",
-            vt100::MouseProtocolMode::ButtonMotion => b"\x1b[?1002h",
-            vt100::MouseProtocolMode::AnyMotion => b"\x1b[?1003h",
-        });
-        out.extend_from_slice(match screen.mouse_protocol_encoding() {
-            vt100::MouseProtocolEncoding::Default => b"".as_slice(),
-            vt100::MouseProtocolEncoding::Utf8 => b"\x1b[?1005h",
-            vt100::MouseProtocolEncoding::Sgr => b"\x1b[?1006h",
-        });
-        // The scroll region (DECSTBM), if the app set one away from the full screen. Without it a
-        // reattaching client — which rebuilds its parser from these bytes — keeps a full-screen
-        // region and scrolls the whole pane where the app scrolls a sub-range, so the display drifts
-        // on the next line feed and stays wrong until the app repaints. Emitted before
-        // `contents_formatted` (which repositions the cursor for every row), and 1-based per the
-        // escape's convention against vt100's 0-based `scroll_region`.
-        let (top, bottom) = screen.scroll_region();
-        let rows = screen.size().0;
-        if (top, bottom) != (0, rows.saturating_sub(1)) {
-            out.extend_from_slice(format!("\x1b[{};{}r", top + 1, bottom + 1).as_bytes());
-        }
-        out.extend_from_slice(&screen.contents_formatted());
-        out
+        snapshot_bytes(parser.screen())
     }
 
     /// Move a client's scroll position by `lines` and serve the window it lands on.
@@ -449,43 +456,9 @@ impl Session {
                 rows: size.rows,
                 cols: size.cols,
                 pixel_width: 0,
-                // Carry the current repaint nudge so a same-size resize stays a true no-op: the
-                // kernel raises SIGWINCH only when the winsize *struct* changes, and `request_repaint`
-                // owns that bit. If `resize` hard-coded 0 here it would itself toggle the struct
-                // whenever a repaint had set the nudge to 1, firing a spurious redraw.
-                pixel_height: self.winch_nudge.load(Ordering::Relaxed),
+                pixel_height: 0,
             })
             .context("resize pty")?;
-        Ok(())
-    }
-
-    /// Make the pane's app repaint its whole screen, without changing its size.
-    ///
-    /// The reattach snapshot is a best-effort reconstruction: vt100 exposes no getter for some
-    /// terminal state (origin mode, tab stops, charset), so a client parser rebuilt from a snapshot
-    /// can diverge from what the app intends, leaving a pane that reattaches blank or stale until the
-    /// app next redraws on its own. A full-screen app redraws everything on SIGWINCH, which heals any
-    /// such gap — so on attach we provoke one.
-    ///
-    /// The kernel raises SIGWINCH only when the `winsize` struct changes (`tty_do_resize` memcmp's the
-    /// whole struct, pixel fields included). We therefore toggle `ws_ypixel` between 0 and 1: rows and
-    /// cols never change, so the vt100 grid and the client's size are untouched and nothing is
-    /// truncated — the struct differs just enough to signal. **Do not "simplify" this to reissuing the
-    /// current size: that is a byte-identical struct, the kernel deduplicates it, and no signal
-    /// fires.** A plain shell ignores SIGWINCH, which is fine: its content is ordinary scrollback the
-    /// snapshot already carries in full; only full-screen apps have hidden state to redraw.
-    pub fn request_repaint(&self) -> Result<()> {
-        let nudge = self.winch_nudge.fetch_xor(1, Ordering::Relaxed) ^ 1;
-        let io = self.io.lock().unwrap();
-        let current = io.master.get_size().context("get pty size")?;
-        io.master
-            .resize(PtySize {
-                rows: current.rows,
-                cols: current.cols,
-                pixel_width: 0,
-                pixel_height: nudge,
-            })
-            .context("nudge winsize for repaint")?;
         Ok(())
     }
 
@@ -872,6 +845,60 @@ mod tests {
             client.screen().scroll_region(),
             daemon_region,
             "the snapshot must reproduce the daemon's scroll region"
+        );
+    }
+
+    /// A reattaching client rebuilds its parser from `snapshot()` and is then fed the identical live
+    /// stream, so the snapshot must restore **every** bit of vt100's state — otherwise the two
+    /// parsers diverge and the app (a diff renderer like Claude Code) never repaints to fix it. That
+    /// is the whole cause of the blank/condensed reattach bugs.
+    ///
+    /// This drives a parser through every piece of state vt100 models, snapshots, rebuilds a fresh
+    /// parser from the snapshot alone, and asserts they match. It is also the guard on completeness:
+    /// vt100's state surface is small and closed (cells, cursor, scroll region, origin mode, the five
+    /// mode bits, mouse mode + encoding — it models no charset or tab stops), so if vt100 is ever
+    /// bumped and grows a new stateful mode, this test is where the omission must show up.
+    #[test]
+    fn snapshot_round_trips_all_vt100_state() {
+        let mut daemon = vt100::Parser::new(24, 80, 0);
+        // Exercise every stateful knob: alt screen, all the input modes, mouse tracking + SGR
+        // encoding, a scroll region, origin mode, a non-home cursor, and some styled cells.
+        daemon.process(b"\x1b[?1049h"); // alternate screen
+        daemon.process(b"\x1b[?1h"); // DECCKM application cursor
+        daemon.process(b"\x1b="); // application keypad
+        daemon.process(b"\x1b[?2004h"); // bracketed paste
+        daemon.process(b"\x1b[?1003h\x1b[?1006h"); // mouse any-motion + SGR encoding
+        daemon.process(b"\x1b[3;20r"); // scroll region rows 3..=20
+        daemon.process(b"\x1b[?6h"); // origin mode
+        daemon.process(b"\x1b[5;10H\x1b[1;31mRED\x1b[0m plain"); // styled cells + cursor
+
+        let session_screen = |p: &vt100::Parser| {
+            let s = p.screen();
+            (
+                s.contents(),
+                s.contents_formatted(),
+                s.cursor_position(),
+                s.alternate_screen(),
+                s.application_cursor(),
+                s.application_keypad(),
+                s.bracketed_paste(),
+                s.hide_cursor(),
+                s.mouse_protocol_mode(),
+                s.mouse_protocol_encoding(),
+                s.scroll_region(),
+                s.origin_mode(),
+            )
+        };
+
+        // The real production builder, not a copy — so the test cannot drift from `snapshot()`.
+        let snap = snapshot_bytes(daemon.screen());
+
+        let mut client = vt100::Parser::new(24, 80, 0);
+        client.process(&snap);
+        assert_eq!(
+            session_screen(&client),
+            session_screen(&daemon),
+            "the snapshot did not round-trip all vt100 state"
         );
     }
 }
