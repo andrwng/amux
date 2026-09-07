@@ -333,17 +333,22 @@ the proven mosh/agentapi-style split:
   broadcasts the **raw PTY output bytes** to subscribed clients.
 - Each client runs its *own* `vt100::Parser` fed by `[snapshot] ++ [live stream]` and renders
   it with `tui-term`.
-- **The grid size is the daemon's, not the client's, and it is grow-only.** The client's viewport
-  does not size the grid; a client that is *larger* grows it, a client that is *smaller* crops its
-  view (tui-term renders the top-left of a bigger screen). The daemon never shrinks the grid, because
-  vt100 cannot reflow and the app is a diff renderer that never repaints the lost cells — a shrink
-  would blank/truncate exactly the content the app will not redraw. So the grid's size travels *to*
-  the client (in `OutputSnapshot { size, .. }`), which sizes its parser to match; a parser sized to
-  the viewport instead would mis-parse every byte the moment the two differ. `ClientMsg::Resize`
-  grows the grid and the daemon re-snapshots so the client's parser follows; `Attach` also grows it
-  to the new client's viewport. The honest cost: a genuinely smaller terminal sees a cropped app
-  rather than a reflowed one — but nothing is ever destroyed, and growing back reveals it all.
-  (`Session::resize` is grow-only; `resize_is_grow_only_and_preserves_content` is the guard.)
+- **The grid size is the daemon's, and a reattach never changes it.** The grid size travels *to* the
+  client (in `OutputSnapshot { size, .. }`), which sizes its own parser to match and renders that
+  into whatever pane it has — a smaller pane crops (tui-term renders the top-left of a bigger
+  screen), a larger one letterboxes. A parser sized to the viewport instead would mis-parse every
+  byte the moment the two differ. Crucially, **resizing the grid is only ever driven by a deliberate
+  size change** — the first client sizing a freshly spawned session (`Session::client_sized` gates
+  this one-time sizing in `attach`), a genuine terminal `Event::Resize`, or a split changing a pane
+  — carried by `ClientMsg::Resize`, which the client sends only when an *already-shown* pane's size
+  changes. A plain reattach re-subscribes and re-snapshots but does **not** resize, because a resize
+  sends the app SIGWINCH and a diff-rendering TUI (ink/Claude Code) clears and, while idle, redraws
+  nothing — blanking the pane; and vt100 cannot reflow, so a shrink also drops content the app never
+  repaints. That is the whole fix for the blank reattach. The residual cost is confined to a genuine
+  terminal shrink, where the clear is the app's own correct response to the user's action.
+  (`Session::resize` is exact and marks the session client-sized;
+  `resize_is_exact_and_marks_client_sized` and `reattaching_from_a_smaller_terminal_keeps_all_content`
+  are the guards.)
 - **Late-join snapshot — and it must be a *faithful* one.** On `SubscribeOutput` the daemon sends
   `snapshot_bytes()`: a preamble of terminal state that `contents_formatted()` does not encode,
   followed by `contents_formatted()` (the visible cells), then the live stream. This is load-bearing,

@@ -468,7 +468,14 @@ fn attach(
         });
         return;
     };
-    let _ = session.resize(size);
+    // Size the grid from the attaching client's viewport *only the first time* the session is shown
+    // — a freshly spawned agent or split shell is at the spawn default and must grow to the real
+    // pane. A reattach must NOT resize: a resize sends SIGWINCH, and a diff-rendering TUI clears and
+    // (while idle) redraws nothing, blanking the pane. Genuine later size changes come as
+    // `ClientMsg::Resize`, not through attach. See `Session::resize`.
+    if !session.client_sized() {
+        let _ = session.resize(size);
+    }
     if attached.contains_key(&terminal) {
         return;
     }

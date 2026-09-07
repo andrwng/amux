@@ -541,9 +541,10 @@ async fn reattach_snapshot_preserves_mouse_mode() {
 #[tokio::test]
 async fn reattaching_from_a_smaller_terminal_keeps_all_content() {
     // The reported blank: reconnect after an SSH drop from a terminal narrower/shorter than before.
-    // A destructive resize would truncate the daemon grid (vt100 can't reflow) and the app never
-    // repaints, so content is lost. Grow-only resize must keep the grid at its larger size and let
-    // the smaller client crop — the snapshot still carries the full-width content and the true size.
+    // Resizing the grid on reattach would truncate it (vt100 can't reflow) and, via SIGWINCH, make
+    // the app clear and not redraw — the blank. A reattach must therefore not resize at all: the
+    // grid keeps its size and the smaller client crops, so the snapshot still carries the full-width
+    // content and reports the true size.
     let (mut client, repo, tmp) = setup().await; // a `cat` primary that echoes what we feed it
     let agent = create_agent(&mut client, repo, "feat/wide").await;
     let term = agent.primary_terminal;
@@ -605,7 +606,7 @@ async fn reattaching_from_a_smaller_terminal_keeps_all_content() {
     // The grid did not shrink to the smaller client, and the full 100-column line survived.
     assert_eq!(
         size, wide,
-        "grow-only: the grid keeps its larger size for the small client to crop"
+        "reattach does not resize: the grid keeps its size for the small client to crop"
     );
     let mut parser = vt100::Parser::new(size.rows, size.cols, 0);
     parser.process(&snap);

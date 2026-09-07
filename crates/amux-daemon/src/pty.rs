@@ -10,6 +10,7 @@
 
 use std::io::{Read, Write};
 use std::path::Path;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::thread::{self, JoinHandle};
 use std::time::Duration;
@@ -245,6 +246,9 @@ pub struct Session {
     exit_rx: watch::Receiver<bool>,
     exit_code: Arc<Mutex<Option<i32>>>,
     threads: Mutex<Vec<JoinHandle<()>>>,
+    /// Set once any client sizes the session (see [`Session::resize`]); gates the one-time sizing on
+    /// first attach so a reattach never resizes.
+    client_sized: AtomicBool,
 }
 
 impl Session {
@@ -348,6 +352,7 @@ impl Session {
             exit_rx,
             exit_code,
             threads: Mutex::new(vec![reader_thread, waiter_thread]),
+            client_sized: AtomicBool::new(false),
         }))
     }
 
@@ -458,31 +463,37 @@ impl Session {
             .unwrap_or(Size { rows: 0, cols: 0 })
     }
 
-    /// Resize the grid — **grow-only**. Returns whether the size actually changed.
+    /// Whether a client has set this session's size at least once (see [`Self::resize`]). Until then
+    /// the grid is at the spawn default and the first attach is allowed to size it.
+    pub fn client_sized(&self) -> bool {
+        self.client_sized.load(Ordering::Relaxed)
+    }
+
+    /// Resize the grid to `size` exactly, and mark the session as client-sized. Returns whether the
+    /// size actually changed (so the caller can re-snapshot only when it did).
     ///
-    /// vt100 cannot reflow and the pane's app is a diff renderer that never repaints on demand
-    /// (ink/Claude Code answers even a real resize with "re-assert modes", no content), so shrinking
-    /// the grid destroys content nothing will ever redraw — the blank/truncated reattach. We
-    /// therefore never shrink: the size is the element-wise max of the current grid and the request.
-    /// A client smaller than the grid crops its view (tui-term renders the top-left of a larger
-    /// screen) instead of the daemon throwing content away. The cost is that a genuinely smaller
-    /// terminal sees a cropped app rather than a reflowed one — the honest price of an app that will
-    /// not repaint — and it is never destructive: growing back reveals everything.
+    /// A resize is only ever driven by a *deliberate* size change — the first client sizing a
+    /// freshly spawned session, a genuine terminal resize, or a split changing a pane's geometry —
+    /// **never** by a plain reattach. That distinction is the whole fix for the blank reattach: a
+    /// resize sends the app SIGWINCH, and a diff-rendering TUI (ink/Claude Code) responds by clearing
+    /// and, while idle, redrawing nothing — leaving the grid blank until it next has something to
+    /// draw. vt100 also cannot reflow, so a shrink additionally drops content. Reattach must
+    /// therefore not resize at all (see `server::attach`); when a resize *is* genuine, the clear is
+    /// the app's own correct response to the user's action.
     pub fn resize(&self, size: Size) -> Result<bool> {
+        self.client_sized.store(true, Ordering::Relaxed);
         let mut parser = self.parser.lock().unwrap();
         let (cur_rows, cur_cols) = parser.screen().size();
-        let rows = size.rows.max(cur_rows);
-        let cols = size.cols.max(cur_cols);
-        if (rows, cols) == (cur_rows, cur_cols) {
+        if (size.rows, size.cols) == (cur_rows, cur_cols) {
             return Ok(false);
         }
-        parser.screen_mut().set_size(rows, cols);
+        parser.screen_mut().set_size(size.rows, size.cols);
         drop(parser);
         let io = self.io.lock().unwrap();
         io.master
             .resize(PtySize {
-                rows,
-                cols,
+                rows: size.rows,
+                cols: size.cols,
                 pixel_width: 0,
                 pixel_height: 0,
             })
@@ -930,56 +941,27 @@ mod tests {
         );
     }
 
-    /// Grow-only resize is what makes a reattach non-destructive. A pane holds content at its size;
-    /// a smaller client must not shrink the grid, because vt100 cannot reflow and the app (a diff
-    /// renderer) will never repaint the lost cells — that is the blank/truncated reattach. The grid
-    /// grows to fit a larger client and holds against a smaller one, which then crops its view.
+    /// `resize` is exact and marks the session client-sized. It is only ever called for a deliberate
+    /// size change (first sizing, a genuine terminal resize, a split); a reattach does not call it,
+    /// which is what keeps a reconnect from blanking the pane (see `server::attach` and the
+    /// `reattaching_from_a_smaller_terminal_keeps_all_content` integration test).
     #[test]
-    fn resize_is_grow_only_and_preserves_content() {
-        let session = session_with_lines(10, 8); // 10 rows, cols 40 (see helper), 8 lines of text
-        let before = session.parser.lock().unwrap().screen().contents();
-        assert!(before.contains("line 7"), "precondition: content present");
+    fn resize_is_exact_and_marks_client_sized() {
+        let session = session_with_lines(10, 8);
+        assert!(!session.client_sized(), "not sized until a client asks");
         assert_eq!(session.size(), Size { rows: 10, cols: 40 });
 
-        // A smaller client attaches: the grid must not shrink and must keep every line.
-        assert!(
-            !session.resize(Size { rows: 4, cols: 20 }).unwrap(),
-            "a shrink request changes nothing"
-        );
-        assert_eq!(
-            session.size(),
-            Size { rows: 10, cols: 40 },
-            "grid held its size"
-        );
-        assert_eq!(
-            session.parser.lock().unwrap().screen().contents(),
-            before,
-            "no content was destroyed"
-        );
-
-        // A larger client grows it in both dimensions.
+        // A grow.
         assert!(session.resize(Size { rows: 12, cols: 80 }).unwrap());
+        assert!(session.client_sized(), "resize marks the session sized");
         assert_eq!(session.size(), Size { rows: 12, cols: 80 });
-        assert!(
-            session
-                .parser
-                .lock()
-                .unwrap()
-                .screen()
-                .contents()
-                .contains("line 7"),
-            "growing keeps the content too"
-        );
 
-        // A mixed request grows each axis independently (wider but shorter → only wider).
-        assert!(session.resize(Size { rows: 6, cols: 100 }).unwrap());
-        assert_eq!(
-            session.size(),
-            Size {
-                rows: 12,
-                cols: 100
-            }
-        );
+        // A genuine shrink takes effect exactly (the app's problem to repaint, not ours to refuse).
+        assert!(session.resize(Size { rows: 6, cols: 20 }).unwrap());
+        assert_eq!(session.size(), Size { rows: 6, cols: 20 });
+
+        // Same size is a no-op (no SIGWINCH, no needless re-snapshot).
+        assert!(!session.resize(Size { rows: 6, cols: 20 }).unwrap());
     }
 }
 
