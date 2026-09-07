@@ -5,7 +5,10 @@
 //! `Child` mutably while others read/write. See `docs/DESIGN.md` §5.
 //!
 //! Load-bearing details (§11): reader on a dedicated thread, drop the slave after spawn, and
-//! treat both `Ok(0)` (macOS EOF) and `Err` (Linux EIO) as "closed". The parser is also the pane's
+//! treat both `Ok(0)` (macOS EOF) and `Err` (Linux EIO) as "closed". PTY *writes* run on their own
+//! dedicated thread fed by a bounded channel ([`InputTx`]) — never on the reader thread — so a
+//! child that stops draining its stdin can block only that writer, not reading, output, or input
+//! routing; writing on the reader thread once froze whole panes. The parser is also the pane's
 //! terminal for *queries*, not just for rendering — see [`query_reply`] and §5.3.
 
 use std::io::{Read, Write};
@@ -232,14 +235,28 @@ struct SessionIo {
     master: Box<dyn MasterPty + Send>,
 }
 
-/// The PTY's input side. Shared, because query replies originate on the reader thread while user
-/// input arrives on tokio tasks; the mutex keeps a reply from interleaving into a keystroke.
-type Writer = Arc<Mutex<Box<dyn Write + Send>>>;
+/// Bytes queued to the PTY input side. A **dedicated writer thread** owns the write half and does
+/// the (potentially blocking) `write_all`; everyone else — user keystrokes on tokio tasks, query
+/// replies on the reader thread — only enqueues here. This is load-bearing for liveness: a PTY
+/// write blocks when the child stops draining its stdin, so writing on the reader thread (as this
+/// once did, under a shared lock) froze the whole pane — no output *and* no input — the instant a
+/// child stopped reading while a reply was owed. Now only the writer thread can block; reading,
+/// parsing, and broadcast keep going.
+///
+/// Bounded, and `try_send`-with-drop on both paths, so a wedged child cannot grow this without
+/// limit (§2.6). Dropping is the right failure: a child that will not read its input is not helped
+/// by queueing more of it, and query replies are best-effort anyway.
+type InputTx = std::sync::mpsc::SyncSender<Vec<u8>>;
+
+/// Capacity of the per-session input queue (messages). Keystrokes and query replies are tiny and
+/// normally drained immediately; this only fills when the child has stopped reading, where dropping
+/// is correct.
+const INPUT_QUEUE: usize = 1024;
 
 /// A live PTY session. Cheap to `Arc`-share; all methods take `&self`.
 pub struct Session {
     io: Mutex<SessionIo>,
-    writer: Writer,
+    input_tx: Option<InputTx>,
     parser: Arc<Mutex<vt100::Parser<Queries>>>,
     output_tx: broadcast::Sender<Vec<u8>>,
     pid: Option<u32>,
@@ -288,8 +305,7 @@ impl Session {
         let pid = child.process_id();
 
         let mut reader = pair.master.try_clone_reader().context("clone reader")?;
-        let writer = pair.master.take_writer().context("take writer")?;
-        let writer: Writer = Arc::new(Mutex::new(writer));
+        let mut writer = pair.master.take_writer().context("take writer")?;
         let parser = Arc::new(Mutex::new(vt100::Parser::new_with_callbacks(
             size.rows,
             size.cols,
@@ -300,10 +316,27 @@ impl Session {
         let (exit_tx, exit_rx) = watch::channel(false);
         let exit_code = Arc::new(Mutex::new(None));
 
-        // Reader thread: pump PTY output into the parser and the broadcast.
+        // Writer thread: the *only* place a PTY write happens, so a write that blocks (child not
+        // draining its stdin) blocks nothing but this thread — reading and parsing continue. It
+        // exits when the last sender drops (Session gone) or the PTY dies (write error).
+        let (input_tx, input_rx) = std::sync::mpsc::sync_channel::<Vec<u8>>(INPUT_QUEUE);
+        let writer_thread = thread::spawn(move || {
+            while let Ok(bytes) = input_rx.recv() {
+                if writer
+                    .write_all(&bytes)
+                    .and_then(|()| writer.flush())
+                    .is_err()
+                {
+                    break;
+                }
+            }
+        });
+
+        // Reader thread: pump PTY output into the parser and the broadcast, and *enqueue* query
+        // replies (never write them here — that is what froze panes).
         let reader_parser = Arc::clone(&parser);
         let reader_tx = output_tx.clone();
-        let reader_writer = Arc::clone(&writer);
+        let reader_input_tx = input_tx.clone();
         let reader_thread = thread::spawn(move || {
             let mut buf = [0u8; 8192];
             loop {
@@ -311,17 +344,16 @@ impl Session {
                     Ok(0) => break,
                     Ok(n) => {
                         let chunk = &buf[..n];
-                        // Answer any terminal query in this chunk, but write the reply *after*
-                        // dropping the parser lock — see `Queries`.
+                        // Answer any terminal query in this chunk, but only *after* dropping the
+                        // parser lock — see `Queries` — and only by enqueuing: a blocking write here
+                        // would stall reading. Best-effort, so drop the reply if the queue is full.
                         let mut reply = Vec::new();
                         if let Ok(mut parser) = reader_parser.lock() {
                             parser.process(chunk);
                             reply.append(&mut parser.callbacks_mut().pending);
                         }
                         if !reply.is_empty() {
-                            if let Ok(mut writer) = reader_writer.lock() {
-                                let _ = writer.write_all(&reply).and_then(|()| writer.flush());
-                            }
+                            let _ = reader_input_tx.try_send(reply);
                         }
                         let _ = reader_tx.send(chunk.to_vec()); // Err only means "no attached client"
                     }
@@ -345,13 +377,13 @@ impl Session {
             io: Mutex::new(SessionIo {
                 master: pair.master,
             }),
-            writer,
+            input_tx: Some(input_tx),
             parser,
             output_tx,
             pid,
             exit_rx,
             exit_code,
-            threads: Mutex::new(vec![reader_thread, waiter_thread]),
+            threads: Mutex::new(vec![reader_thread, writer_thread, waiter_thread]),
             client_sized: AtomicBool::new(false),
         }))
     }
@@ -444,11 +476,19 @@ impl Session {
         *self.exit_code.lock().unwrap()
     }
 
+    /// Queue keystrokes for the PTY. Non-blocking: the dedicated writer thread does the actual
+    /// write, so a child that has stopped reading its stdin cannot block the caller (a tokio task).
+    /// The queue is bounded; if it is full — only when the child is not draining, where more input
+    /// helps nothing — the keystrokes are dropped rather than allowed to grow unbounded (§2.6).
     pub fn write_input(&self, bytes: &[u8]) -> Result<()> {
-        let mut writer = self.writer.lock().unwrap();
-        writer.write_all(bytes).context("write to pty")?;
-        writer.flush().context("flush pty")?;
-        Ok(())
+        use std::sync::mpsc::TrySendError;
+        let Some(tx) = self.input_tx.as_ref() else {
+            anyhow::bail!("pty writer gone");
+        };
+        match tx.try_send(bytes.to_vec()) {
+            Ok(()) | Err(TrySendError::Full(_)) => Ok(()),
+            Err(TrySendError::Disconnected(_)) => anyhow::bail!("pty writer gone"),
+        }
     }
 
     /// The grid's current size, `(rows, cols)` as an `amux_proto::Size`. This is authoritative for a
@@ -536,6 +576,11 @@ impl Session {
 
 impl Drop for Session {
     fn drop(&mut self) {
+        // Drop our end of the input channel *first*: the writer thread blocks on `recv`, which only
+        // returns once every sender is gone. Kill then makes the reader thread exit and drop its
+        // clone, disconnecting the channel so the writer thread ends — otherwise the join below
+        // would wait on a thread whose channel this Session was still keeping open.
+        self.input_tx = None;
         self.kill();
         if let Ok(mut threads) = self.threads.lock() {
             for handle in threads.drain(..) {
@@ -939,6 +984,53 @@ mod tests {
             session_screen(&daemon),
             "the snapshot did not round-trip all vt100 state"
         );
+    }
+
+    /// The freeze regression: a child that stops reading its stdin must not wedge the pane. Writes
+    /// go through a dedicated writer thread, so `write_input` only ever enqueues — it must return
+    /// promptly even when the child never drains, where the old design (a blocking write on the
+    /// reader thread, under the writer lock) froze output *and* input together.
+    #[test]
+    fn write_input_never_blocks_on_a_child_that_stops_reading() {
+        // `exec sleep` replaces the shell with a process that never reads stdin.
+        let session = Session::spawn(
+            &[
+                "sh".to_string(),
+                "-c".to_string(),
+                "printf READY; exec sleep 100".to_string(),
+            ],
+            Path::new("/"),
+            &[],
+            Size { rows: 6, cols: 40 },
+        )
+        .expect("spawn");
+        for _ in 0..100 {
+            if session
+                .parser
+                .lock()
+                .map(|p| p.screen().contents().contains("READY"))
+                .unwrap_or(false)
+            {
+                break;
+            }
+            thread::sleep(Duration::from_millis(20));
+        }
+
+        // Hammer far more than any PTY input buffer could hold. If `write_input` blocked on the
+        // non-reading child, this thread would never signal and the test would time out.
+        let s2 = Arc::clone(&session);
+        let (done_tx, done_rx) = std::sync::mpsc::channel();
+        thread::spawn(move || {
+            for _ in 0..10_000 {
+                let _ = s2.write_input(&[b'x'; 128]);
+            }
+            let _ = done_tx.send(());
+        });
+        assert!(
+            done_rx.recv_timeout(Duration::from_secs(5)).is_ok(),
+            "write_input blocked on a child that stopped reading — the frozen pane"
+        );
+        session.kill();
     }
 
     /// `resize` is exact and marks the session client-sized. It is only ever called for a deliberate
