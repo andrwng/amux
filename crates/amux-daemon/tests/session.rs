@@ -539,30 +539,26 @@ async fn reattach_snapshot_preserves_mouse_mode() {
 }
 
 #[tokio::test]
-async fn reattaching_from_a_smaller_terminal_keeps_all_content() {
-    // The reported blank: reconnect after an SSH drop from a terminal narrower/shorter than before.
-    // Resizing the grid on reattach would truncate it (vt100 can't reflow) and, via SIGWINCH, make
-    // the app clear and not redraw — the blank. A reattach must therefore not resize at all: the
-    // grid keeps its size and the smaller client crops, so the snapshot still carries the full-width
-    // content and reports the true size.
+async fn reattaching_resizes_the_grid_to_the_client() {
+    // The reported "really bad" pane: a session whose grid was last sized small (e.g. an 11-row
+    // split), then the client reconnects into a full-height window. The grid must follow the new
+    // client — otherwise it stays frozen at the old small size and the client renders those few
+    // rows into a much larger pane, leaving the rest stale/blank (never self-healing). The daemon
+    // resizes the grid to the attaching client and re-serves the reflowed content as the snapshot.
     let (mut client, repo, tmp) = setup().await; // a `cat` primary that echoes what we feed it
-    let agent = create_agent(&mut client, repo, "feat/wide").await;
+    let agent = create_agent(&mut client, repo, "feat/resize").await;
     let term = agent.primary_terminal;
 
-    // A wide client establishes a 120-col grid *before* any content, so the line lands unwrapped.
-    let wide = Size {
-        cols: 120,
-        rows: 30,
-    };
+    // First shown in a short split: an 11-row grid, with a line of content.
+    let short = Size { cols: 80, rows: 11 };
     client
         .send(ClientMsg::Attach {
             terminal: term,
-            size: wide,
+            size: short,
         })
         .await
         .unwrap();
-    // Feed a 100-column line; `cat` echoes it back through the (now 120-wide) grid.
-    let line = "X".repeat(100);
+    let line = "content-line".to_string();
     client
         .send(ClientMsg::Input {
             terminal: term,
@@ -579,12 +575,12 @@ async fn reattaching_from_a_smaller_terminal_keeps_all_content() {
         .await
         .unwrap();
 
-    // Reconnect from a smaller terminal, as the user did over SSH.
+    // Reconnect into a full-height window, as the user did after their SSH client timed out.
     let mut c2 = handshake(&tmp.path().join("amuxd.sock")).await;
-    let small = Size { cols: 80, rows: 24 };
+    let tall = Size { cols: 80, rows: 34 };
     c2.send(ClientMsg::Attach {
         terminal: term,
-        size: small,
+        size: tall,
     })
     .await
     .unwrap();
@@ -603,10 +599,11 @@ async fn reattaching_from_a_smaller_terminal_keeps_all_content() {
     .unwrap()
     .expect("a snapshot on reattach");
 
-    // The grid did not shrink to the smaller client, and the full 100-column line survived.
+    // The grid tracked the reconnecting client to the full height (the bug: it stayed at 11 rows),
+    // and the reflowed content is still present so the pane is not blank while the app repaints.
     assert_eq!(
-        size, wide,
-        "reattach does not resize: the grid keeps its size for the small client to crop"
+        size, tall,
+        "reattach resizes the grid to the client's pane, not the stale split size"
     );
     let mut parser = vt100::Parser::new(size.rows, size.cols, 0);
     parser.process(&snap);
@@ -617,7 +614,7 @@ async fn reattaching_from_a_smaller_terminal_keeps_all_content() {
         .join("");
     assert!(
         joined.contains(&line),
-        "all 100 columns of content survived the smaller reattach"
+        "the reflowed content survived the taller reattach"
     );
 }
 

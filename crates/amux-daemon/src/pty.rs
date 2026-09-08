@@ -13,7 +13,6 @@
 
 use std::io::{Read, Write};
 use std::path::Path;
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::thread::{self, JoinHandle};
 use std::time::Duration;
@@ -263,9 +262,6 @@ pub struct Session {
     exit_rx: watch::Receiver<bool>,
     exit_code: Arc<Mutex<Option<i32>>>,
     threads: Mutex<Vec<JoinHandle<()>>>,
-    /// Set once any client sizes the session (see [`Session::resize`]); gates the one-time sizing on
-    /// first attach so a reattach never resizes.
-    client_sized: AtomicBool,
 }
 
 impl Session {
@@ -384,7 +380,6 @@ impl Session {
             exit_rx,
             exit_code,
             threads: Mutex::new(vec![reader_thread, writer_thread, waiter_thread]),
-            client_sized: AtomicBool::new(false),
         }))
     }
 
@@ -503,25 +498,17 @@ impl Session {
             .unwrap_or(Size { rows: 0, cols: 0 })
     }
 
-    /// Whether a client has set this session's size at least once (see [`Self::resize`]). Until then
-    /// the grid is at the spawn default and the first attach is allowed to size it.
-    pub fn client_sized(&self) -> bool {
-        self.client_sized.load(Ordering::Relaxed)
-    }
-
-    /// Resize the grid to `size` exactly, and mark the session as client-sized. Returns whether the
-    /// size actually changed (so the caller can re-snapshot only when it did).
+    /// Resize the grid to `size` exactly. Returns whether the size actually changed (so the caller
+    /// can re-snapshot only when it did).
     ///
-    /// A resize is only ever driven by a *deliberate* size change — the first client sizing a
-    /// freshly spawned session, a genuine terminal resize, or a split changing a pane's geometry —
-    /// **never** by a plain reattach. That distinction is the whole fix for the blank reattach: a
-    /// resize sends the app SIGWINCH, and a diff-rendering TUI (ink/Claude Code) responds by clearing
-    /// and, while idle, redrawing nothing — leaving the grid blank until it next has something to
-    /// draw. vt100 also cannot reflow, so a shrink additionally drops content. Reattach must
-    /// therefore not resize at all (see `server::attach`); when a resize *is* genuine, the clear is
-    /// the app's own correct response to the user's action.
+    /// The grid always tracks the size of the pane the attached client shows it in — set on attach
+    /// and on any later layout change, exactly like tmux resizes a pty to its client. A resize does
+    /// send the app SIGWINCH; a diff-rendering TUI (ink/Claude Code) answers it with a full
+    /// clear+repaint, so the grid re-fills on its own. In the gap before that repaint the pane is
+    /// still not blank: `set_size` reflows the existing rows into the new grid, and `attach`/the
+    /// `Resize` handler serve that reflowed grid as a fresh snapshot. A *same-size* reattach — the
+    /// common reconnect — hits the early return below and sends no SIGWINCH at all.
     pub fn resize(&self, size: Size) -> Result<bool> {
-        self.client_sized.store(true, Ordering::Relaxed);
         let mut parser = self.parser.lock().unwrap();
         let (cur_rows, cur_cols) = parser.screen().size();
         if (size.rows, size.cols) == (cur_rows, cur_cols) {
@@ -1033,19 +1020,16 @@ mod tests {
         session.kill();
     }
 
-    /// `resize` is exact and marks the session client-sized. It is only ever called for a deliberate
-    /// size change (first sizing, a genuine terminal resize, a split); a reattach does not call it,
-    /// which is what keeps a reconnect from blanking the pane (see `server::attach` and the
-    /// `reattaching_from_a_smaller_terminal_keeps_all_content` integration test).
+    /// `resize` sets the grid size exactly — grow or shrink — and reports whether it changed, so a
+    /// same-size reattach (the common reconnect) is a no-op with no SIGWINCH. The grid tracks the
+    /// attached client's pane; a differently sized reconnect resizes it (see `server::attach`).
     #[test]
-    fn resize_is_exact_and_marks_client_sized() {
+    fn resize_is_exact() {
         let session = session_with_lines(10, 8);
-        assert!(!session.client_sized(), "not sized until a client asks");
         assert_eq!(session.size(), Size { rows: 10, cols: 40 });
 
         // A grow.
         assert!(session.resize(Size { rows: 12, cols: 80 }).unwrap());
-        assert!(session.client_sized(), "resize marks the session sized");
         assert_eq!(session.size(), Size { rows: 12, cols: 80 });
 
         // A genuine shrink takes effect exactly (the app's problem to repaint, not ours to refuse).

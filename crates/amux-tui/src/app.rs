@@ -2119,18 +2119,14 @@ impl App {
 
         for (&terminal, &size) in &desired {
             match self.attached.get(&terminal).copied() {
-                // Newly shown: subscribe. `Attach` grows the (grow-only) daemon grid up to our
-                // viewport and replies with a snapshot, which is what sizes our parser — we no
-                // longer size it to the viewport here, because the authoritative grid may be larger
-                // than this client's pane and the parser must match the grid, not the pane.
+                // Newly shown: subscribe. `Attach` sizes the daemon grid to our pane and replies
+                // with a snapshot, which is what sizes our parser to match the grid.
                 None => {
                     sink.send(ClientMsg::Attach { terminal, size }).await?;
                     self.attached.insert(terminal, size);
                 }
-                // Already shown, viewport changed: ask the daemon to grow to it. Grow-only, so a
-                // smaller viewport never shrinks the grid (the renderer crops instead) — that is
-                // what stops a reconnect or a split from truncating content the app won't repaint.
-                // The daemon re-snapshots on a real change, which resizes our parser.
+                // Already shown, viewport changed: resize the daemon grid to it. The daemon
+                // re-snapshots on a real change, which resizes our parser to the new grid.
                 Some(prev) if prev != size => {
                     sink.send(ClientMsg::Resize { terminal, size }).await?;
                     self.attached.insert(terminal, size);

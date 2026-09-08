@@ -420,9 +420,9 @@ fn handle_command(
         }
         ClientMsg::Resize { terminal, size } => {
             if let Some(session) = registry.session(terminal) {
-                // Grow-only (see `Session::resize`). If the grid actually changed, re-snapshot so
-                // this client's parser follows the new authoritative size; a client's live parser
-                // sized to the old grid would otherwise misplace every subsequent byte.
+                // Resize the grid to this client's pane (see `Session::resize`). If it actually
+                // changed, re-snapshot so this client's parser follows the new size; a client's
+                // live parser sized to the old grid would otherwise misplace every subsequent byte.
                 if let Ok(true) = session.resize(size) {
                     let _ = out_tx.send(DaemonMsg::OutputSnapshot {
                         terminal,
@@ -468,14 +468,13 @@ fn attach(
         });
         return;
     };
-    // Size the grid from the attaching client's viewport *only the first time* the session is shown
-    // — a freshly spawned agent or split shell is at the spawn default and must grow to the real
-    // pane. A reattach must NOT resize: a resize sends SIGWINCH, and a diff-rendering TUI clears and
-    // (while idle) redraws nothing, blanking the pane. Genuine later size changes come as
-    // `ClientMsg::Resize`, not through attach. See `Session::resize`.
-    if !session.client_sized() {
-        let _ = session.resize(size);
-    }
+    // Size the grid to the attaching client's pane — always, like tmux resizing a pty to its
+    // client. A reattach at the same size is a no-op in `resize` (no SIGWINCH); a genuine change
+    // (a reconnect into a differently sized window, a fresh session at the spawn default) resizes
+    // the pty and reflows the grid, and the snapshot sent just below serves that reflowed grid at
+    // the new size — so the pane is never left frozen at a stale size, and never blank while the
+    // app repaints in response to SIGWINCH. See `Session::resize`.
+    let _ = session.resize(size);
     if attached.contains_key(&terminal) {
         return;
     }

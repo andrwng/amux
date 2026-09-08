@@ -333,22 +333,25 @@ the proven mosh/agentapi-style split:
   broadcasts the **raw PTY output bytes** to subscribed clients.
 - Each client runs its *own* `vt100::Parser` fed by `[snapshot] ++ [live stream]` and renders
   it with `tui-term`.
-- **The grid size is the daemon's, and a reattach never changes it.** The grid size travels *to* the
-  client (in `OutputSnapshot { size, .. }`), which sizes its own parser to match and renders that
-  into whatever pane it has — a smaller pane crops (tui-term renders the top-left of a bigger
-  screen), a larger one letterboxes. A parser sized to the viewport instead would mis-parse every
-  byte the moment the two differ. Crucially, **resizing the grid is only ever driven by a deliberate
-  size change** — the first client sizing a freshly spawned session (`Session::client_sized` gates
-  this one-time sizing in `attach`), a genuine terminal `Event::Resize`, or a split changing a pane
-  — carried by `ClientMsg::Resize`, which the client sends only when an *already-shown* pane's size
-  changes. A plain reattach re-subscribes and re-snapshots but does **not** resize, because a resize
-  sends the app SIGWINCH and a diff-rendering TUI (ink/Claude Code) clears and, while idle, redraws
-  nothing — blanking the pane; and vt100 cannot reflow, so a shrink also drops content the app never
-  repaints. That is the whole fix for the blank reattach. The residual cost is confined to a genuine
-  terminal shrink, where the clear is the app's own correct response to the user's action.
-  (`Session::resize` is exact and marks the session client-sized;
-  `resize_is_exact_and_marks_client_sized` and `reattaching_from_a_smaller_terminal_keeps_all_content`
-  are the guards.)
+- **The grid tracks the attached client's pane — like tmux resizing a pty to its client.** The grid
+  size travels *to* the client (in `OutputSnapshot { size, .. }`), which sizes its own parser to
+  match and renders it; a parser sized to the viewport instead of the grid would mis-parse every
+  byte the moment the two differ, so the parser always follows the snapshot's size, never the pane's.
+  The daemon sets the grid on `attach` and on every later `ClientMsg::Resize` (a genuine terminal
+  `Event::Resize` or a split changing a pane). This includes a reattach: a client reconnecting into
+  a differently sized window resizes the grid to it. The subtlety that earlier cost us a blank is
+  that **a resize only fires SIGWINCH when the dimensions actually change** — `Session::resize`
+  early-returns on a same-size call, so the common reconnect (same window) is a pure re-subscribe +
+  re-snapshot with no SIGWINCH, carried entirely by the faithful snapshot below. When the size
+  *does* change, the app gets SIGWINCH and a diff-rendering TUI (ink/Claude Code) answers a real
+  dimension change with a full clear+repaint (unlike a size-less SIGWINCH — see the superseded note
+  below), so the grid re-fills on its own; and even before that repaint the pane is not blank,
+  because `set_size` reflows the existing rows and `attach`/the `Resize` handler serve that reflowed
+  grid as the snapshot. The earlier "never resize on reattach" rule was wrong in the other
+  direction: it froze a pane's grid at a stale size (e.g. an old 11-row split) so a reconnect into a
+  full-height window rendered those few rows into a large pane and left the rest stale — a blank that
+  *never* self-healed. (`Session::resize` is exact; `resize_is_exact` and
+  `reattaching_resizes_the_grid_to_the_client` are the guards.)
 - **Late-join snapshot — and it must be a *faithful* one.** On `SubscribeOutput` the daemon sends
   `snapshot_bytes()`: a preamble of terminal state that `contents_formatted()` does not encode,
   followed by `contents_formatted()` (the visible cells), then the live stream. This is load-bearing,
@@ -371,10 +374,13 @@ the proven mosh/agentapi-style split:
   contents, DECOM after (it would reinterpret the contents' absolute positioning as region-relative,
   and enabling it homes the cursor, so the cursor is re-placed region-relative afterward).
 
-  A superseded approach, recorded so it is not retried: forcing a SIGWINCH on attach to make the app
-  repaint. It does not work — ink treats a size-less SIGWINCH (and even a real resize of an unchanged
-  React tree) as "re-assert modes", never a content repaint — so the terminal *must* be a perfect
-  mirror; there is no repaint to fall back on.
+  A superseded approach, recorded so it is not retried: forcing a SIGWINCH on attach *without
+  changing the size* to make the app repaint. It does not work — ink answers a size-less SIGWINCH
+  with ~39 bytes (re-assert modes, move cursor), never a content repaint. That is why a same-size
+  reattach must lean entirely on the faithful snapshot and cannot count on a repaint. Note this is
+  specifically the *size-less* case: a SIGWINCH that carries a real dimension change *does* draw a
+  full repaint (observed in capture as `ESC[2J` + a full-screen redraw), which is why resizing the
+  grid to a reconnecting client is safe.
 
 This keeps the client a near-dumb renderer, avoids a bespoke cell-diff protocol, and makes
 multi-client attach fall out naturally.
