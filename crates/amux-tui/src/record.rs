@@ -56,9 +56,14 @@ pub struct Frame {
 }
 
 /// Append-only capture file. `record` is best-effort: a diagnostic must never take down the client,
-/// so every I/O error is swallowed.
+/// so every I/O error is swallowed. `notes` is a human-readable companion log (`<path>.notes`) that
+/// records *sizes* — the size the daemon reports in each snapshot, and the size the client requests
+/// on each Attach/Resize — which the binary frame stream does not carry, but which pins a
+/// blank-from-shrink (a resize to a size smaller than the content's row destroys it; see
+/// `Session::resize` and DESIGN.md §5.3).
 pub struct Recorder {
     file: Mutex<File>,
+    notes: Mutex<File>,
     start: Instant,
 }
 
@@ -67,8 +72,10 @@ impl Recorder {
     pub fn from_env() -> Option<Self> {
         let path = std::env::var_os("AMUX_RECORD")?;
         let file = File::create(&path).ok()?;
+        let notes = File::create(format!("{}.notes", path.to_string_lossy())).ok()?;
         Some(Self {
             file: Mutex::new(file),
+            notes: Mutex::new(notes),
             start: Instant::now(),
         })
     }
@@ -79,6 +86,16 @@ impl Recorder {
         if let Ok(mut file) = self.file.lock() {
             let _ = file.write_all(&frame);
             let _ = file.flush();
+        }
+    }
+
+    /// Append a size event to the `.notes` sidecar. `what` is the event ("SNAP"/"ATTACH"/"RESIZE").
+    pub fn note_size(&self, terminal: TerminalId, what: &str, cols: u16, rows: u16) {
+        let millis = self.start.elapsed().as_millis() as u64;
+        if let Ok(mut f) = self.notes.lock() {
+            let short = &terminal.to_full_string()[..8];
+            let _ = writeln!(f, "{millis} {short} {what} {cols}x{rows}");
+            let _ = f.flush();
         }
     }
 }

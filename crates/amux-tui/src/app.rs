@@ -661,8 +661,13 @@ impl App {
                 if let Some(rec) = &self.recorder {
                     match &dm {
                         DaemonMsg::OutputSnapshot {
-                            terminal, bytes, ..
-                        } => rec.record(*terminal, Kind::Snapshot, bytes),
+                            terminal,
+                            bytes,
+                            size,
+                        } => {
+                            rec.record(*terminal, Kind::Snapshot, bytes);
+                            rec.note_size(*terminal, "SNAP", size.cols, size.rows);
+                        }
                         DaemonMsg::Output { terminal, bytes } => {
                             rec.record(*terminal, Kind::Output, bytes)
                         }
@@ -2122,12 +2127,18 @@ impl App {
                 // Newly shown: subscribe. `Attach` sizes the daemon grid to our pane and replies
                 // with a snapshot, which is what sizes our parser to match the grid.
                 None => {
+                    if let Some(rec) = &self.recorder {
+                        rec.note_size(terminal, "ATTACH", size.cols, size.rows);
+                    }
                     sink.send(ClientMsg::Attach { terminal, size }).await?;
                     self.attached.insert(terminal, size);
                 }
                 // Already shown, viewport changed: resize the daemon grid to it. The daemon
                 // re-snapshots on a real change, which resizes our parser to the new grid.
                 Some(prev) if prev != size => {
+                    if let Some(rec) = &self.recorder {
+                        rec.note_size(terminal, "RESIZE", size.cols, size.rows);
+                    }
                     sink.send(ClientMsg::Resize { terminal, size }).await?;
                     self.attached.insert(terminal, size);
                     // A scrolled-back window was rendered for its old size; re-serve it.
