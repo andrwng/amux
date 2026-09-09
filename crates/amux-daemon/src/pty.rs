@@ -1039,6 +1039,41 @@ mod tests {
         // Same size is a no-op (no SIGWINCH, no needless re-snapshot).
         assert!(!session.resize(Size { rows: 6, cols: 20 }).unwrap());
     }
+
+    /// Shrinking the grid must keep the **bottom** rows — the cursor line and most recent output —
+    /// not the top. This is the blank-pane bug: a pane previously large (as the main pane) is
+    /// re-attached small (a split slot), the daemon resizes its grid down, and the reattach
+    /// snapshot is served immediately. Upstream vt100 `set_size` truncated the bottom rows and kept
+    /// the top (a full-screen app's blank header), so the snapshot was empty and an idle
+    /// diff-renderer never repainted — a permanent blank. Our vendored `set_size` drops from the
+    /// top instead (see `vendor/vt100/src/grid.rs`), so recent content survives the shrink.
+    #[test]
+    fn shrinking_the_grid_keeps_the_most_recent_rows() {
+        // 25 lines on a 30-row grid: lines 0..=24 occupy rows 0..=24, cursor just below.
+        let session = session_with_lines(30, 25);
+        {
+            let parser = session.parser.lock().unwrap();
+            let c = parser.screen().contents();
+            assert!(
+                c.contains("line 0") && c.contains("line 24"),
+                "precondition"
+            );
+        }
+
+        // Shrink to 10 rows. A real terminal keeps the last rows; the oldest scroll off the top.
+        assert!(session.resize(Size { rows: 10, cols: 40 }).unwrap());
+
+        let parser = session.parser.lock().unwrap();
+        let c = parser.screen().contents();
+        assert!(
+            c.contains("line 24"),
+            "most recent output must survive the shrink, got:\n{c}"
+        );
+        assert!(
+            !c.contains("line 0"),
+            "the oldest rows scroll off the top, not the recent ones, got:\n{c}"
+        );
+    }
 }
 
 #[cfg(test)]

@@ -345,13 +345,19 @@ the proven mosh/agentapi-style split:
   re-snapshot with no SIGWINCH, carried entirely by the faithful snapshot below. When the size
   *does* change, the app gets SIGWINCH and a diff-rendering TUI (ink/Claude Code) answers a real
   dimension change with a full clear+repaint (unlike a size-less SIGWINCH — see the superseded note
-  below), so the grid re-fills on its own; and even before that repaint the pane is not blank,
-  because `set_size` reflows the existing rows and `attach`/the `Resize` handler serve that reflowed
-  grid as the snapshot. The earlier "never resize on reattach" rule was wrong in the other
-  direction: it froze a pane's grid at a stale size (e.g. an old 11-row split) so a reconnect into a
-  full-height window rendered those few rows into a large pane and left the rest stale — a blank that
-  *never* self-healed. (`Session::resize` is exact; `resize_is_exact` and
-  `reattaching_resizes_the_grid_to_the_client` are the guards.)
+  below), so the grid re-fills on its own. Before that repaint lands the pane must still not be
+  blank, and here the row-shrink direction is load-bearing: the daemon snapshots the resized grid
+  *immediately*, so if a shrink kept the wrong rows the snapshot would be empty. vt100 does not
+  reflow, but our vendored `set_size` keeps the **bottom** rows on a shrink (dropping the oldest off
+  the top into scrollback), matching a real terminal — so a pane re-attached into a smaller slot
+  (large main → small split) snapshots its most recent output and prompt, not a blank header.
+  Upstream vt100 truncates the tail (keeps the top); with an idle app that never repaints, that was
+  a permanent blank — the bug this fixed (§11). The earlier "never resize on reattach" rule was
+  wrong in the other direction: it froze a pane's grid at a stale size (e.g. an old 11-row split) so
+  a reconnect into a full-height window rendered those few rows into a large pane and left the rest
+  stale — a blank that *never* self-healed. (`Session::resize` is exact; `resize_is_exact`,
+  `shrinking_the_grid_keeps_the_most_recent_rows`, and `reattaching_resizes_the_grid_to_the_client`
+  are the guards.)
 - **Late-join snapshot — and it must be a *faithful* one.** On `SubscribeOutput` the daemon sends
   `snapshot_bytes()`: a preamble of terminal state that `contents_formatted()` does not encode,
   followed by `contents_formatted()` (the visible cells), then the live stream. This is load-bearing,
@@ -720,7 +726,7 @@ Pinned, mutually-compatible set (verified vs crates.io/docs.rs). Note we ride th
 | crate | pin | note |
 |---|---|---|
 | portable-pty | 0.9 | PTY ownership |
-| vt100 | 0.16.2 | **vendored** at `vendor/vt100` via `[patch.crates-io]`: upstream + two getters the faithful reattach snapshot needs and upstream lacks — `scroll_region()` and `origin_mode()` (each on `Screen` and `Grid`). Byte-identical otherwise; drop the patch if upstream adds them. `contents_formatted()` = snapshot body, `contents_diff()` = incremental |
+| vt100 | 0.16.2 | **vendored** at `vendor/vt100` via `[patch.crates-io]`, two changes vs. upstream: (1) getters `scroll_region()` + `origin_mode()` (each on `Screen`/`Grid`) the faithful reattach snapshot needs; (2) `Grid::set_size` keeps the **bottom** rows on a row-shrink (upstream keeps the top), so a pane re-attached into a smaller slot snapshots recent output, not a blank header. Byte-identical otherwise; drop each if upstream adds it. `contents_formatted()` = snapshot body, `contents_diff()` = incremental |
 | tui-term | 0.3.4 | tracks ratatui 0.30; `PseudoTerminal::new(&screen)` |
 | ratatui | 0.30.2 | `ratatui::init()`/`restore()` (raw+altscreen+panic hook) |
 | crossterm | 0.29 | features = ["event-stream"] (ratatui only pulls it as dev-dep) |

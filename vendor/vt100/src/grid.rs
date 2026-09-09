@@ -78,7 +78,32 @@ impl Grid {
         for row in &mut self.rows {
             row.resize(size.cols, crate::Cell::new());
         }
-        self.rows.resize(usize::from(size.rows), self.new_row());
+        // Row-count change. On a shrink, drop rows from the TOP (oldest) into scrollback and keep
+        // the BOTTOM rows — the cursor line and most recent output — exactly as a real terminal
+        // does when its window shrinks. `Vec::resize` (upstream) instead truncates the tail, i.e.
+        // drops the *bottom* rows and keeps the top, which for a full-screen app blanks the visible
+        // area (its recent output and prompt live at the bottom) and cannot be recovered, since the
+        // app re-renders only diffs. On a grow, append blank rows at the bottom (upstream behavior).
+        let cur = self.rows.len();
+        let want = usize::from(size.rows);
+        if want < cur {
+            let drop = cur - want;
+            for _ in 0..drop {
+                let removed = self.rows.remove(0);
+                if self.scrollback_len > 0 {
+                    self.scrollback.push_back(removed);
+                    while self.scrollback.len() > self.scrollback_len {
+                        self.scrollback.pop_front();
+                    }
+                }
+            }
+            // Visible content moved up by `drop` rows; move the cursor (and saved cursor) with it.
+            let drop = drop as u16;
+            self.pos.row = self.pos.row.saturating_sub(drop);
+            self.saved_pos.row = self.saved_pos.row.saturating_sub(drop);
+        } else if want > cur {
+            self.rows.resize(want, self.new_row());
+        }
 
         if self.scroll_bottom >= size.rows {
             self.scroll_bottom = size.rows - 1;
