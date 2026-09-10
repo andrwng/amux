@@ -174,8 +174,10 @@ fn mini_width(available: u16) -> u16 {
 }
 
 const RESIZE_STEP: f32 = 0.05;
+/// Min height of the minis row.
+const MINI_H_MIN: u16 = 8;
 /// Max height of the minis row (capped to half the main area).
-const MINI_ROWS: u16 = 14;
+const MINI_ROWS: u16 = 18;
 /// How often the loop wakes up on its own, with no input, purely to redraw: the sidebar's
 /// per-agent age (`age_short`) is computed from a live clock, so a quiet screen would otherwise
 /// freeze it (e.g. "45s ago" staying "45s" forever). Coarse enough to be free.
@@ -600,7 +602,7 @@ impl App {
         if self.minis.is_empty() || self.minis_hidden {
             return (self.area, None);
         }
-        let mini_h = (self.area.height / 2).clamp(3, MINI_ROWS);
+        let mini_h = (self.area.height / 2).clamp(MINI_H_MIN, MINI_ROWS);
         // Inset the band 1 cell on the bottom + right, leaving room for the drop shadow.
         let minis = Rect::new(
             self.area.x,
