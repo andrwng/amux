@@ -358,6 +358,17 @@ the proven mosh/agentapi-style split:
   stale — a blank that *never* self-healed. (`Session::resize` is exact; `resize_is_exact`,
   `shrinking_the_grid_keeps_the_most_recent_rows`, and `reattaching_resizes_the_grid_to_the_client`
   are the guards.)
+- **Repaint kick when a reattach lands on an empty grid.** One blank does not come from resizing at
+  all: a diff-renderer that cleared its screen and went idle leaves the daemon grid blank, and a
+  reattach *at the same size* (the common reconnect) fires no SIGWINCH, so the app is never prompted
+  to redraw — the pane stays blank until the user happens to change something. An active pane hides
+  this (it repaints constantly); an idle one does not. `server::attach` detects it —
+  `!resized && Session::visible_is_empty()` — and kicks a repaint with a size **wobble**: shrink one
+  row, pause, restore. Two real dimension changes an idle app (ink coalesces a burst of SIGWINCH,
+  and ignores a size-*less* one) cannot collapse to a no-op, so it redraws, ending back at the
+  client's size. Gated so a healthy pane never wobbles. The shrink is content-safe (the grid is
+  empty, and `set_size` keeps the bottom rows regardless). This is the one case the faithful
+  snapshot cannot cover, because there is nothing in the grid to snapshot.
 - **Late-join snapshot — and it must be a *faithful* one.** On `SubscribeOutput` the daemon sends
   `snapshot_bytes()`: a preamble of terminal state that `contents_formatted()` does not encode,
   followed by `contents_formatted()` (the visible cells), then the live stream. This is load-bearing,

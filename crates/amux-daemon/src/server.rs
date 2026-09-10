@@ -474,7 +474,29 @@ fn attach(
     // the pty and reflows the grid, and the snapshot sent just below serves that reflowed grid at
     // the new size — so the pane is never left frozen at a stale size, and never blank while the
     // app repaints in response to SIGWINCH. See `Session::resize`.
-    let _ = session.resize(size);
+    let resized = session.resize(size).unwrap_or(false);
+
+    // Kick a repaint when a same-size reattach lands on an *empty* grid. A diff-rendering app
+    // (ink/Claude Code) that cleared its screen and went idle leaves the grid blank; a no-op resize
+    // fires no SIGWINCH, so the app is never prompted to redraw and the pane stays blank until the
+    // user happens to change something. Force it with a size *wobble*: shrink one row, then restore
+    // — two real dimension changes an app cannot coalesce into a no-op, so it repaints, ending back
+    // at the client's size. Gated on `!resized && visible_is_empty` so a healthy pane (whose attach
+    // either changed size or already has content) never wobbles or flickers. The shrink is
+    // content-safe: the grid is empty, and `Grid::set_size` keeps the bottom rows regardless.
+    if !resized && size.rows > 1 && session.visible_is_empty() {
+        let s = session.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(120)).await;
+            let _ = s.resize(Size {
+                cols: size.cols,
+                rows: size.rows - 1,
+            });
+            tokio::time::sleep(Duration::from_millis(120)).await;
+            let _ = s.resize(size);
+        });
+    }
+
     if attached.contains_key(&terminal) {
         return;
     }
