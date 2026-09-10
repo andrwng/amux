@@ -3128,6 +3128,7 @@ fn render(frame: &mut Frame, app: &App) {
 
 fn render_minis(frame: &mut Frame, area: Rect, app: &App) {
     let by_id: HashMap<_, _> = app.agents.iter().map(|a| (a.id, a)).collect();
+    let repo_names: HashMap<_, _> = app.repos.iter().map(|r| (r.id, r.name.as_str())).collect();
     let rects = app.mini_rects(area);
 
     // A drop shadow around the whole floating group (its right column + bottom row, offset 1),
@@ -3158,17 +3159,20 @@ fn render_minis(frame: &mut Frame, area: Rect, app: &App) {
             continue;
         };
         let focused = app.focus == Focus::Mini(i);
-        let (glyph, color, branch) = by_id
+        // Qualified `repo/name`, same as the sidebar's recent block — a mini floats free of any
+        // repo grouping, so an unqualified name would be ambiguous across repos.
+        let (glyph, color, label) = by_id
             .get(agent_id)
             .map(|a| {
+                let repo = repo_names.get(&a.repo).copied().unwrap_or("repo");
                 (
                     a.state.glyph(),
                     color_for(&a.state),
-                    a.branch.as_deref().unwrap_or("HEAD"),
+                    format!("{repo}/{}", a.name),
                 )
             })
-            .unwrap_or(('?', Color::DarkGray, "?"));
-        let title = format!(" {glyph} {branch} ");
+            .unwrap_or(('?', Color::DarkGray, "?".to_string()));
+        let title = format!(" {glyph} {label} ");
         let border = if focused {
             Style::default()
                 .fg(app.theme.focus)
@@ -4194,6 +4198,31 @@ mod tests {
         assert_eq!(app.active_agent, Some(ids[2]));
         assert_eq!(app.minis, vec![ids[1], ids[0]]);
         assert_eq!(app.focus, Focus::Panes);
+    }
+
+    #[test]
+    fn mini_title_shows_the_qualified_repo_slash_name() {
+        use ratatui::{backend::TestBackend, Terminal};
+        let (mut app, ids) = app_with_agents(2);
+        app.active_agent = Some(ids[0]);
+        app.tree.open(TerminalId::new());
+        app.minis = vec![ids[1]];
+
+        let (_, minis_area) = app.regions();
+        let area = minis_area.unwrap();
+        let mut term = Terminal::new(TestBackend::new(100, 40)).unwrap();
+        term.draw(|f| render_minis(f, area, &app)).unwrap();
+        let content: String = term
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|c| c.symbol())
+            .collect();
+        assert!(
+            content.contains("r/a"),
+            "mini title shows repo/name, got: {content}"
+        );
     }
 
     #[test]
