@@ -515,6 +515,9 @@ struct App {
     minis_hidden: bool,
     /// Where focus was before it entered the minis row, so closing a mini can return there.
     focus_return: Focus,
+    /// The mini index last focused, so navigating back into the minis row resumes there instead
+    /// of always landing on the leftmost one — mirrors `PaneTree::focus_most_recent`.
+    last_mini: usize,
     /// The agent last reported to the daemon as "being viewed" (drives read/unread).
     focus_agent: Option<AgentId>,
     input: InputMode,
@@ -570,6 +573,7 @@ impl App {
             minimized: HashSet::new(),
             minis_hidden: false,
             focus_return: Focus::Sidebar,
+            last_mini: 0,
             focus_agent: None,
             input: InputMode::Normal,
             prefix: false,
@@ -1045,16 +1049,16 @@ impl App {
                         self.tree.focus_most_recent();
                         self.focus = Focus::Panes;
                     } else if !self.minis.is_empty() {
-                        self.enter_mini(0);
+                        self.enter_mini(self.resume_mini());
                     }
                 }
             }
             Focus::Panes => match self.tree.navigate(dir, pane_area) {
                 Nav::ExitLeft => self.focus = Focus::Sidebar,
                 // The minis sit below and to the right of the panes, so hitting the bottom or right
-                // edge drops into the leftmost mini (adjacent to the main area).
+                // edge drops into the last-focused mini (adjacent to the main area).
                 Nav::Stay if matches!(dir, Dir::Down | Dir::Right) && !self.minis.is_empty() => {
-                    self.enter_mini(0)
+                    self.enter_mini(self.resume_mini())
                 }
                 _ => {}
             },
@@ -1071,6 +1075,9 @@ impl App {
                 _ => {}
             },
         }
+        if let Focus::Mini(i) = self.focus {
+            self.last_mini = i;
+        }
     }
 
     /// Move focus into the i-th mini, remembering where we came from so closing it can return.
@@ -1079,6 +1086,13 @@ impl App {
             self.focus_return = self.focus;
         }
         self.focus = Focus::Mini(i);
+        self.last_mini = i;
+    }
+
+    /// The mini index to resume at when re-entering the minis row: the last one focused, clamped
+    /// to the current row (a mini may have closed since).
+    fn resume_mini(&self) -> usize {
+        self.last_mini.min(self.minis.len().saturating_sub(1))
     }
 
     async fn key_sidebar(&mut self, key: KeyEvent, sink: &mut Sink) -> Result<Flow> {
@@ -1185,6 +1199,9 @@ impl App {
         } else {
             Focus::Mini(i.min(self.minis.len() - 1))
         };
+        if let Focus::Mini(i) = self.focus {
+            self.last_mini = i;
+        }
         self.reconcile(sink).await
     }
 
@@ -4092,11 +4109,13 @@ mod tests {
         // Up climbs back into the main layout.
         app.navigate(Dir::Up);
         assert_eq!(app.focus, Focus::Panes);
-        // Right off the right edge of the panes also drops into the leftmost mini (they sit to the
-        // right of the main area as well as below it)...
+        // Right off the right edge of the panes resumes the last-focused mini (1, not the
+        // leftmost) — mirrors PaneTree::focus_most_recent.
         app.navigate(Dir::Right);
+        assert_eq!(app.focus, Focus::Mini(1));
+        // Left steps across the row, then off the leftmost mini re-enters the panes.
+        app.navigate(Dir::Left);
         assert_eq!(app.focus, Focus::Mini(0));
-        // ...and left off the leftmost mini re-enters the panes.
         app.navigate(Dir::Left);
         assert_eq!(app.focus, Focus::Panes);
 
@@ -4115,6 +4134,30 @@ mod tests {
             Some(1)
         );
         assert_eq!(app.mini_at(app.area.x + 1, app.area.y), None);
+    }
+
+    #[test]
+    fn leaving_and_returning_to_minis_resumes_the_last_focused_one() {
+        let mut app = App::new(100, 40);
+        app.tree.open(TerminalId::new());
+        app.active_agent = Some(AgentId::new());
+        app.focus = Focus::Panes;
+        app.minis = vec![AgentId::new(), AgentId::new(), AgentId::new()];
+
+        // Focus mini 2, leave to the panes, then come back — should resume on 2, not 0.
+        app.navigate(Dir::Down);
+        app.navigate(Dir::Right);
+        app.navigate(Dir::Right);
+        assert_eq!(app.focus, Focus::Mini(2));
+        app.navigate(Dir::Up);
+        app.navigate(Dir::Down);
+        assert_eq!(app.focus, Focus::Mini(2));
+
+        // If the last-focused mini has since closed, resuming clamps to the new last index.
+        app.minis.truncate(2);
+        app.navigate(Dir::Up);
+        app.navigate(Dir::Down);
+        assert_eq!(app.focus, Focus::Mini(1));
     }
 
     #[test]
