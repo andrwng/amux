@@ -145,7 +145,7 @@ Everywhere: `Ctrl+Q` quit · `Ctrl+h/j/k/l` move focus · `Ctrl+B` command prefi
 | `1`–`9`, `0` | open that numbered sidebar agent (`0` is the tenth; the digits appear on the rows while the prefix is armed) |
 | `-` | open the previous agent — tmux's last-window |
 | `Ctrl+<key>` | send a literal control key to the focused pane (e.g. `Ctrl+B Ctrl+L`, since bare `Ctrl+h/j/k/l` navigate) |
-| `Enter` | *(mini only)* promote the mini into the main area |
+| `Enter` | *(mini only)* promote the mini into the main area, swapping places with what was there |
 | `-` | *(mini only)* minimize/restore it to a status strip |
 | `z` | peek: hide/show the whole minis row |
 

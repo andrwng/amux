@@ -1267,6 +1267,24 @@ impl App {
         Ok(())
     }
 
+    /// Promote the mini at `i` into the main area, swapping it with the outgoing main agent: the
+    /// agent that was main takes the promoted mini's spot in the row, instead of just going to
+    /// the background (as a plain [`activate`] would leave it).
+    async fn swap_mini_to_main(&mut self, i: usize, sink: &mut Sink) -> Result<()> {
+        let Some(agent) = self.minis.get(i).copied() else {
+            return Ok(());
+        };
+        let prev = self.active_agent;
+        let restored = self.swap_to_agent(agent);
+        if let Some(prev) = prev {
+            if prev != agent {
+                self.minis.insert(i.min(self.minis.len()), prev);
+            }
+        }
+        self.spawn_restored_shells(agent, restored, sink).await?;
+        self.reconcile(sink).await
+    }
+
     /// The pure state change behind [`activate`]: save the current agent's layout, restore (or
     /// create) `id`'s, and ensure its primary terminal is shown.
     ///
@@ -1373,12 +1391,11 @@ impl App {
                     self.open_agent(id, sink).await?;
                 }
             }
-            // `Ctrl+B Enter`: promote the focused mini into the main area.
+            // `Ctrl+B Enter`: promote the focused mini into the main area, swapping places with
+            // whatever was main.
             KeyCode::Enter if matches!(self.focus, Focus::Mini(_)) => {
                 if let Focus::Mini(i) = self.focus {
-                    if let Some(agent) = self.minis.get(i).copied() {
-                        self.activate(agent, sink).await?;
-                    }
+                    self.swap_mini_to_main(i, sink).await?;
                 }
             }
             KeyCode::Char('x') => {
@@ -4158,6 +4175,25 @@ mod tests {
         app.navigate(Dir::Up);
         app.navigate(Dir::Down);
         assert_eq!(app.focus, Focus::Mini(1));
+    }
+
+    #[tokio::test]
+    async fn promoting_a_mini_swaps_it_with_the_outgoing_main_agent() {
+        let (mut app, ids) = app_with_agents(3);
+        let (mut sink, _server) = test_sink();
+
+        app.activate(ids[0], &mut sink).await.unwrap();
+        app.minis = vec![ids[1], ids[2]];
+        app.enter_mini(1);
+
+        app.key_prefix(key(KeyCode::Enter), &mut sink)
+            .await
+            .unwrap();
+
+        // The promoted mini is now main; the outgoing main took its old slot in the row.
+        assert_eq!(app.active_agent, Some(ids[2]));
+        assert_eq!(app.minis, vec![ids[1], ids[0]]);
+        assert_eq!(app.focus, Focus::Panes);
     }
 
     #[test]
