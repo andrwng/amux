@@ -1054,7 +1054,7 @@ impl App {
                 }
             }
             Focus::Panes => match self.tree.navigate(dir, pane_area) {
-                Nav::ExitLeft => self.focus = Focus::Sidebar,
+                Nav::ExitLeft => self.enter_sidebar(),
                 // The minis sit below and to the right of the panes, so hitting the bottom or right
                 // edge drops into the last-focused mini (adjacent to the main area).
                 Nav::Stay if matches!(dir, Dir::Down | Dir::Right) && !self.minis.is_empty() => {
@@ -1067,16 +1067,34 @@ impl App {
                 // The minis also sit to the *right* of the main pane, so left off the leftmost
                 // enters the panes (falling through to the sidebar only when there are none).
                 Dir::Left if !self.tree.is_empty() => self.focus = Focus::Panes,
-                Dir::Left => self.focus = Focus::Sidebar,
+                Dir::Left => self.enter_sidebar(),
                 Dir::Right if i + 1 < self.minis.len() => self.focus = Focus::Mini(i + 1),
                 // Climb back into the main layout (minis sit below it too).
                 Dir::Up if !self.tree.is_empty() => self.focus = Focus::Panes,
-                Dir::Up => self.focus = Focus::Sidebar,
+                Dir::Up => self.enter_sidebar(),
                 _ => {}
             },
         }
         if let Focus::Mini(i) = self.focus {
             self.last_mini = i;
+        }
+    }
+
+    /// Move focus into the sidebar by navigation, homing the cursor on the **recent** block. Coming
+    /// back from a pane, the useful next target is another recently-opened agent (usually in a
+    /// different repo), not wherever the cursor was last parked down in the full repo list — so a
+    /// deliberate move into the nav resets to the top of recents. Falls back to the first selectable
+    /// row when the recent block is not shown (too few agents).
+    fn enter_sidebar(&mut self) {
+        self.focus = Focus::Sidebar;
+        let rows = self.sidebar_rows();
+        let target = rows
+            .iter()
+            .copied()
+            .find(|r| matches!(r, Row::Recent(_)))
+            .or_else(|| rows.iter().copied().find(|r| r.selectable()));
+        if let Some(row) = target {
+            self.place_sidebar_sel(row);
         }
     }
 
@@ -6155,6 +6173,45 @@ mod tests {
             "strict MRU: the long-idle blocked agent stays last"
         );
         assert!(recent_ids(&[], Utc::now()).is_empty());
+    }
+
+    /// Navigating out of a pane into the sidebar homes the cursor on the recent block, not wherever
+    /// it was last parked down in the repo list — coming back from a pane, the next agent you want is
+    /// almost always a recent one, often in another repo.
+    #[test]
+    fn navigating_into_the_sidebar_homes_to_recents() {
+        let (mut app, _ids) = app_with_two_repos(4, 3);
+        assert!(
+            app.sidebar_rows()
+                .iter()
+                .any(|r| matches!(r, Row::Recent(_))),
+            "precondition: the recent block is shown"
+        );
+        // Park the cursor deep in the repo list, as if the user had navigated down to a repo group.
+        let deep = app
+            .sidebar_rows()
+            .into_iter()
+            .rev()
+            .find(|r| matches!(r, Row::Agent(_) | Row::Repo(_)))
+            .expect("a repo/agent row exists");
+        app.place_sidebar_sel(deep);
+        assert!(
+            !matches!(app.sidebar_sel, Some(Row::Recent(_))),
+            "precondition: parked off the recent block"
+        );
+
+        // Focus a pane, then navigate left out of it into the sidebar.
+        let t = TerminalId::new();
+        app.tree.open(t);
+        app.focus = Focus::Panes;
+        app.navigate(Dir::Left);
+
+        assert_eq!(app.focus, Focus::Sidebar);
+        assert!(
+            matches!(app.sidebar_sel, Some(Row::Recent(_))),
+            "entering the sidebar homes to recents, got {:?}",
+            app.sidebar_sel
+        );
     }
 
     /// The block earns its five rows or it does not appear: with one repo the roster is already MRU,
