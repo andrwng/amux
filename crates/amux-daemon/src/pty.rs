@@ -168,9 +168,13 @@ const OUTPUT_BACKLOG: usize = 1024;
 /// the reply and swallows the user's keystrokes while it waits. `gh auth login` hung exactly this
 /// way at its first text prompt (survey asks DSR-CPR before drawing an editable line).
 ///
-/// The whitelist is deliberately tiny: reply only to what we can answer truthfully, and leave every
-/// other query as silently ignored (which is what it was before). `cursor` is vt100's 0-based
-/// `(row, col)` and `size` its `(rows, cols)`; every reply is 1-based and inside the screen.
+/// The whitelist covers the queries a CLI is likely to *block* on — cursor position (DSR-CPR),
+/// status (DSR), and primary/secondary device attributes (DA1/DA2) — plus XTVERSION, all answered
+/// with a conservative identity so nothing gates risky output on a capability we lack. Every other
+/// query is silently ignored, which for capability probes (kitty keyboard, DECRQM) is the correct
+/// "unsupported" answer: the app times out and falls back to behavior amux actually handles.
+/// Answering a capability we don't implement would be worse than silence. `cursor` is vt100's
+/// 0-based `(row, col)` and `size` its `(rows, cols)`; every reply is 1-based and inside the screen.
 ///
 /// The clamp is load-bearing. vt100 represents a pending wrap — the cursor resting at the right
 /// margin after a character landed in the last column — as `col == cols`, which is not a position
@@ -199,6 +203,18 @@ fn query_reply(
         // DA1 — "what are you?". `ESC[c` and `ESC[0c` are the same request. VT100 with AVO, the
         // same identity tmux reports.
         (None, 'c', None | Some(0)) => Some(b"\x1b[?1;2c".to_vec()),
+        // DA2 (secondary device attributes) — `ESC[>c` / `ESC[>0c`. A CLI that blocks on this
+        // (as `gh` did on DSR) would wedge forever unanswered. Report a conservative identity —
+        // terminal type 0, version 0 — so nothing gates advanced output on a version we don't have.
+        (Some(b'>'), 'c', None | Some(0)) => Some(b"\x1b[>0;0;0c".to_vec()),
+        // XTVERSION — `ESC[>q` / `ESC[>0q` (Claude Code sends this at startup). Reply the DCS name
+        // string; identifying as "amux" (unknown to feature-detectors) keeps apps on safe defaults.
+        (Some(b'>'), 'q', None | Some(0)) => Some(b"\x1bP>|amux\x1b\\".to_vec()),
+        // Deliberately NOT answered: the kitty keyboard query `ESC[?u`. A reply *claims* support for
+        // the progressive-enhancement protocol, which would make the app expect kitty-encoded key
+        // events — an encoding amux's input layer does not produce, so answering would break keys.
+        // Silence is the correct "unsupported" signal; the app falls back to legacy keys, which we
+        // do send. (Revisit if amux ever encodes kitty key events.)
         _ => None,
     }
 }
@@ -996,6 +1012,59 @@ mod tests {
         );
     }
 
+    /// Design-premise check for the server-authoritative question: the TUI client is NOT an
+    /// independent re-derivation that can drift from the daemon — it is a faithful mirror, because it
+    /// is built from the daemon's own `snapshot_bytes` and then fed the daemon's own byte stream, and
+    /// re-synced from a fresh snapshot on every resize (exactly what `server::attach`/the `Resize`
+    /// handler do). This test walks that lifecycle — attach, live stream, resize+re-snapshot, more
+    /// stream — and asserts the client's visible screen equals the daemon's at every seam. If it
+    /// holds, shipping rendered cells instead of bytes cannot change the picture the user sees: any
+    /// blank/condensed screen is the *daemon grid itself*, and the fix belongs in the grid/resize
+    /// model, not the render transport.
+    #[test]
+    fn client_reconstruction_mirrors_the_daemon_across_a_resize() {
+        let visible = |p: &vt100::Parser| {
+            let s = p.screen();
+            (s.contents(), s.cursor_position(), s.alternate_screen())
+        };
+        // Feed both a daemon parser and a client parser built from the daemon's snapshot the *same*
+        // subsequent bytes — the live-stream model (`DaemonMsg::Output` is the raw PTY stream both
+        // sides see).
+        let mut daemon = vt100::Parser::new(24, 80, 0);
+        daemon.process(b"\x1b[2J\x1b[H");
+        for i in 0..30 {
+            daemon.process(format!("line {i}\r\n").as_bytes());
+        }
+        let mut client = vt100::Parser::new(24, 80, 0);
+        client.process(&snapshot_bytes(daemon.screen()));
+        assert_eq!(visible(&client), visible(&daemon), "after attach snapshot");
+
+        let live = b"\x1b[10;1Hedited a line\x1b[38;2;0;200;0mgreen\x1b[0m";
+        daemon.process(live);
+        client.process(live);
+        assert_eq!(visible(&client), visible(&daemon), "after a live chunk");
+
+        // A resize on the daemon (its vendored keep-bottom `set_size`), then the daemon re-snapshots
+        // and the client rebuilds from it — the real reattach/resize path.
+        daemon.screen_mut().set_size(10, 40);
+        let mut client = vt100::Parser::new(10, 40, 0);
+        client.process(&snapshot_bytes(daemon.screen()));
+        assert_eq!(
+            visible(&client),
+            visible(&daemon),
+            "after a resize + fresh snapshot — the client mirrors even the shrunk grid"
+        );
+
+        let more = b"\x1b[1;1Hafter resize";
+        daemon.process(more);
+        client.process(more);
+        assert_eq!(
+            visible(&client),
+            visible(&daemon),
+            "and stays in lockstep on the post-resize stream"
+        );
+    }
+
     /// The freeze regression: a child that stops reading its stdin must not wedge the pane. Writes
     /// go through a dedicated writer thread, so `write_input` only ever enqueues — it must return
     /// promptly even when the child never drains, where the old design (a blocking write on the
@@ -1192,6 +1261,13 @@ mod query_tests {
             // DA1: bare `ESC[c` parses as no params at all, `ESC[0c` as an explicit 0.
             ((None, &[&[0]], 'c'), b"\x1b[?1;2c"),
             ((None, &[], 'c'), b"\x1b[?1;2c"),
+            // DA2 (`ESC[>c` / `ESC[>0c`): a conservative secondary identity, so a CLI that blocks
+            // on it does not wedge and nothing gates output on a version we lack.
+            ((Some(b'>'), &[], 'c'), b"\x1b[>0;0;0c"),
+            ((Some(b'>'), &[&[0]], 'c'), b"\x1b[>0;0;0c"),
+            // XTVERSION (`ESC[>q` / `ESC[>0q`, Claude Code sends it): the DCS name string.
+            ((Some(b'>'), &[], 'q'), b"\x1bP>|amux\x1b\\"),
+            ((Some(b'>'), &[&[0]], 'q'), b"\x1bP>|amux\x1b\\"),
         ];
         for ((i1, params, c), want) in cases {
             assert_eq!(
@@ -1207,8 +1283,9 @@ mod query_tests {
         let cases: &[Query] = &[
             (None, &[&[3]], 'n'),       // DSR-3, printer status: not ours to answer
             (None, &[&[1]], 'c'),       // DA1 with a param we don't recognize
-            (Some(b'>'), &[], 'c'),     // DA2 — deliberately out of scope
-            (Some(b'>'), &[], 'q'),     // XTVERSION — deliberately out of scope
+            (Some(b'>'), &[&[1]], 'c'), // DA2 with an unrecognized param
+            (Some(b'?'), &[], 'u'),     // kitty keyboard query — answering claims a protocol we
+            // don't encode, so silence is the correct "unsupported" signal (the app falls back).
             (Some(b'?'), &[&[5]], 'n'), // no DECDSR-5 in the whitelist
             (None, &[&[1]], 'z'),       // not a query at all
         ];
