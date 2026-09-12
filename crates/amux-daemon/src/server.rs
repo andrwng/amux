@@ -15,7 +15,7 @@ use nix::fcntl::{Flock, FlockArg};
 use nix::sys::signal::{kill, Signal};
 use nix::unistd::Pid;
 use tokio::net::{UnixListener, UnixStream};
-use tokio::sync::broadcast::error::RecvError;
+use tokio::sync::broadcast::error::{RecvError, TryRecvError};
 use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
 use tokio_util::codec::Framed;
@@ -505,27 +505,64 @@ fn attach(
     // subscribe would be lost. Subscribing first can instead duplicate a few bytes into both the
     // snapshot and the stream, which is harmless (a terminal redrawing identical cells is
     // idempotent); a dropped byte is not.
-    let mut rx = session.subscribe();
+    let rx = session.subscribe();
     let _ = out_tx.send(DaemonMsg::OutputSnapshot {
         terminal,
         size: session.size(),
         bytes: session.snapshot(),
     });
-    let tx = out_tx.clone();
-    let forwarder = tokio::spawn(async move {
-        loop {
-            match rx.recv().await {
-                Ok(bytes) => {
-                    if tx.send(DaemonMsg::Output { terminal, bytes }).is_err() {
-                        break;
+    let forwarder = tokio::spawn(forward_output(
+        rx,
+        out_tx.clone(),
+        terminal,
+        session.clone(),
+    ));
+    attached.insert(terminal, forwarder);
+}
+
+/// Forward a terminal's broadcast output to one client, resyncing on lag.
+///
+/// The happy path relays each raw chunk as `Output`. On `Lagged` the broadcast has dropped chunks
+/// this client never saw, so its parser has diverged from the daemon's grid — and the chunks still
+/// buffered can't simply be replayed (they draw relative to a cursor that has since moved). We drain
+/// the backlog (all of it is already reflected in the current grid) and send a fresh snapshot, so
+/// the client rebuilds from the authoritative screen instead of rendering a corrupted one. Factored
+/// out of `attach` so the resync is unit-testable (`lag_triggers_a_resync_snapshot`).
+async fn forward_output(
+    mut rx: tokio::sync::broadcast::Receiver<Vec<u8>>,
+    tx: mpsc::UnboundedSender<DaemonMsg>,
+    terminal: TerminalId,
+    session: Arc<crate::pty::Session>,
+) {
+    loop {
+        match rx.recv().await {
+            Ok(bytes) => {
+                if tx.send(DaemonMsg::Output { terminal, bytes }).is_err() {
+                    break;
+                }
+            }
+            Err(RecvError::Lagged(_)) => {
+                loop {
+                    match rx.try_recv() {
+                        Ok(_) | Err(TryRecvError::Lagged(_)) => continue,
+                        Err(TryRecvError::Empty) => break,
+                        Err(TryRecvError::Closed) => return,
                     }
                 }
-                Err(RecvError::Lagged(_)) => {}
-                Err(RecvError::Closed) => break,
+                if tx
+                    .send(DaemonMsg::OutputSnapshot {
+                        terminal,
+                        size: session.size(),
+                        bytes: session.snapshot(),
+                    })
+                    .is_err()
+                {
+                    break;
+                }
             }
+            Err(RecvError::Closed) => break,
         }
-    });
-    attached.insert(terminal, forwarder);
+    }
 }
 
 /// Where each scrolled-back terminal's view sits for *this* client, and how deep history was when
@@ -573,5 +610,52 @@ fn scroll_view(
 fn detach(attached: &mut Attachments, terminal: TerminalId) {
     if let Some(forwarder) = attached.remove(&terminal) {
         forwarder.abort();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use amux_proto::Size;
+    use std::path::Path;
+    use std::time::Duration;
+
+    /// A client that falls behind the broadcast (dropped chunks) must be resynced with a fresh
+    /// snapshot, not left silently rendering a diverged screen. `forward_output` is fed a receiver
+    /// that is already lagged (the channel overflowed before it read), and must answer with an
+    /// `OutputSnapshot` rather than replaying the stale backlog. This is the resync `OUTPUT_BACKLOG`
+    /// promises; before the fix the `Lagged` arm dropped the error and the client stayed wrong.
+    #[tokio::test]
+    async fn lag_triggers_a_resync_snapshot() {
+        // A tiny broadcast overflowed before the receiver reads → its next recv is `Lagged`.
+        let (btx, brx) = tokio::sync::broadcast::channel::<Vec<u8>>(4);
+        for i in 0..12u8 {
+            let _ = btx.send(vec![b'x'; usize::from(i) + 1]);
+        }
+
+        // A real session only so `forward_output` has a grid to snapshot.
+        let session = crate::pty::Session::spawn(
+            &["sh".into(), "-c".into(), "printf hi; exec cat".into()],
+            Path::new("/"),
+            &[],
+            Size { cols: 40, rows: 10 },
+        )
+        .expect("spawn");
+
+        let (out_tx, mut out_rx) = mpsc::unbounded_channel();
+        let terminal = TerminalId::new();
+        let handle = tokio::spawn(forward_output(brx, out_tx, terminal, session.clone()));
+
+        let msg = tokio::time::timeout(Duration::from_secs(2), out_rx.recv())
+            .await
+            .expect("forward_output should respond to lag promptly")
+            .expect("a message");
+        assert!(
+            matches!(msg, DaemonMsg::OutputSnapshot { terminal: t, .. } if t == terminal),
+            "a lagged client must be resynced with a snapshot, got {msg:?}"
+        );
+
+        handle.abort();
+        session.kill();
     }
 }
