@@ -127,6 +127,12 @@ fn show_recent(
 /// How many rows of the sidebar list a wheel notch scrolls, matching the pane wheel.
 const SIDEBAR_WHEEL_ROWS: usize = 3;
 
+/// How long the pane layout must be quiet before a staged resize is sent. One user action can
+/// reshape a pane through several intermediate sizes in a few milliseconds; coalescing to the
+/// final size spares the app a burst of SIGWINCHes it would otherwise collapse mid-redraw. Short
+/// enough to feel instant, long enough to swallow a reconcile burst.
+const RESIZE_DEBOUNCE: Duration = Duration::from_millis(100);
+
 /// A stored `sidebar_top` clamped to what the list can actually show: never past the last
 /// screenful, and never non-zero for a list that fits. Applied at render, so a top left behind by
 /// agents deleted underneath it corrects itself instead of showing a blank sidebar.
@@ -406,7 +412,9 @@ where
 
     render(app)?;
     loop {
-        // Phase 1 — block until one source is ready.
+        // Phase 1 — block until one source is ready. `resize_at` copies the staged-resize deadline
+        // so the branch's timer borrows nothing from `app` (the other arms need `&mut app`).
+        let resize_at = app.resize_deadline;
         let mut quit = matches!(
             tokio::select! {
                 msg = stream.next() => app.handle_daemon(msg.and_then(|r| r.ok()), sink).await?,
@@ -414,6 +422,17 @@ where
                 // No state to apply — just fall through to Phase 2/the render below so the age
                 // column redraws with a fresh "now".
                 _ = age_tick.tick() => Flow::Continue,
+                // The pane layout went quiet — send the coalesced resize(s). Pends forever when
+                // nothing is staged, so this arm only fires after a real size change settles.
+                _ = async move {
+                    match resize_at {
+                        Some(d) => tokio::time::sleep_until(d).await,
+                        None => std::future::pending::<()>().await,
+                    }
+                } => {
+                    app.flush_resizes(sink).await?;
+                    Flow::Continue
+                }
             },
             Flow::Quit
         );
@@ -500,6 +519,15 @@ struct App {
     terminals: HashMap<TerminalId, AgentId>,
     parsers: HashMap<TerminalId, vt100::Parser<Links>>,
     attached: HashMap<TerminalId, Size>,
+    /// Resize coalescing. One user action (dragging a split, opening/closing a mini) makes
+    /// `reconcile` run several times with intermediate pane sizes; sending a `Resize` for each
+    /// subjects the app to a burst of SIGWINCHes. A real terminal coalesces resize into one event
+    /// at the final size, and a diff-renderer redraws cleanly for a single resize but can end
+    /// mis-synced (blank/condensed) across a rapid burst it collapses. So a size change for an
+    /// already-shown terminal is *staged* here and flushed as one `Resize` once the layout has been
+    /// quiet for [`RESIZE_DEBOUNCE`]. `resize_deadline` is when the loop should flush.
+    staged_sizes: HashMap<TerminalId, Size>,
+    resize_deadline: Option<tokio::time::Instant>,
     /// Terminals whose foreground app wants `Ctrl+hjkl` (vim-like), so we pass those keys through
     /// instead of navigating. Announced by the daemon via `TerminalApp`.
     passthrough: HashMap<TerminalId, bool>,
@@ -566,6 +594,8 @@ impl App {
             terminals: HashMap::new(),
             parsers: HashMap::new(),
             attached: HashMap::new(),
+            staged_sizes: HashMap::new(),
+            resize_deadline: None,
             passthrough: HashMap::new(),
             focus: Focus::Sidebar,
             theme: Theme::default(),
@@ -2187,22 +2217,14 @@ impl App {
                     sink.send(ClientMsg::Attach { terminal, size }).await?;
                     self.attached.insert(terminal, size);
                 }
-                // Already shown, viewport changed: resize the daemon grid to it. The daemon
-                // re-snapshots on a real change, which resizes our parser to the new grid.
+                // Already shown, viewport changed: stage a resize and (re)arm the debounce. A burst
+                // of intermediate sizes from one user action collapses to a single Resize at the
+                // final size when the layout goes quiet (see `flush_resizes`); `attached` is updated
+                // optimistically so the next reconcile in the burst re-stages only a further change.
                 Some(prev) if prev != size => {
-                    if let Some(rec) = &self.recorder {
-                        rec.note_size(terminal, "RESIZE", size.cols, size.rows);
-                    }
-                    sink.send(ClientMsg::Resize { terminal, size }).await?;
+                    self.staged_sizes.insert(terminal, size);
                     self.attached.insert(terminal, size);
-                    // A scrolled-back window was rendered for its old size; re-serve it.
-                    if self
-                        .scroll
-                        .as_ref()
-                        .is_some_and(|sc| sc.terminal == terminal)
-                    {
-                        sink.send(ClientMsg::Scroll { terminal, lines: 0 }).await?;
-                    }
+                    self.resize_deadline = Some(tokio::time::Instant::now() + RESIZE_DEBOUNCE);
                 }
                 Some(_) => {}
             }
@@ -2219,6 +2241,7 @@ impl App {
             // closed/killed already). Keep the terminal→agent mapping + passthrough for restore.
             sink.send(ClientMsg::Detach { terminal }).await?;
             self.attached.remove(&terminal);
+            self.staged_sizes.remove(&terminal);
             self.parsers.remove(&terminal);
             // The daemon drops our scroll position on detach, so hold no window for it either —
             // otherwise returning to this pane would show a stale scrolled view whose next step
@@ -2244,6 +2267,33 @@ impl App {
         sink.send(ClientMsg::SetActive(self.active_agent)).await?;
         sink.send(ClientMsg::SetPrevious(self.prev_active_agent))
             .await?;
+        Ok(())
+    }
+
+    /// Send the resizes coalesced since the last flush, one `Resize` per terminal at its final size
+    /// (see `staged_sizes`). Fired by the event loop once the layout has been quiet for
+    /// [`RESIZE_DEBOUNCE`]. The daemon re-snapshots on a real change, which resizes our parser to
+    /// match the new grid; a scrolled-back pane is re-served at the new size.
+    async fn flush_resizes(&mut self, sink: &mut Sink) -> Result<()> {
+        self.resize_deadline = None;
+        let staged: Vec<(TerminalId, Size)> = self.staged_sizes.drain().collect();
+        for (terminal, size) in staged {
+            // Skip a terminal detached since it was staged (its `attached` entry is gone).
+            if self.attached.get(&terminal) != Some(&size) {
+                continue;
+            }
+            if let Some(rec) = &self.recorder {
+                rec.note_size(terminal, "RESIZE", size.cols, size.rows);
+            }
+            sink.send(ClientMsg::Resize { terminal, size }).await?;
+            if self
+                .scroll
+                .as_ref()
+                .is_some_and(|sc| sc.terminal == terminal)
+            {
+                sink.send(ClientMsg::Scroll { terminal, lines: 0 }).await?;
+            }
+        }
         Ok(())
     }
 
@@ -6173,6 +6223,61 @@ mod tests {
             "strict MRU: the long-idle blocked agent stays last"
         );
         assert!(recent_ids(&[], Utc::now()).is_empty());
+    }
+
+    /// A burst of size changes from one user action must coalesce into a single `Resize` at the
+    /// final size — a real terminal delivers one resize when you finish, and a diff-renderer that
+    /// coalesces the SIGWINCHes can end mis-synced (blank/condensed) across a rapid burst. The
+    /// resize is staged and flushed once the layout settles, not sent per intermediate size.
+    #[tokio::test]
+    async fn resizes_are_coalesced_into_one() {
+        async fn drain(server: &mut Framed<UnixStream, amux_proto::ServerCodec>) -> Vec<ClientMsg> {
+            let mut out = Vec::new();
+            while let Some(m) = next_msg(server).await {
+                out.push(m);
+            }
+            out
+        }
+
+        let (mut sink, mut server) = test_server();
+        let mut app = App::new(120, 40);
+        app.restoring = false;
+        let t = TerminalId::new();
+        let a = agent_info(t);
+        let id = a.id;
+        app.agents = vec![a];
+        let _ = app.swap_to_agent(id);
+        app.reconcile(&mut sink).await.unwrap();
+        drain(&mut server).await; // the initial Attach + Set* bookkeeping
+
+        // Two rapid size changes (one user action's worth of reconciles).
+        app.on_resize(90, 30, &mut sink).await.unwrap();
+        app.on_resize(70, 24, &mut sink).await.unwrap();
+
+        let during = drain(&mut server).await;
+        assert!(
+            !during.iter().any(|m| matches!(m, ClientMsg::Resize { .. })),
+            "resize is debounced, not sent for each intermediate size"
+        );
+        assert!(app.resize_deadline.is_some(), "a flush is armed");
+        let final_size = *app.staged_sizes.get(&t).expect("the final size is staged");
+
+        // Layout settled → flush.
+        app.flush_resizes(&mut sink).await.unwrap();
+        let after = drain(&mut server).await;
+        let resizes: Vec<(TerminalId, Size)> = after
+            .iter()
+            .filter_map(|m| match m {
+                ClientMsg::Resize { terminal, size } => Some((*terminal, *size)),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            resizes,
+            vec![(t, final_size)],
+            "exactly one coalesced resize, at the final size"
+        );
+        assert!(app.staged_sizes.is_empty() && app.resize_deadline.is_none());
     }
 
     /// Navigating out of a pane into the sidebar homes the cursor on the recent block, not wherever

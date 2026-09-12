@@ -358,6 +358,17 @@ the proven mosh/agentapi-style split:
   stale — a blank that *never* self-healed. (`Session::resize` is exact; `resize_is_exact`,
   `shrinking_the_grid_keeps_the_most_recent_rows`, and `reattaching_resizes_the_grid_to_the_client`
   are the guards.)
+- **Resize coalescing.** One user action — dragging a split, opening or closing a mini — makes the
+  client's `reconcile` run several times with intermediate pane sizes. Sending a `Resize` for each
+  subjects the app to a burst of SIGWINCHes within milliseconds. A real terminal never does this: it
+  delivers one resize when you finish. A diff-renderer (ink/Claude Code) redraws cleanly for a single
+  resize but can end mis-synced — blank or condensed — across a rapid burst it collapses into one
+  read at the final size while the grid was mutated between them (observed as a pane resized
+  45→39→29 in ~100ms that never recovered). So the client *stages* a size change for an already-shown
+  terminal and flushes it as a single `Resize` once the layout has been quiet for `RESIZE_DEBOUNCE`
+  (`App::flush_resizes`, fired from the event loop; `resizes_are_coalesced_into_one` is the guard).
+  A first attach is still immediate — it needs the snapshot now. This does not revive an app already
+  wedged by a past burst (that needs the agent restarted); it stops new ones from wedging.
 - **Repaint kick when a reattach lands on an empty grid.** One blank does not come from resizing at
   all: a diff-renderer that cleared its screen and went idle leaves the daemon grid blank, and a
   reattach *at the same size* (the common reconnect) fires no SIGWINCH, so the app is never prompted
