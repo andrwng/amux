@@ -475,6 +475,10 @@ fn attach(
     // the new size — so the pane is never left frozen at a stale size, and never blank while the
     // app repaints in response to SIGWINCH. See `Session::resize`.
     let resized = session.resize(size).unwrap_or(false);
+    session.trace_event(&format!(
+        "ATTACH req={}x{} resized={resized}",
+        size.cols, size.rows
+    ));
 
     // Kick a repaint when a same-size reattach lands on an *empty* grid. A diff-rendering app
     // (ink/Claude Code) that cleared its screen and went idle leaves the grid blank; a no-op resize

@@ -13,6 +13,7 @@
 
 use std::io::{Read, Write};
 use std::path::Path;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::thread::{self, JoinHandle};
 use std::time::Duration;
@@ -65,6 +66,45 @@ fn terminfo_exists(name: &str) -> bool {
 /// history. 5000 lines is ~25 screenfuls under `less`-like use and covers a long agent
 /// conversation; a session that never scrolls costs nothing.
 const SCROLLBACK: usize = 5000;
+
+/// Continuous, per-session grid tracing for the blank-pane investigation. Env-gated
+/// (`AMUX_GRID_TRACE=<path>`), so it is entirely off — no allocation, no cell scan — unless set.
+/// Unlike the client-side `AMUX_RECORD` tap (which resets on every TUI reattach and so always
+/// *starts* after the grid is already blank), this lives in the daemon and spans the whole session
+/// lifetime: it records the exact event that turns a grid content→blank (an app `2J`, a resize, an
+/// attach), which is the one fact needed to fix the right layer.
+static SESSION_SEQ: AtomicU64 = AtomicU64::new(0);
+
+fn grid_trace_path() -> Option<&'static Path> {
+    static P: OnceLock<Option<std::path::PathBuf>> = OnceLock::new();
+    P.get_or_init(|| std::env::var_os("AMUX_GRID_TRACE").map(std::path::PathBuf::from))
+        .as_deref()
+}
+
+fn gtrace(msg: &str) {
+    let Some(path) = grid_trace_path() else {
+        return;
+    };
+    let ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis())
+        .unwrap_or(0);
+    if let Ok(mut f) = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(path)
+    {
+        let _ = writeln!(f, "{ms} {msg}");
+    }
+}
+
+/// Number of visible rows that hold any text — the "is the screen blank?" signal for tracing.
+fn nonblank_rows(screen: &vt100::Screen) -> usize {
+    let (rows, cols) = screen.size();
+    (0..rows)
+        .filter(|&y| (0..cols).any(|x| screen.cell(y, x).is_some_and(|c| !c.contents().is_empty())))
+        .count()
+}
 
 /// Where a client's scrolled-back window sits, and how deep history was when it was served.
 ///
@@ -278,6 +318,8 @@ pub struct Session {
     exit_rx: watch::Receiver<bool>,
     exit_code: Arc<Mutex<Option<i32>>>,
     threads: Mutex<Vec<JoinHandle<()>>>,
+    /// Process-wide session number, for correlating grid-trace lines (see `gtrace`).
+    sid: u64,
 }
 
 impl Session {
@@ -288,6 +330,12 @@ impl Session {
         size: Size,
     ) -> Result<Arc<Self>> {
         anyhow::ensure!(!command.is_empty(), "cannot spawn an empty command");
+
+        let sid = SESSION_SEQ.fetch_add(1, Ordering::Relaxed);
+        gtrace(&format!(
+            "sid={sid} spawn cmd={} {}x{}",
+            command[0], size.cols, size.rows
+        ));
 
         let pty = native_pty_system();
         let pair = pty
@@ -351,6 +399,7 @@ impl Session {
         let reader_input_tx = input_tx.clone();
         let reader_thread = thread::spawn(move || {
             let mut buf = [0u8; 8192];
+            let mut prev_nb: usize = 0; // for grid-trace transition detection
             loop {
                 match reader.read(&mut buf) {
                     Ok(0) => break,
@@ -360,9 +409,28 @@ impl Session {
                         // parser lock — see `Queries` — and only by enqueuing: a blocking write here
                         // would stall reading. Best-effort, so drop the reply if the queue is full.
                         let mut reply = Vec::new();
+                        let mut traced: Option<(usize, (u16, u16))> = None;
                         if let Ok(mut parser) = reader_parser.lock() {
                             parser.process(chunk);
                             reply.append(&mut parser.callbacks_mut().pending);
+                            if grid_trace_path().is_some() {
+                                traced =
+                                    Some((nonblank_rows(parser.screen()), parser.screen().size()));
+                            }
+                        }
+                        // Log a content↔blank transition and what drove it — the app's own output
+                        // for this chunk (a `2J`/`ED` clear is the usual culprit).
+                        if let Some((nb, (rows, cols))) = traced {
+                            let blanked = prev_nb >= 4 && nb <= 1;
+                            let filled = prev_nb <= 1 && nb >= 4;
+                            if blanked || filled {
+                                let c2j = chunk.windows(4).any(|w| w == b"\x1b[2J");
+                                let cj = chunk.windows(3).any(|w| w == b"\x1b[J");
+                                gtrace(&format!(
+                                    "sid={sid} OUTPUT grid {prev_nb}->{nb} {cols}x{rows} 2J={c2j} J={cj} len={n}"
+                                ));
+                            }
+                            prev_nb = nb;
                         }
                         if !reply.is_empty() {
                             let _ = reader_input_tx.try_send(reply);
@@ -396,6 +464,7 @@ impl Session {
             exit_rx,
             exit_code,
             threads: Mutex::new(vec![reader_thread, writer_thread, waiter_thread]),
+            sid,
         }))
     }
 
@@ -553,8 +622,22 @@ impl Session {
         if (size.rows, size.cols) == (cur_rows, cur_cols) {
             return Ok(false);
         }
+        let nb_before = if grid_trace_path().is_some() {
+            nonblank_rows(parser.screen())
+        } else {
+            0
+        };
         parser.screen_mut().set_size(size.rows, size.cols);
+        let nb_after = if grid_trace_path().is_some() {
+            nonblank_rows(parser.screen())
+        } else {
+            0
+        };
         drop(parser);
+        gtrace(&format!(
+            "sid={} RESIZE {cur_cols}x{cur_rows}->{}x{} nb {nb_before}->{nb_after}",
+            self.sid, size.cols, size.rows
+        ));
         let io = self.io.lock().unwrap();
         io.master
             .resize(PtySize {
@@ -565,6 +648,23 @@ impl Session {
             })
             .context("resize pty")?;
         Ok(true)
+    }
+
+    /// Log a named lifecycle event (e.g. an attach) against this session's grid — no-op unless
+    /// `AMUX_GRID_TRACE` is set. Lets the server correlate attach with the grid's blank state.
+    pub fn trace_event(&self, event: &str) {
+        if grid_trace_path().is_none() {
+            return;
+        }
+        let (nb, rows, cols) = self
+            .parser
+            .lock()
+            .map(|p| {
+                let (r, c) = p.screen().size();
+                (nonblank_rows(p.screen()), r, c)
+            })
+            .unwrap_or((0, 0, 0));
+        gtrace(&format!("sid={} {event} nb={nb} {cols}x{rows}", self.sid));
     }
 
     /// Terminate the child by PID (SIGKILL). The waiter thread then reaps and flips the watch.
