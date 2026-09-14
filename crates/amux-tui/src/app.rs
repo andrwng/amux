@@ -1933,6 +1933,10 @@ impl App {
     fn selection_text(&self) -> Option<String> {
         let sel = self.selection?;
         let screen = self.parsers.get(&sel.terminal)?.screen();
+        // A split pane shows the grid's bottom rows (see `render_screen`), so a visible frame row
+        // maps to a grid row `row_off` lower. Zero for the full-size main pane, so this is a no-op
+        // there and reads the exact visible text in a cropped split.
+        let row_off = crop_row_offset(screen, sel.inner);
         let (start, end) = ordered(sel.anchor, sel.head);
         let right = sel.inner.x + sel.inner.width.saturating_sub(1);
         let mut out = String::new();
@@ -1942,7 +1946,7 @@ impl App {
             let mut line = String::new();
             for x in c0..=c1 {
                 let contents = screen
-                    .cell(y - sel.inner.y, x - sel.inner.x)
+                    .cell((y - sel.inner.y) + row_off, x - sel.inner.x)
                     .map(|c| c.contents())
                     .unwrap_or_default();
                 if contents.is_empty() {
@@ -1955,7 +1959,7 @@ impl App {
             // and gets no separator: re-inserting a break the program never printed would corrupt a
             // URL (or any long token) on paste. A row that ends because the program printed a
             // newline is trimmed and separated as before.
-            let wrapped = screen.row_wrapped(y - sel.inner.y) && c1 == right;
+            let wrapped = screen.row_wrapped((y - sel.inner.y) + row_off) && c1 == right;
             if !wrapped {
                 while line.ends_with(' ') {
                     line.pop();
@@ -3593,6 +3597,42 @@ fn age_short(ts: DateTime<Utc>) -> String {
     }
 }
 
+/// How many rows of a terminal's grid are hidden above a pane that is shorter than the grid. A
+/// main-tree terminal is sized to the whole main area (`App::reconcile`), so a split pane is
+/// shorter than its grid and must show the grid's **bottom** rows — where a terminal UI keeps its
+/// cursor and most recent output. This is that offset; 0 when the grid fits (the common main pane).
+fn crop_row_offset(screen: &vt100::Screen, inner: Rect) -> u16 {
+    screen.size().0.saturating_sub(inner.height)
+}
+
+/// Render `screen` into `inner`, **bottom-anchored**: when the grid is taller than the pane, show
+/// its last `inner.height` rows (not the top — a diff-rendering TUI's content and prompt live at
+/// the bottom, so a top-anchored crop shows blank header rows, which is the split-pane "blank" bug).
+/// Columns are left-anchored. When the grid fits, it's a plain render.
+fn render_screen(frame: &mut Frame, inner: Rect, screen: &vt100::Screen) {
+    use ratatui::widgets::Widget;
+    let (grows, gcols) = screen.size();
+    if grows <= inner.height && gcols <= inner.width {
+        frame.render_widget(PseudoTerminal::new(screen), inner);
+        return;
+    }
+    // Render the whole grid into a scratch buffer, then blit its bottom-left window into the pane.
+    let full = Rect::new(0, 0, gcols, grows);
+    let mut scratch = Buffer::empty(full);
+    PseudoTerminal::new(screen).render(full, &mut scratch);
+    let row_off = grows.saturating_sub(inner.height);
+    let buf = frame.buffer_mut();
+    for y in 0..inner.height.min(grows) {
+        for x in 0..inner.width.min(gcols) {
+            if let Some(src) = scratch.cell((x, row_off + y)) {
+                if let Some(dst) = buf.cell_mut((inner.x + x, inner.y + y)) {
+                    *dst = src.clone();
+                }
+            }
+        }
+    }
+}
+
 fn render_panes(frame: &mut Frame, area: Rect, app: &App) {
     if app.tree.is_empty() {
         let block = Block::default()
@@ -3658,8 +3698,9 @@ fn render_panes(frame: &mut Frame, area: Rect, app: &App) {
         frame.render_widget(block, place.rect);
 
         // A scrolled-back pane renders the window the daemon served; everything else renders live.
+        // Bottom-anchored when the grid is taller than the pane (a split of the stable home grid).
         match place.payload.and_then(|t| app.screen_for(t)) {
-            Some(screen) => frame.render_widget(PseudoTerminal::new(screen), inner),
+            Some(screen) => render_screen(frame, inner, screen),
             None => frame.render_widget(
                 Paragraph::new("  \u{2026}").style(Style::default().fg(Color::DarkGray)),
                 inner,
@@ -3672,9 +3713,14 @@ fn render_panes(frame: &mut Frame, area: Rect, app: &App) {
             }
         }
         // Links last: a carrier cell holds one style, so marking after the highlight lets the
-        // selection's edges fall on run boundaries instead of being swallowed by a `Skip`.
+        // selection's edges fall on run boundaries instead of being swallowed by a `Skip`. Skipped
+        // for a cropped pane: `mark_links` reads link positions from the top of the grid, but a
+        // cropped pane shows the bottom, so marking would place carrier cells over the wrong
+        // (bottom) cells and corrupt them. The full-size main pane (no crop) still gets links.
         if let Some(parser) = place.payload.and_then(|t| app.parser_for(t)) {
-            mark_links(frame.buffer_mut(), parser, inner);
+            if crop_row_offset(parser.screen(), inner) == 0 {
+                mark_links(frame.buffer_mut(), parser, inner);
+            }
         }
     }
 }
@@ -4277,6 +4323,39 @@ mod tests {
         assert_eq!(app.active_agent, Some(ids[2]));
         assert_eq!(app.minis, vec![ids[1], ids[0]]);
         assert_eq!(app.focus, Focus::Panes);
+    }
+
+    /// A split pane is shorter than its (home-sized) grid, so it must render the grid's BOTTOM rows
+    /// — where a terminal UI keeps its recent output and prompt. A top-anchored crop would show the
+    /// blank header rows, which was the split-pane "blank" bug.
+    #[test]
+    fn a_split_pane_shows_the_bottom_of_a_taller_grid() {
+        use ratatui::{backend::TestBackend, Terminal};
+        // A 20-row grid with a blank top and content + prompt at the bottom, like an idle Claude.
+        let mut p = vt100::Parser::new(20, 40, 0);
+        p.process(b"\x1b[19;1Hrecent output line");
+        p.process(b"\x1b[20;1H> prompt");
+        let screen = p.screen();
+
+        // Render into a 5-row pane. Bottom-anchored → the last rows, including the prompt.
+        let mut term = Terminal::new(TestBackend::new(40, 5)).unwrap();
+        term.draw(|f| render_screen(f, Rect::new(0, 0, 40, 5), screen))
+            .unwrap();
+        let content: String = term
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|c| c.symbol())
+            .collect();
+        assert!(
+            content.contains("> prompt"),
+            "the bottom-anchored crop must show the prompt, got: {content:?}"
+        );
+        assert!(
+            content.contains("recent output line"),
+            "and the recent line just above it, got: {content:?}"
+        );
     }
 
     #[test]
