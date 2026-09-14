@@ -1573,7 +1573,7 @@ impl App {
         sink: &mut Sink,
     ) -> Result<Flow> {
         // A page is what the user can *see*, not the grid's height: a split pane shows a
-        // bottom-anchored crop of a home-sized grid (see `render_screen`), so paging by
+        // crop of a taller grid while a resize is in flight (see `render_screen`), so paging by
         // `attached[terminal].rows` would jump several screenfuls. Minis are sized to their cell,
         // so for them the attached size *is* the visible size.
         let page = self
@@ -1610,7 +1610,7 @@ impl App {
     }
 
     /// The rows of `terminal` actually on screen when it is a main-tree pane: its slot's content
-    /// height, which for a split is less than the home-sized grid it renders a crop of. `None` when
+    /// height, which can be less than the grid it renders a crop of mid-resize. `None` when
     /// it is not in the main tree (a mini, or not shown).
     fn visible_rows(&self, terminal: TerminalId) -> Option<u16> {
         let (pane_area, _) = self.regions();
@@ -2281,20 +2281,20 @@ impl App {
         }
         let (pane_area, minis_area) = self.regions();
         let mut desired: HashMap<TerminalId, Size> = HashMap::new();
-        // Every main-tree terminal is sized to the *whole* main area, not its split sub-rect — a
-        // stable "home" size that changes only when the main area itself does (a real terminal
-        // resize or the sidebar rail toggling), never when a split is dragged or a pane is
-        // rearranged. Splitting therefore only changes how much of the grid a pane *shows* (the
-        // renderer clips to the sub-rect), and never resizes the app. This is the whole blank-pane
-        // fix: shrinking the grid on a split ran vt100's keep-bottom `set_size`, which discards the
-        // top rows — and an idle diff-renderer, having cleared for the SIGWINCH, never repaints them
-        // back — so a divider drag left the pane blank. A stable home size never shrinks the grid,
-        // so nothing is discarded and no SIGWINCH is sent for a mere layout change. (Minis are the
-        // one exception below: a mini is a deliberate small viewport, sized to its cell.)
-        let home = pane_size(pane_area);
+        // Every main-tree terminal is sized to its own pane — the tmux model: the pty *is* the pane,
+        // and the app lays itself out for exactly the rows and columns the user can see. A split,
+        // a divider drag, or a promote/demote resizes the app; the client coalesces a burst of
+        // intermediate sizes into one `Resize` (see `flush_resizes`), and the daemon re-snapshots at
+        // the new size so our parser follows the grid. (A "home size" detour — every pane sized to
+        // the whole main area, rendering a crop — was tried and reverted: a full-screen app lays
+        // out header-at-top and prompt-at-bottom for the *grid*, so a shorter pane could never show
+        // both, and a fresh Claude in a split showed a blank pane with its header and the user's
+        // prompt cropped away. It rested on a claim that Claude Code does not repaint after a
+        // shrink; measured directly, it repaints within ~750ms after a single shrink, a grow, and a
+        // 5-step resize storm — `manual_claude_repaints_after_resizes` in the daemon.)
         for place in self.tree.layout(pane_area) {
             if let Some(t) = place.payload {
-                desired.insert(t, home);
+                desired.insert(t, pane_size(place.rect));
             }
         }
         // The minis row streams each agent's primary terminal, sized to its cell.
@@ -3326,7 +3326,7 @@ fn pane_links(screen: &vt100::Screen, width: u16, height: u16) -> Vec<PaneLink> 
 fn mark_links(buf: &mut Buffer, parser: &vt100::Parser<Links>, inner: Rect) {
     let screen = parser.screen();
     // Links live in *grid* rows; the pane may show only the grid's bottom `inner.height` rows (a
-    // split slot of the home-sized grid — see `render_screen`). Scan the whole grid so a URL near
+    // pane shorter than its grid mid-resize — see `render_screen`). Scan the whole grid so a URL near
     // the bottom is found, then translate each run to the pane row it is drawn on and drop runs
     // that are cropped away. Skipping link marking for cropped panes instead (the earlier "scope
     // cut") left a split pane with no hyperlinks at all, so a cmd+click fell back to the terminal's
@@ -4019,13 +4019,15 @@ fn age_short(ts: DateTime<Utc>) -> String {
 
 /// How many rows of a terminal's grid are hidden above a pane that is shorter than the grid.
 ///
-/// A main-tree terminal is sized to the whole main area (`App::reconcile`), so a split pane shows a
-/// window of `inner.height` rows out of a taller grid. Which window is decided by the **cursor**:
+/// In steady state the grid *is* the pane (`App::reconcile` sizes each pty to its pane), so this is
+/// 0. It is non-zero only in the window between a layout change and the daemon's re-snapshot at the
+/// new size — and for a terminal whose grid is deliberately larger than a viewport of it. Then the
+/// pane shows a window of `inner.height` rows out of the taller grid, chosen by the **cursor**:
 /// the window is bottom-anchored (the grid's last rows — where a full-screen TUI like Claude Code
 /// keeps its prompt and recent output) unless the cursor sits above it, in which case it slides up
 /// just far enough to keep the cursor row visible. A fresh shell puts its prompt and cursor on row 0
 /// of a 60-row grid; a pure bottom anchor showed rows 46..60 — all empty — so a new split pane
-/// looked dead although the daemon held a live shell. 0 when the grid fits (the common main pane).
+/// looked dead although the daemon held a live shell.
 ///
 /// This is the single source for the crop, shared by rendering, selection/copy, double-click, and
 /// link marking so a click always lands on the cell it appears over.
@@ -4134,7 +4136,7 @@ fn render_panes(frame: &mut Frame, area: Rect, app: &App) {
         frame.render_widget(block, place.rect);
 
         // A scrolled-back pane renders the window the daemon served; everything else renders live.
-        // Bottom-anchored when the grid is taller than the pane (a split of the stable home grid).
+        // Cropped through `crop_row_offset` when the grid is taller than the pane (mid-resize).
         match place.payload.and_then(|t| app.screen_for(t)) {
             Some(screen) => render_screen(frame, inner, screen),
             None => frame.render_widget(
@@ -4560,7 +4562,7 @@ mod tests {
         }
     }
 
-    /// In a split, a pane renders a bottom-anchored crop of the home-sized grid, so a "page" must be
+    /// While a resize is in flight a pane renders a crop of a taller grid, so a "page" must be
     /// the pane's *visible* rows — paging by the grid height jumped several screenfuls per key.
     #[tokio::test]
     async fn paging_in_a_split_pane_moves_by_the_visible_rows() {
@@ -4799,7 +4801,7 @@ mod tests {
         assert_eq!(app.focus, Focus::Panes);
     }
 
-    /// A split pane is shorter than its (home-sized) grid, so it must render the grid's BOTTOM rows
+    /// A pane shorter than its grid (mid-resize) must render the grid's BOTTOM rows
     /// — where a terminal UI keeps its recent output and prompt. A top-anchored crop would show the
     /// blank header rows, which was the split-pane "blank" bug.
     #[test]
@@ -4900,7 +4902,7 @@ mod tests {
         );
     }
 
-    /// A split pane shows the bottom of a taller home-sized grid. Links in that visible window must
+    /// A pane showing the bottom of a taller grid (mid-resize). Links in that visible window must
     /// still be marked — on the *pane* row they are drawn on, not the grid row. Skipping link
     /// marking for cropped panes left them with no hyperlinks at all, so a cmd+click on the wrapped
     /// login URL fell back to the terminal's own text scan across the pane border (`…code│%2F…`).
@@ -4949,14 +4951,14 @@ mod tests {
     }
 
     /// A freshly spawned shell draws its prompt on grid row 0 with the cursor near the top. Its
-    /// grid is the home size (the whole main area), but its pane is a split slot shorter than that,
+    /// grid is taller than the pane (a resize still in flight, or a viewport of a bigger grid),
     /// so the bottom-anchored crop shows the grid's *bottom* rows — and row 0 is cropped away. The
     /// user sees a blank pane although the daemon holds a live shell with a prompt. The crop must
     /// follow the cursor: a screen whose content sits above the bottom window must show that
     /// content (anchor so the cursor row is visible), not empty rows below it.
     #[test]
     fn a_short_split_pane_shows_a_new_shells_prompt_not_blank_rows() {
-        // 60-row home grid, prompt on row 0, cursor there — a fresh `bash`.
+        // 60-row grid, prompt on row 0, cursor there — a fresh `bash`.
         let mut parser = new_client_parser(60, 100, 0);
         parser.process(b"user@host:~$ ");
         assert_eq!(
@@ -7410,12 +7412,13 @@ mod tests {
         assert!(app.staged_sizes.is_empty() && app.resize_deadline.is_none());
     }
 
-    /// Every main-tree terminal is sized to the whole main area (the stable "home" size), not its
-    /// split sub-rect. This is the blank-pane fix: a split (or a divider drag) then only changes how
-    /// much of the grid a pane shows, never the grid's size — so the app is never shrunk, vt100's
-    /// keep-bottom `set_size` never discards content, and an idle diff-renderer can't be left blank.
+    /// Every main-tree terminal is sized to its own pane (the tmux model): a stacked split attaches
+    /// each terminal at its half-height sub-rect, so the app lays out for what the user can see.
+    /// The alternative — every pane at the whole main area, rendering a crop — was shipped and
+    /// reverted: a fresh Claude in a split showed a blank pane, its header and the user's prompt
+    /// cropped away above the window (see `App::reconcile`).
     #[tokio::test]
-    async fn split_panes_get_the_stable_home_size() {
+    async fn split_panes_are_sized_to_their_own_rects() {
         let (mut sink, mut server) = test_server();
         let mut app = App::new(120, 40);
         app.restoring = false;
@@ -7425,30 +7428,36 @@ mod tests {
         app.agents = vec![a];
         let _ = app.swap_to_agent(ida); // pa in the main area
         app.terminals.insert(sh, ida);
-        app.tree.split(Axis::TopBottom); // stacked split, like the reproduced drag
+        app.tree.split(Axis::TopBottom);
         app.tree.open(sh);
         assert_eq!(app.tree.payloads().len(), 2, "two stacked panes");
 
         app.reconcile(&mut sink).await.unwrap();
 
-        let home = pane_size(app.regions().0);
-        let mut attaches: Vec<(TerminalId, Size)> = Vec::new();
+        let want: HashMap<TerminalId, Size> = app
+            .tree
+            .layout(app.regions().0)
+            .into_iter()
+            .filter_map(|pl| pl.payload.map(|t| (t, pane_size(pl.rect))))
+            .collect();
+        let whole = pane_size(app.regions().0);
+        let mut attaches: HashMap<TerminalId, Size> = HashMap::new();
         while let Some(m) = next_msg(&mut server).await {
             if let ClientMsg::Attach { terminal, size } = m {
-                attaches.push((terminal, size));
+                attaches.insert(terminal, size);
             }
         }
-        // Both panes attach at the FULL main-area size, not the half-height sub-rect each occupies.
         for t in [pa, sh] {
+            assert_eq!(
+                attaches.get(&t),
+                want.get(&t),
+                "terminal {t} attaches at its own pane size"
+            );
             assert!(
-                attaches.iter().any(|(tt, s)| *tt == t && *s == home),
-                "terminal {t} must attach at the home size {home:?}, got {attaches:?}"
+                want[&t].rows < whole.rows,
+                "precondition: a stacked slot is shorter than the whole main area"
             );
         }
-        assert!(
-            home.rows > pane_size(app.tree.layout(app.regions().0)[0].rect).rows,
-            "precondition: a stacked split slot is shorter than home, so this is a real crop"
-        );
     }
 
     /// Navigating out of a pane into the sidebar homes the cursor on the recent block, not wherever

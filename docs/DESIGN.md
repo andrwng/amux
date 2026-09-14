@@ -333,34 +333,36 @@ the proven mosh/agentapi-style split:
   broadcasts the **raw PTY output bytes** to subscribed clients.
 - Each client runs its *own* `vt100::Parser` fed by `[snapshot] ++ [live stream]` and renders
   it with `tui-term`.
-- **The grid is a stable per-agent "home" size; layout only changes what a pane *shows*, not the
-  grid.** A main-tree terminal's grid is sized to the **whole main area** (`pane_size` of
-  `regions().0`), a size that changes only when the main area itself does — a real terminal
-  `Event::Resize`, or the sidebar rail toggling. Splitting the main area, dragging a divider,
-  promoting/demoting, or focus changes do **not** resize the app: the split only changes how much of
-  the home-sized grid each pane renders. The grid size travels *to* the client (in
-  `OutputSnapshot { size, .. }`), which sizes its own parser to it; a pane equal to the grid renders
-  whole, and a pane **shorter** than the grid shows a *window* of it chosen by the **cursor**
-  (`crop_row_offset`): bottom-anchored — the grid's last rows, where a full-screen TUI like Claude
-  Code keeps its prompt and recent output — unless the cursor sits above that window, in which case
-  it slides up just enough to keep the cursor row visible. A fresh shell puts its prompt and cursor
-  on row 0 of a 60-row grid; a pure bottom anchor showed 14 empty rows, so a new split pane looked
-  dead while the daemon held a live shell. That one offset is the single source for rendering,
-  selection/copy, double-click, and link marking, so a click always lands on the cell it appears
-  over. A parser sized to the viewport instead of the grid would mis-parse every byte the moment
-  the two differ, so the parser always follows the snapshot's size, never the pane's.
+- **The pty is the pane (the tmux model).** A main-tree terminal's grid is sized to its own pane
+  rect (`pane_size(place.rect)` in `App::reconcile`); a split, a divider drag, or a promote/demote
+  resizes the app, which lays itself out for exactly the rows and columns the user can see. The grid
+  size travels *to* the client (in `OutputSnapshot { size, .. }`), which sizes its own parser to it;
+  a `Resize` that changes the grid is answered with a fresh snapshot at the new size, so the parser
+  always follows the grid, never the pane — a parser sized to the viewport instead would mis-parse
+  every byte the moment the two differ. The **minis row** works the same way: a mini is a small
+  viewport, sized to its cell.
 
-  This is the whole blank-pane fix, and it was pinned by a daemon grid trace (§ "grid tracing"): a
-  divider drag used to resize the pane's grid smaller on each step; vt100's keep-bottom `set_size`
-  discards the top rows on a shrink, and an idle diff-renderer — having cleared its screen for the
-  SIGWINCH — never repaints them, so the pane went blank (`nb 11→6→4→…` in the trace) and stayed
-  blank until unrelated activity. A stable home size never shrinks the grid for a layout change, so
-  nothing is discarded and no SIGWINCH is sent; a same-window reattach is likewise a no-op resize.
-  The app is resized only on a *real* main-area change, where the user is actively there and the app
-  repaints. `set_size` still keeps the bottom rows on the rare genuine shrink (§11). The **minis row
-  is the one exception**: a mini is a deliberate small viewport, sized to its cell.
-  (`resize_is_exact`, `shrinking_the_grid_keeps_the_most_recent_rows`,
-  `split_panes_get_the_stable_home_size` are the guards.)
+  A detour is worth recording because it looked principled and was wrong. For a day every main-tree
+  pane was sized to the *whole main area* (a "home size") and a split rendered a crop of that grid,
+  on the theory that shrinking a grid blanks an idle diff-renderer (vt100's keep-bottom `set_size`
+  drops the top rows; the app was believed not to repaint on SIGWINCH). Two things were wrong with
+  it. A full-screen app lays out header-at-top and prompt-at-bottom for the *grid*, so a pane
+  shorter than the grid can never show both: a fresh Claude Code in a 75% split showed a blank pane
+  — its header and the user's just-typed prompt cropped away above the window, its reply landing on
+  rows the pane would never show. And the premise was false: measured against a real `claude` in a
+  pty (`manual_claude_repaints_after_resizes`, ignored — needs the binary), the main UI repaints to
+  the new size within ~750ms after a single shrink, after a grow, and after a five-step resize
+  storm. The blank panes that motivated it came from resize *bursts* (below) and a client-side
+  reconstruction bug, not from resizing as such.
+
+  The crop machinery is kept because a pane can still be shorter than its grid *transiently*: between
+  a layout change and the daemon's re-snapshot at the new size. Then the pane shows a window of the
+  grid chosen by the **cursor** (`crop_row_offset`): bottom-anchored unless the cursor sits above,
+  in which case it slides up just enough to keep the cursor row visible (a fresh shell has its
+  prompt and cursor on row 0). That one offset is the single source for rendering, selection/copy,
+  double-click, and link marking, so a click always lands on the cell it appears over.
+  (`split_panes_are_sized_to_their_own_rects`, `resize_is_exact`,
+  `shrinking_the_grid_keeps_the_most_recent_rows` are the guards.)
 - **Resize coalescing.** One user action — dragging a split, opening or closing a mini — makes the
   client's `reconcile` run several times with intermediate pane sizes. Sending a `Resize` for each
   subjects the app to a burst of SIGWINCHes within milliseconds. A real terminal never does this: it

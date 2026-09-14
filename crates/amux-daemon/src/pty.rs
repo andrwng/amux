@@ -1659,3 +1659,173 @@ mod query_tests {
         }
     }
 }
+
+/// Manual experiment (needs a `claude` binary and a login; creates a throwaway project entry):
+/// does Claude Code's full-screen UI repaint after the pty is resized? It decides the sizing
+/// model in `docs/DESIGN.md` §5.3 — the pty is the pane — so it stays here to be re-run when
+/// that is doubted. Run with
+/// `cargo test -p amux-daemon --lib -- manual_claude_repaints_after_resizes --ignored --nocapture`
+/// and read the dumps: after each resize the header must be on rows 1–3 and the prompt box on the
+/// last rows of the *new* size. Measured 2026-09-14 (Claude Code 2.1.270): repaints within ~750ms
+/// after a single shrink (with one `2J` clear), after a grow, and after a five-step resize storm.
+#[cfg(test)]
+mod resize_experiment {
+    use super::*;
+    fn census(
+        bytes: &[u8],
+        rows: u16,
+        cols: u16,
+    ) -> (usize, Option<u16>, Option<u16>, bool, (u16, u16)) {
+        let mut p = vt100::Parser::new(rows, cols, 0);
+        p.process(bytes);
+        let sc = p.screen();
+        let nb: Vec<u16> = (0..rows)
+            .filter(|&y| {
+                (0..cols).any(|x| {
+                    sc.cell(y, x)
+                        .map(|c| !c.contents().is_empty())
+                        .unwrap_or(false)
+                })
+            })
+            .collect();
+        let has_prompt = (0..rows).any(|y| {
+            (0..cols).any(|x| {
+                sc.cell(y, x)
+                    .map(|c| c.contents() == "\u{276f}")
+                    .unwrap_or(false)
+            })
+        });
+        (
+            nb.len(),
+            nb.first().copied(),
+            nb.last().copied(),
+            has_prompt,
+            sc.cursor_position(),
+        )
+    }
+    fn dump(label: &str, bytes: &[u8], rows: u16, cols: u16) {
+        let mut p = vt100::Parser::new(rows, cols, 0);
+        p.process(bytes);
+        let sc = p.screen();
+        eprintln!(
+            "---- {label} alt={} cursor={:?} ----",
+            sc.alternate_screen(),
+            sc.cursor_position()
+        );
+        for y in 0..rows {
+            let mut t = String::new();
+            for x in 0..cols {
+                if let Some(c) = sc.cell(y, x) {
+                    let g = c.contents();
+                    t.push_str(if g.is_empty() { " " } else { g });
+                }
+            }
+            let t = t.trim_end();
+            if !t.is_empty() {
+                eprintln!("{y:>2}|{}", t.chars().take(100).collect::<String>());
+            }
+        }
+    }
+    #[test]
+    #[ignore]
+    fn manual_claude_repaints_after_resizes() {
+        let dir = tempfile::tempdir().unwrap();
+        let s = Session::spawn(
+            &["claude".to_string()],
+            dir.path(),
+            &[],
+            Size {
+                cols: 120,
+                rows: 40,
+            },
+        )
+        .unwrap();
+        let mut rx = s.subscribe();
+        std::thread::sleep(std::time::Duration::from_secs(6));
+        let mut got = 0usize;
+        while let Ok(b) = rx.try_recv() {
+            got += b.len();
+        }
+        eprintln!(
+            "[40 rows] bytes so far={got} census={:?}",
+            census(&s.snapshot(), 40, 120)
+        );
+        // Accept the trust dialog; reach the main UI (alt screen, prompt pinned at the bottom).
+        dump("dialog @40", &s.snapshot(), 40, 120);
+        s.write_input(b"\x1b[B").unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(400));
+        s.write_input(b"\r").unwrap();
+        std::thread::sleep(std::time::Duration::from_secs(12));
+        let mut got = Vec::new();
+        while let Ok(b) = rx.try_recv() {
+            got.extend(b);
+        }
+        eprintln!(
+            "[after Enter +10s] bytes={} raw={:?}",
+            got.len(),
+            String::from_utf8_lossy(&got[..got.len().min(300)])
+        );
+        dump("main UI? @40", &s.snapshot(), 40, 120);
+        // ONE shrink, no wobble.
+        s.resize(Size {
+            cols: 120,
+            rows: 25,
+        })
+        .unwrap();
+        eprintln!(
+            "[shrink->25] immediately after set_size census={:?}",
+            census(&s.snapshot(), 25, 120)
+        );
+        for i in 1..=4 {
+            std::thread::sleep(std::time::Duration::from_millis(750));
+            let mut got = 0usize;
+            let mut clears = 0usize;
+            while let Ok(b) = rx.try_recv() {
+                got += b.len();
+                clears += b.windows(4).filter(|w| *w == b"\x1b[2J").count();
+            }
+            eprintln!(
+                "[shrink +{}ms] bytes={got} 2J={clears} census={:?}",
+                i * 750,
+                census(&s.snapshot(), 25, 120)
+            );
+        }
+        dump("after shrink settle @25", &s.snapshot(), 25, 120);
+        // A divider-drag storm: five resizes 20ms apart, then settle. (The client coalesces these to
+        // one, so this is the worst case, not the normal one.)
+        for rows in [28u16, 31, 34, 37, 33] {
+            s.resize(Size { cols: 120, rows }).unwrap();
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+        std::thread::sleep(std::time::Duration::from_millis(1500));
+        let mut got = 0usize;
+        while let Ok(b) = rx.try_recv() {
+            got += b.len();
+        }
+        eprintln!(
+            "[storm ->33 +1500ms] bytes={got} census={:?}",
+            census(&s.snapshot(), 33, 120)
+        );
+        dump("after storm settle @33", &s.snapshot(), 33, 120);
+        // and grow back
+        s.resize(Size {
+            cols: 120,
+            rows: 40,
+        })
+        .unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(1500));
+        let mut got = 0usize;
+        while let Ok(b) = rx.try_recv() {
+            got += b.len();
+        }
+        eprintln!(
+            "[grow->40 +1500ms] bytes={got} census={:?}",
+            census(&s.snapshot(), 40, 120)
+        );
+        dump("after grow settle @40", &s.snapshot(), 40, 120);
+        let _ = s.write_input(b"\x03\x03");
+        std::thread::sleep(std::time::Duration::from_millis(300));
+        let _ = s.write_input(b"/exit\r");
+        std::thread::sleep(std::time::Duration::from_millis(800));
+    }
+}
