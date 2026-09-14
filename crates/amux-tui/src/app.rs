@@ -3325,16 +3325,24 @@ fn pane_links(screen: &vt100::Screen, width: u16, height: u16) -> Vec<PaneLink> 
 /// restyles the selected cells, so the selection's edges simply become run boundaries.
 fn mark_links(buf: &mut Buffer, parser: &vt100::Parser<Links>, inner: Rect) {
     let screen = parser.screen();
+    // Links live in *grid* rows; the pane may show only the grid's bottom `inner.height` rows (a
+    // split slot of the home-sized grid — see `render_screen`). Scan the whole grid so a URL near
+    // the bottom is found, then translate each run to the pane row it is drawn on and drop runs
+    // that are cropped away. Skipping link marking for cropped panes instead (the earlier "scope
+    // cut") left a split pane with no hyperlinks at all, so a cmd+click fell back to the terminal's
+    // own text scan across the pane border — the login URL opened with a `│` spliced in.
+    let grid_rows = screen.size().0;
+    let row_off = crop_row_offset(screen, inner);
     // The app's own links win: it knows the whole URI even where amux cannot reconstruct it (a TUI
     // wraps text itself, so `row_wrapped` is false and there is no seam to join). amux's own
     // detection then covers what the app left unmarked — a URL printed by a plain shell command.
-    let declared = app_links(parser, inner.width, inner.height);
+    let declared = app_links(parser, inner.width, grid_rows);
     let claimed: HashSet<(u16, u16)> = declared
         .iter()
         .flat_map(|l| l.runs.iter())
         .flat_map(|&(y, x0, x1)| (x0..=x1).map(move |x| (y, x)))
         .collect();
-    let detected = pane_links(screen, inner.width, inner.height)
+    let detected = pane_links(screen, inner.width, grid_rows)
         .into_iter()
         .filter(|l| {
             !l.runs
@@ -3349,7 +3357,14 @@ fn mark_links(buf: &mut Buffer, parser: &vt100::Parser<Links>, inner: Rect) {
     for link in declared.into_iter().chain(detected) {
         let next = ids.len();
         let id = *ids.entry(link.url.clone()).or_insert(next);
-        for (row, x0, x1) in link.runs {
+        for (grid_row, x0, x1) in link.runs {
+            // Grid row → pane row; anything above the visible window is cropped away.
+            let Some(row) = grid_row.checked_sub(row_off) else {
+                continue;
+            };
+            if row >= inner.height {
+                continue;
+            }
             for (sx0, sx1) in style_runs(buf, inner, row, x0, x1) {
                 mark_run(buf, inner, row, sx0, sx1, &link.url, id);
             }
@@ -3982,19 +3997,18 @@ fn crop_row_offset(screen: &vt100::Screen, inner: Rect) -> u16 {
 /// its last `inner.height` rows (not the top — a diff-rendering TUI's content and prompt live at
 /// the bottom, so a top-anchored crop shows blank header rows, which is the split-pane "blank" bug).
 /// Columns are left-anchored. When the grid fits, it's a plain render.
-fn render_screen(frame: &mut Frame, inner: Rect, screen: &vt100::Screen) {
+/// `render_screen`'s implementation on a bare `Buffer` (also what tests render through).
+fn render_screen_into(buf: &mut Buffer, inner: Rect, screen: &vt100::Screen) {
     use ratatui::widgets::Widget;
     let (grows, gcols) = screen.size();
     if grows <= inner.height && gcols <= inner.width {
-        frame.render_widget(PseudoTerminal::new(screen), inner);
+        PseudoTerminal::new(screen).render(inner, buf);
         return;
     }
-    // Render the whole grid into a scratch buffer, then blit its bottom-left window into the pane.
     let full = Rect::new(0, 0, gcols, grows);
     let mut scratch = Buffer::empty(full);
     PseudoTerminal::new(screen).render(full, &mut scratch);
     let row_off = grows.saturating_sub(inner.height);
-    let buf = frame.buffer_mut();
     for y in 0..inner.height.min(grows) {
         for x in 0..inner.width.min(gcols) {
             if let Some(src) = scratch.cell((x, row_off + y)) {
@@ -4004,6 +4018,10 @@ fn render_screen(frame: &mut Frame, inner: Rect, screen: &vt100::Screen) {
             }
         }
     }
+}
+
+fn render_screen(frame: &mut Frame, inner: Rect, screen: &vt100::Screen) {
+    render_screen_into(frame.buffer_mut(), inner, screen);
 }
 
 fn render_panes(frame: &mut Frame, area: Rect, app: &App) {
@@ -4086,14 +4104,11 @@ fn render_panes(frame: &mut Frame, area: Rect, app: &App) {
             }
         }
         // Links last: a carrier cell holds one style, so marking after the highlight lets the
-        // selection's edges fall on run boundaries instead of being swallowed by a `Skip`. Skipped
-        // for a cropped pane: `mark_links` reads link positions from the top of the grid, but a
-        // cropped pane shows the bottom, so marking would place carrier cells over the wrong
-        // (bottom) cells and corrupt them. The full-size main pane (no crop) still gets links.
+        // selection's edges fall on run boundaries instead of being swallowed by a `Skip`.
+        // `mark_links` is crop-aware, so a split pane showing the bottom of a taller grid gets its
+        // links on the right rows too.
         if let Some(parser) = place.payload.and_then(|t| app.parser_for(t)) {
-            if crop_row_offset(parser.screen(), inner) == 0 {
-                mark_links(frame.buffer_mut(), parser, inner);
-            }
+            mark_links(frame.buffer_mut(), parser, inner);
         }
     }
 }
@@ -4837,6 +4852,54 @@ mod tests {
         assert!(
             parser.callbacks_mut().clipboard.is_none(),
             "a clear is not a write"
+        );
+    }
+
+    /// A split pane shows the bottom of a taller home-sized grid. Links in that visible window must
+    /// still be marked — on the *pane* row they are drawn on, not the grid row. Skipping link
+    /// marking for cropped panes left them with no hyperlinks at all, so a cmd+click on the wrapped
+    /// login URL fell back to the terminal's own text scan across the pane border (`…code│%2F…`).
+    #[test]
+    fn links_are_marked_on_the_right_row_in_a_cropped_split_pane() {
+        use ratatui::widgets::{Block, Borders, Widget};
+        let url = "https://claude.com/cai/oauth/authorize?state=xyz";
+        // 50-row grid, URL on grid row 40 (0-based); shown in a 20-row slot → crop offset 30 →
+        // the URL is drawn on pane row 10.
+        let (grid_rows, grid_cols) = (50u16, 80u16);
+        let mut parser = new_client_parser(grid_rows, grid_cols, 0);
+        parser.process(format!("\x1b[41;1H{url}").as_bytes());
+
+        let outer = Rect::new(0, 0, grid_cols + 2, 20 + 2);
+        let mut buf = Buffer::empty(outer);
+        let block = Block::default().borders(Borders::ALL);
+        let inner = block.inner(outer);
+        block.render(outer, &mut buf);
+        render_screen_into(&mut buf, inner, parser.screen());
+        assert_eq!(
+            crop_row_offset(parser.screen(), inner),
+            30,
+            "precondition: cropped by 30"
+        );
+        mark_links(&mut buf, &parser, inner);
+
+        // The carrier cell with the href must be on buffer row inner.y + 10 == 11, at the URL's
+        // first column (inner.x + 0 == 1) — and nowhere else.
+        let mut found = Vec::new();
+        for y in 0..outer.height {
+            for x in 0..outer.width {
+                let sym = buf
+                    .cell((x, y))
+                    .map(|c| c.symbol().to_string())
+                    .unwrap_or_default();
+                if sym.contains("]8;id=") && sym.contains(url) {
+                    found.push((x, y));
+                }
+            }
+        }
+        assert_eq!(
+            found,
+            vec![(1, 11)],
+            "the link is marked exactly once, on the translated pane row"
         );
     }
 
