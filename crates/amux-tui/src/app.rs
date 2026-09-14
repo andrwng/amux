@@ -2178,9 +2178,20 @@ impl App {
         }
         let (pane_area, minis_area) = self.regions();
         let mut desired: HashMap<TerminalId, Size> = HashMap::new();
+        // Every main-tree terminal is sized to the *whole* main area, not its split sub-rect — a
+        // stable "home" size that changes only when the main area itself does (a real terminal
+        // resize or the sidebar rail toggling), never when a split is dragged or a pane is
+        // rearranged. Splitting therefore only changes how much of the grid a pane *shows* (the
+        // renderer clips to the sub-rect), and never resizes the app. This is the whole blank-pane
+        // fix: shrinking the grid on a split ran vt100's keep-bottom `set_size`, which discards the
+        // top rows — and an idle diff-renderer, having cleared for the SIGWINCH, never repaints them
+        // back — so a divider drag left the pane blank. A stable home size never shrinks the grid,
+        // so nothing is discarded and no SIGWINCH is sent for a mere layout change. (Minis are the
+        // one exception below: a mini is a deliberate small viewport, sized to its cell.)
+        let home = pane_size(pane_area);
         for place in self.tree.layout(pane_area) {
             if let Some(t) = place.payload {
-                desired.insert(t, pane_size(place.rect));
+                desired.insert(t, home);
             }
         }
         // The minis row streams each agent's primary terminal, sized to its cell.
@@ -6278,6 +6289,47 @@ mod tests {
             "exactly one coalesced resize, at the final size"
         );
         assert!(app.staged_sizes.is_empty() && app.resize_deadline.is_none());
+    }
+
+    /// Every main-tree terminal is sized to the whole main area (the stable "home" size), not its
+    /// split sub-rect. This is the blank-pane fix: a split (or a divider drag) then only changes how
+    /// much of the grid a pane shows, never the grid's size — so the app is never shrunk, vt100's
+    /// keep-bottom `set_size` never discards content, and an idle diff-renderer can't be left blank.
+    #[tokio::test]
+    async fn split_panes_get_the_stable_home_size() {
+        let (mut sink, mut server) = test_server();
+        let mut app = App::new(120, 40);
+        app.restoring = false;
+        let (pa, sh) = (TerminalId::new(), TerminalId::new());
+        let a = agent_info(pa);
+        let ida = a.id;
+        app.agents = vec![a];
+        let _ = app.swap_to_agent(ida); // pa in the main area
+        app.terminals.insert(sh, ida);
+        app.tree.split(Axis::TopBottom); // stacked split, like the reproduced drag
+        app.tree.open(sh);
+        assert_eq!(app.tree.payloads().len(), 2, "two stacked panes");
+
+        app.reconcile(&mut sink).await.unwrap();
+
+        let home = pane_size(app.regions().0);
+        let mut attaches: Vec<(TerminalId, Size)> = Vec::new();
+        while let Some(m) = next_msg(&mut server).await {
+            if let ClientMsg::Attach { terminal, size } = m {
+                attaches.push((terminal, size));
+            }
+        }
+        // Both panes attach at the FULL main-area size, not the half-height sub-rect each occupies.
+        for t in [pa, sh] {
+            assert!(
+                attaches.iter().any(|(tt, s)| *tt == t && *s == home),
+                "terminal {t} must attach at the home size {home:?}, got {attaches:?}"
+            );
+        }
+        assert!(
+            home.rows > pane_size(app.tree.layout(app.regions().0)[0].rect).rows,
+            "precondition: a stacked split slot is shorter than home, so this is a real crop"
+        );
     }
 
     /// Navigating out of a pane into the sidebar homes the cursor on the recent block, not wherever

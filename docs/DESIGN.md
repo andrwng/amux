@@ -333,31 +333,28 @@ the proven mosh/agentapi-style split:
   broadcasts the **raw PTY output bytes** to subscribed clients.
 - Each client runs its *own* `vt100::Parser` fed by `[snapshot] ++ [live stream]` and renders
   it with `tui-term`.
-- **The grid tracks the attached client's pane — like tmux resizing a pty to its client.** The grid
-  size travels *to* the client (in `OutputSnapshot { size, .. }`), which sizes its own parser to
-  match and renders it; a parser sized to the viewport instead of the grid would mis-parse every
-  byte the moment the two differ, so the parser always follows the snapshot's size, never the pane's.
-  The daemon sets the grid on `attach` and on every later `ClientMsg::Resize` (a genuine terminal
-  `Event::Resize` or a split changing a pane). This includes a reattach: a client reconnecting into
-  a differently sized window resizes the grid to it. The subtlety that earlier cost us a blank is
-  that **a resize only fires SIGWINCH when the dimensions actually change** — `Session::resize`
-  early-returns on a same-size call, so the common reconnect (same window) is a pure re-subscribe +
-  re-snapshot with no SIGWINCH, carried entirely by the faithful snapshot below. When the size
-  *does* change, the app gets SIGWINCH and a diff-rendering TUI (ink/Claude Code) answers a real
-  dimension change with a full clear+repaint (unlike a size-less SIGWINCH — see the superseded note
-  below), so the grid re-fills on its own. Before that repaint lands the pane must still not be
-  blank, and here the row-shrink direction is load-bearing: the daemon snapshots the resized grid
-  *immediately*, so if a shrink kept the wrong rows the snapshot would be empty. vt100 does not
-  reflow, but our vendored `set_size` keeps the **bottom** rows on a shrink (dropping the oldest off
-  the top into scrollback), matching a real terminal — so a pane re-attached into a smaller slot
-  (large main → small split) snapshots its most recent output and prompt, not a blank header.
-  Upstream vt100 truncates the tail (keeps the top); with an idle app that never repaints, that was
-  a permanent blank — the bug this fixed (§11). The earlier "never resize on reattach" rule was
-  wrong in the other direction: it froze a pane's grid at a stale size (e.g. an old 11-row split) so
-  a reconnect into a full-height window rendered those few rows into a large pane and left the rest
-  stale — a blank that *never* self-healed. (`Session::resize` is exact; `resize_is_exact`,
-  `shrinking_the_grid_keeps_the_most_recent_rows`, and `reattaching_resizes_the_grid_to_the_client`
-  are the guards.)
+- **The grid is a stable per-agent "home" size; layout only changes what a pane *shows*, not the
+  grid.** A main-tree terminal's grid is sized to the **whole main area** (`pane_size` of
+  `regions().0`), a size that changes only when the main area itself does — a real terminal
+  `Event::Resize`, or the sidebar rail toggling. Splitting the main area, dragging a divider,
+  promoting/demoting, or focus changes do **not** resize the app: the split only changes how much of
+  the home-sized grid each pane renders. The grid size travels *to* the client (in
+  `OutputSnapshot { size, .. }`), which sizes its own parser to it; a pane smaller than the grid
+  **clips** (tui-term renders the top-left of the larger screen), a pane equal to it renders whole.
+  A parser sized to the viewport instead of the grid would mis-parse every byte the moment the two
+  differ, so the parser always follows the snapshot's size, never the pane's.
+
+  This is the whole blank-pane fix, and it was pinned by a daemon grid trace (§ "grid tracing"): a
+  divider drag used to resize the pane's grid smaller on each step; vt100's keep-bottom `set_size`
+  discards the top rows on a shrink, and an idle diff-renderer — having cleared its screen for the
+  SIGWINCH — never repaints them, so the pane went blank (`nb 11→6→4→…` in the trace) and stayed
+  blank until unrelated activity. A stable home size never shrinks the grid for a layout change, so
+  nothing is discarded and no SIGWINCH is sent; a same-window reattach is likewise a no-op resize.
+  The app is resized only on a *real* main-area change, where the user is actively there and the app
+  repaints. `set_size` still keeps the bottom rows on the rare genuine shrink (§11). The **minis row
+  is the one exception**: a mini is a deliberate small viewport, sized to its cell.
+  (`resize_is_exact`, `shrinking_the_grid_keeps_the_most_recent_rows`,
+  `split_panes_get_the_stable_home_size` are the guards.)
 - **Resize coalescing.** One user action — dragging a split, opening or closing a mini — makes the
   client's `reconcile` run several times with intermediate pane sizes. Sending a `Resize` for each
   subjects the app to a burst of SIGWINCHes within milliseconds. A real terminal never does this: it
@@ -369,17 +366,19 @@ the proven mosh/agentapi-style split:
   (`App::flush_resizes`, fired from the event loop; `resizes_are_coalesced_into_one` is the guard).
   A first attach is still immediate — it needs the snapshot now. This does not revive an app already
   wedged by a past burst (that needs the agent restarted); it stops new ones from wedging.
-- **Repaint kick when a reattach lands on an empty grid.** One blank does not come from resizing at
-  all: a diff-renderer that cleared its screen and went idle leaves the daemon grid blank, and a
-  reattach *at the same size* (the common reconnect) fires no SIGWINCH, so the app is never prompted
-  to redraw — the pane stays blank until the user happens to change something. An active pane hides
-  this (it repaints constantly); an idle one does not. `server::attach` detects it —
-  `!resized && Session::visible_is_empty()` — and kicks a repaint with a size **wobble**: shrink one
-  row, pause, restore. Two real dimension changes an idle app (ink coalesces a burst of SIGWINCH,
-  and ignores a size-*less* one) cannot collapse to a no-op, so it redraws, ending back at the
-  client's size. Gated so a healthy pane never wobbles. The shrink is content-safe (the grid is
-  empty, and `set_size` keeps the bottom rows regardless). This is the one case the faithful
-  snapshot cannot cover, because there is nothing in the grid to snapshot.
+- **No SIGWINCH "wobble".** An earlier attempt kicked a blank grid back to life on attach by wobbling
+  the size (shrink a row, restore) to force a repaint. A daemon grid trace proved it both useless and
+  harmful: an idle diff-renderer ignores the wobble's SIGWINCH, and because ink *clears* on SIGWINCH
+  before repainting, the nudge can itself blank a pane. It is removed. With the stable home size a
+  layout change never resizes the app, so there is no resize-induced blank to nudge away.
+- **Grid tracing.** A blank that only reproduces intermittently across reattaches is invisible to the
+  client-side `AMUX_RECORD` tap, which resets on every reattach and so always begins after the grid
+  is already blank. `AMUX_GRID_TRACE=<path>` turns on continuous daemon-side tracing (off — no cost —
+  otherwise): per session it logs spawn, every resize (nonblank rows before→after), each app-output
+  chunk that flips the grid content↔blank (flagged if it carried a `2J`), and attach. Because it
+  lives in the daemon it spans the whole session across detach/reattach, so it names the exact event
+  that blanked a grid — an app clear vs. an amux resize — which is what turned the stable-home fix
+  from a guess into a certainty.
 - **Late-join snapshot — and it must be a *faithful* one.** On `SubscribeOutput` the daemon sends
   `snapshot_bytes()`: a preamble of terminal state that `contents_formatted()` does not encode,
   followed by `contents_formatted()` (the visible cells), then the live stream. This is load-bearing,

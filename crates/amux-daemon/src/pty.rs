@@ -483,29 +483,6 @@ impl Session {
         snapshot_bytes(parser.screen())
     }
 
-    /// Whether the visible screen has no text at all — every cell blank. A diff-rendering app that
-    /// has cleared its screen and gone idle leaves the grid like this; a same-size reattach then
-    /// snapshots an empty screen and, firing no SIGWINCH, never prompts the app to repaint. The
-    /// attach path uses this to decide whether to kick a repaint (see `server::attach`).
-    pub fn visible_is_empty(&self) -> bool {
-        let Ok(parser) = self.parser.lock() else {
-            return false;
-        };
-        let screen = parser.screen();
-        let (rows, cols) = screen.size();
-        for r in 0..rows {
-            for c in 0..cols {
-                if screen
-                    .cell(r, c)
-                    .is_some_and(|cell| !cell.contents().is_empty())
-                {
-                    return false;
-                }
-            }
-        }
-        true
-    }
-
     /// Move a client's scroll position by `lines` and serve the window it lands on.
     ///
     /// This is the whole of scrolling: the daemon holds the history, so a client never keeps its own
@@ -1230,41 +1207,6 @@ mod tests {
 
         // Same size is a no-op (no SIGWINCH, no needless re-snapshot).
         assert!(!session.resize(Size { rows: 6, cols: 20 }).unwrap());
-    }
-
-    /// `visible_is_empty` reports whether the grid has any text — the signal `server::attach` uses to
-    /// decide whether to kick a repaint (a cleared, idle diff-renderer reattached at the same size
-    /// snapshots blank and never gets a SIGWINCH to redraw). Empty after a clear, non-empty once the
-    /// app draws.
-    #[test]
-    fn visible_is_empty_tracks_screen_content() {
-        // Clear the screen, then idle on `cat` so the grid stays blank until we feed it.
-        let session = Session::spawn(
-            &[
-                "sh".to_string(),
-                "-c".to_string(),
-                "printf '\\033[2J'; exec cat".to_string(),
-            ],
-            Path::new("/"),
-            &[],
-            Size { rows: 10, cols: 40 },
-        )
-        .expect("spawn sh");
-
-        let poll = |want: bool| {
-            for _ in 0..100 {
-                if session.visible_is_empty() == want {
-                    return true;
-                }
-                thread::sleep(Duration::from_millis(20));
-            }
-            false
-        };
-        assert!(poll(true), "a cleared, idle screen is empty");
-
-        session.write_input(b"hello\r\n").unwrap();
-        assert!(poll(false), "text on the screen is not empty");
-        session.kill();
     }
 
     /// Shrinking the grid must keep the **bottom** rows — the cursor line and most recent output —

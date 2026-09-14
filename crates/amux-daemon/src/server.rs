@@ -468,38 +468,21 @@ fn attach(
         });
         return;
     };
-    // Size the grid to the attaching client's pane — always, like tmux resizing a pty to its
-    // client. A reattach at the same size is a no-op in `resize` (no SIGWINCH); a genuine change
-    // (a reconnect into a differently sized window, a fresh session at the spawn default) resizes
-    // the pty and reflows the grid, and the snapshot sent just below serves that reflowed grid at
-    // the new size — so the pane is never left frozen at a stale size, and never blank while the
-    // app repaints in response to SIGWINCH. See `Session::resize`.
+    // Size the grid to the attaching client's pane. The client sends a *stable* size (the whole
+    // main area, not a split sub-rect — see `App::reconcile`), so a reattach into the same window
+    // is a no-op here (no SIGWINCH), and the grid keeps its content. A genuine change (a reconnect
+    // into a differently sized window, a fresh session at the spawn default) resizes the pty, and
+    // the app repaints for that real SIGWINCH. See `Session::resize`.
+    //
+    // No repaint "wobble" here anymore: it was a SIGWINCH nudge meant to un-blank a cleared grid,
+    // but a grid trace proved it doesn't help an idle diff-renderer (which ignores the SIGWINCH)
+    // and can *cause* a blank (ink clears on SIGWINCH before repainting). With the stable home
+    // size, a layout change never resizes the app, so there is no blank to nudge away.
     let resized = session.resize(size).unwrap_or(false);
     session.trace_event(&format!(
         "ATTACH req={}x{} resized={resized}",
         size.cols, size.rows
     ));
-
-    // Kick a repaint when a same-size reattach lands on an *empty* grid. A diff-rendering app
-    // (ink/Claude Code) that cleared its screen and went idle leaves the grid blank; a no-op resize
-    // fires no SIGWINCH, so the app is never prompted to redraw and the pane stays blank until the
-    // user happens to change something. Force it with a size *wobble*: shrink one row, then restore
-    // — two real dimension changes an app cannot coalesce into a no-op, so it repaints, ending back
-    // at the client's size. Gated on `!resized && visible_is_empty` so a healthy pane (whose attach
-    // either changed size or already has content) never wobbles or flickers. The shrink is
-    // content-safe: the grid is empty, and `Grid::set_size` keeps the bottom rows regardless.
-    if !resized && size.rows > 1 && session.visible_is_empty() {
-        let s = session.clone();
-        tokio::spawn(async move {
-            tokio::time::sleep(Duration::from_millis(120)).await;
-            let _ = s.resize(Size {
-                cols: size.cols,
-                rows: size.rows - 1,
-            });
-            tokio::time::sleep(Duration::from_millis(120)).await;
-            let _ = s.resize(size);
-        });
-    }
 
     if attached.contains_key(&terminal) {
         return;
