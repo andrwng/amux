@@ -1955,14 +1955,22 @@ impl App {
         let row_off = crop_row_offset(screen, sel.inner);
         let (start, end) = ordered(sel.anchor, sel.head);
         let right = sel.inner.x + sel.inner.width.saturating_sub(1);
+        let rows = screen.size().0;
         let mut out = String::new();
+        // Where the previous row's URL continued onto this one, if it did: cells before that column
+        // (a box border, the app's indent) are layout, not the URL, and are skipped.
+        let mut skip_to: Option<u16> = None;
         for y in start.1..=end.1 {
-            let c0 = if y == start.1 { start.0 } else { sel.inner.x };
+            let srow = (y - sel.inner.y) + row_off;
+            let mut c0 = if y == start.1 { start.0 } else { sel.inner.x };
             let c1 = if y == end.1 { end.0 } else { right };
+            if let Some(col) = skip_to.take() {
+                c0 = c0.max(sel.inner.x + col);
+            }
             let mut line = String::new();
             for x in c0..=c1 {
                 let contents = screen
-                    .cell((y - sel.inner.y) + row_off, x - sel.inner.x)
+                    .cell(srow, x - sel.inner.x)
                     .map(|c| c.contents())
                     .unwrap_or_default();
                 if contents.is_empty() {
@@ -1971,29 +1979,43 @@ impl App {
                     line.push_str(contents);
                 }
             }
-            // A row the terminal wrapped continues on the next one, so it keeps its trailing cells
-            // and gets no separator: re-inserting a break the program never printed would corrupt a
-            // URL (or any long token) on paste. A row that ends because the program printed a
-            // newline is trimmed and separated as before.
-            // A row that continues onto the next (terminal- or app-wrapped) keeps its trailing
-            // cells and gets no separator — see `continues_on_next_row`.
-            let srow = (y - sel.inner.y) + row_off;
-            let wrapped = continuation_start(
-                screen,
-                srow,
-                sel.inner.width,
-                screen.size().0,
-                &row_text(screen, srow, sel.inner.width),
-            )
-            .is_some()
-                && c1 == right;
-            if !wrapped {
-                while line.ends_with(' ') {
-                    line.pop();
+            // Does this row's URL continue onto the next? Decided by the same seam logic as link
+            // detection (`continuation_start`), so copy and click always agree on what the URL is.
+            // Like detection, judge it on the *logical* line accumulated so far, not this row alone:
+            // the third row of a wrapped URL has no `https://` of its own, and only the joined text
+            // shows it is still mid-URL. A terminal wrap is exact; an app wrap continues at the next
+            // row's first URL character.
+            let cont = if y != end.1 {
+                let mut logical = out.clone();
+                logical.push_str(&line);
+                continuation_start(screen, srow, sel.inner.width, rows, &logical)
+            } else {
+                None
+            };
+            match cont {
+                // Terminal wrap: the row's trailing cells are real text; no separator.
+                Some(0) if screen.row_wrapped(srow) => {}
+                // App wrap: drop the gutter and any trailing layout glyph (a box border) — the URL
+                // text ended before them — and continue the URL on the next row with no separator.
+                Some(col) => {
+                    while line
+                        .chars()
+                        .next_back()
+                        .is_some_and(|c| c.is_whitespace() || !is_url_char(c))
+                    {
+                        line.pop();
+                    }
+                    skip_to = Some(col);
+                }
+                // The line ended here: trim trailing blanks and separate with a newline.
+                None => {
+                    while line.ends_with(' ') {
+                        line.pop();
+                    }
                 }
             }
             out.push_str(&line);
-            if y != end.1 && !wrapped {
+            if cont.is_none() && y != end.1 {
                 out.push('\n');
             }
         }
@@ -2033,13 +2055,22 @@ impl App {
                 })
                 .collect()
         };
-        let last = inner.width.saturating_sub(1) as usize;
         let (x0, x1) = token_span(&cells(cy), cx as usize)?;
         let rows = screen.size().0;
 
-        // Backwards over seams: this row continues the one above only if that row continues onto
-        // it (terminal- or app-wrapped) *at exactly where this token starts* — column 0 for a
-        // terminal wrap, the app's indent for a soft wrap — and the token reaches the seam above.
+        // Last URL-text column of a row: the token's real end. Inside a bordered box the URL ends
+        // at the border, not the pane edge, so the seam must be anchored to *this*, never to
+        // `inner.width - 1`. Only a terminal wrap (exact seam) runs to the pane edge.
+        let url_end = |y: u16| -> Option<usize> {
+            let c = cells(y);
+            (0..c.len())
+                .rev()
+                .find(|&x| !c[x].trim().is_empty() && c[x].chars().all(is_url_char))
+        };
+        // Backwards over seams: the row above continues onto this one (terminal- or app-wrapped —
+        // `continuation_start`, judged on the logical line so a third row with no scheme still
+        // counts) *at exactly where this token starts*, and the token above reaches its row's URL
+        // end. Then the token above extends ours.
         let mut y0 = cy;
         let mut x0 = x0;
         while y0 > top
@@ -2048,38 +2079,40 @@ impl App {
                 y0 - 1,
                 inner.width,
                 rows,
-                &row_text(screen, y0 - 1, inner.width),
+                &logical_line_ending_at(screen, y0 - 1, inner.width, top),
             ) == Some(x0 as u16)
         {
             let above = cells(y0 - 1);
-            match token_span(&above, last) {
-                Some((ax0, _)) => {
+            let Some(end) = url_end(y0 - 1) else { break };
+            match token_span(&above, end) {
+                Some((ax0, ax1)) if ax1 == end => {
                     y0 -= 1;
                     x0 = ax0;
                 }
-                None => break,
+                _ => break,
             }
         }
-        // Forwards over seams, symmetrically: the continuation's token begins at the start column.
+        // Forwards over seams, symmetrically: our token must reach this row's URL end, the row must
+        // continue, and the continuation's token begins at the seam's start column.
         let mut y1 = cy;
         let mut x1 = x1;
-        while x1 == last && y1 + 1 < bottom {
+        while y1 + 1 < bottom && url_end(y1) == Some(x1) {
             let Some(start) = continuation_start(
                 screen,
                 y1,
                 inner.width,
                 rows,
-                &row_text(screen, y1, inner.width),
+                &logical_line_ending_at(screen, y1, inner.width, top),
             ) else {
                 break;
             };
             let below = cells(y1 + 1);
             match token_span(&below, start as usize) {
-                Some((_, bx1)) => {
+                Some((bx0, bx1)) if bx0 == start as usize => {
                     y1 += 1;
                     x1 = bx1;
                 }
-                None => break,
+                _ => break,
             }
         }
         Some(Selection {
@@ -2959,15 +2992,27 @@ const SOFT_WRAP_INDENT_MAX: u16 = 8;
 /// one the app wrapped. This is the gate for an *app* soft-wrap join, so prose that merely ends at
 /// the margin never joins.
 fn tail_in_url(line: &str) -> bool {
-    let trimmed = line.trim_end();
+    // Strip trailing blanks (a right gutter) and any trailing *non-URL* glyphs — a box border `│`,
+    // closing punctuation — which cannot be part of the URL: they mean the URL ended before them.
+    let trimmed = line.trim_end_matches(|c: char| c.is_whitespace() || !is_url_char(c));
     LINK_SCHEMES
         .iter()
         .filter_map(|s| trimmed.rfind(s))
         .max()
         .is_some_and(|start| {
             let tail = &trimmed[start..];
+            // The URL must reach `trimmed`'s end with no whitespace inside it, AND the original row
+            // must not have URL text *after* something non-URL (that would be a new token, not a
+            // continuation): everything past `trimmed` is whitespace or non-URL glyphs by construction.
             !tail.is_empty() && !tail.chars().any(char::is_whitespace)
         })
+}
+
+/// A character that can appear in a URL as amux detects them (see `urls_in_line`): the token class,
+/// which covers unreserved and common reserved URL characters. Box-drawing, borders, and other
+/// layout glyphs are not in it, so a bordered box's `│` is never taken for URL text.
+fn is_url_char(c: char) -> bool {
+    c.is_alphanumeric() || "._-/~:@?=&%+#".contains(c)
 }
 
 /// If row `row` continues onto `row + 1`, the column on `row + 1` where the continuation's text
@@ -3002,22 +3047,90 @@ fn continuation_start(
             .map(|c| c.contents().to_string())
             .unwrap_or_default()
     };
-    (0..width.min(SOFT_WRAP_INDENT_MAX + 1))
-        .find(|&x| !cell(row + 1, x).trim().is_empty())
-        .filter(|&x| is_token_char(&cell(row + 1, x)))
+    // The continuation starts at the first URL character within the indent window. Blanks are the
+    // app's indent; a leading layout glyph (a box border `│`) is skipped the same way — neither is
+    // URL text. If no URL character appears within the window, the rows are not one URL.
+    (0..width.min(SOFT_WRAP_INDENT_MAX + 1)).find(|&x| {
+        let c = cell(row + 1, x);
+        !c.trim().is_empty() && c.chars().all(is_url_char)
+    })
 }
 
-/// The text of one grid row, blanks as spaces so positions stay aligned (for seam decisions).
-fn row_text(screen: &vt100::Screen, row: u16, width: u16) -> String {
-    (0..width)
-        .map(|x| {
-            screen
-                .cell(row, x)
-                .map(|c| c.contents().to_string())
-                .filter(|s| !s.is_empty())
-                .unwrap_or_else(|| " ".to_string())
-        })
-        .collect()
+/// The logical line that *ends* at `row`, **cleaned at each seam** exactly as `pane_links` and
+/// `selection_text` build theirs: starting from the topmost row that still continues down to `row`
+/// (through app-wrap seams), each continuing row has its trailing gutter/border dropped and the
+/// next row's leading border/indent skipped, so the result is the contiguous URL text. This is what
+/// `continuation_start`/`tail_in_url` must be judged on: a raw join keeps `│ … │` at the seams,
+/// whose whitespace makes `tail_in_url` say "not mid-URL" and stops the walk — which is why a
+/// double-click on the third row of a wrapped URL used to select only that row.
+fn logical_line_ending_at(screen: &vt100::Screen, row: u16, width: u16, top: u16) -> String {
+    let rows = screen.size().0;
+    // Walk up: `first` is the highest row that continues, seam by seam, down to `row`. Each step's
+    // seam is judged on the cleaned line ending at the candidate row above.
+    // Judging row `first-1`'s seam needs the URL's *start*, which may be rows further up (the
+    // third row of a URL carries no scheme). So find the seam chain's true top by walking up while
+    // the cleaned line from the candidate down to `first-1` ends mid-URL — recomputed from that
+    // candidate each step, which is what lets a scheme several rows above be seen.
+    let mut first = row;
+    while first > top {
+        let cand = first - 1;
+        let joined = clean_line(screen, cand, cand, width);
+        // Does `cand` continue onto `first`? Try with more context above `cand` too, since `cand`
+        // itself may be a middle row: take the longest cleaned line ending at `cand` whose tail is
+        // mid-URL.
+        let mut probe_top = cand;
+        let mut ok = continuation_start(screen, cand, width, rows, &joined).is_some();
+        while !ok && probe_top > top {
+            probe_top -= 1;
+            let longer = clean_line(screen, probe_top, cand, width);
+            ok = continuation_start(screen, cand, width, rows, &longer).is_some();
+        }
+        if !ok {
+            break;
+        }
+        first = cand;
+    }
+    clean_line(screen, first, row, width)
+}
+
+/// Rows `first..=last` joined into one cleaned logical line (see `logical_line_ending_at`).
+fn clean_line(screen: &vt100::Screen, first: u16, last: u16, width: u16) -> String {
+    let rows = screen.size().0;
+    let mut out = String::new();
+    let mut skip: u16 = 0;
+    for r in first..=last {
+        let mut line: String = (skip..width)
+            .map(|x| {
+                screen
+                    .cell(r, x)
+                    .map(|c| c.contents().to_string())
+                    .filter(|s| !s.is_empty())
+                    .unwrap_or_else(|| " ".to_string())
+            })
+            .collect();
+        if r < last {
+            // Judge this row's seam on the cleaned line so far (as detection does), then trim the
+            // gutter/border the app left after the URL and start the next row at its URL text.
+            let mut so_far = out.clone();
+            so_far.push_str(&line);
+            match continuation_start(screen, r, width, rows, &so_far) {
+                Some(0) if screen.row_wrapped(r) => skip = 0,
+                Some(col) => {
+                    while line
+                        .chars()
+                        .next_back()
+                        .is_some_and(|c| c.is_whitespace() || !is_url_char(c))
+                    {
+                        line.pop();
+                    }
+                    skip = col;
+                }
+                None => skip = 0,
+            }
+        }
+        out.push_str(&line);
+    }
+    out
 }
 
 fn pane_links(screen: &vt100::Screen, width: u16, height: u16) -> Vec<PaneLink> {
@@ -3053,7 +3166,11 @@ fn pane_links(screen: &vt100::Screen, width: u16, height: u16) -> Vec<PaneLink> 
                     // is a contiguous URL instead of `…/ab  cd…` — a URL with a space in it, which is
                     // exactly what a click then opened.
                     if !screen.row_wrapped(last) {
-                        while cells.last().is_some_and(|(_, _, c)| c.trim().is_empty()) {
+                        // Drop the gutter *and* any trailing layout glyphs (a box border `│`): a URL
+                        // never contains them, so they mark where the URL text ended on this row.
+                        while cells.last().is_some_and(|(_, _, c)| {
+                            c.trim().is_empty() || !c.chars().all(is_url_char)
+                        }) {
                             cells.pop();
                             starts.pop();
                         }
@@ -6059,6 +6176,115 @@ mod tests {
             linked,
             15 + 10,
             "exactly the URL's cells are linked, gutter/indent excluded"
+        );
+    }
+
+    /// The real login-link failure: Claude Code draws its OAuth URL *inside a bordered box*, so each
+    /// row of the wrapped URL is `│ <url text> │`. The border glyph `│` (U+2502) sat at the seam and
+    /// was glued into the URL — the click opened `…code%E2%94%82%2Fcallback…`. A box-drawing
+    /// border is never URL text: the join must exclude it on both sides of the seam.
+    #[test]
+    fn a_url_wrapped_inside_a_bordered_box_excludes_the_border() {
+        // A 26-col grid holding a 24-col box, so a box row never fills the grid and never
+        // terminal-wraps (Claude's box sits inside the pane with room to spare).
+        let mut p = vt100::Parser::new(4, 26, 0);
+        // `│` + 22 interior cells + `│`. The URL fills the interior and continues on the next row.
+        p.process("│ https://x.io/oauth/ab │".as_bytes());
+        p.process("\x1b[2;1H│ cd?state=Zq           │".as_bytes());
+        assert!(
+            !p.screen().row_wrapped(0),
+            "precondition: an app wrap inside a box"
+        );
+        let links = pane_links(p.screen(), 26, 4);
+        assert_eq!(
+            links.iter().map(|l| l.url.as_str()).collect::<Vec<_>>(),
+            vec!["https://x.io/oauth/abcd?state=Zq"],
+            "the box border must not be part of the URL"
+        );
+    }
+
+    /// End to end with the exact URL from the report, laid out as Claude Code does — inside a
+    /// bordered box, wrapped across three rows — and checked for byte-exact recovery. This is the
+    /// case that broke the login flow (`…code%E2%94%82%2Fcallback…`).
+    #[test]
+    fn the_real_oauth_url_in_a_claude_box_round_trips_exactly() {
+        let url = "https://claude.com/cai/oauth/authorize?code=true&client_id=9d1c250a-e61b-44d9-88ed-5944d1962f5e&response_type=code&redirect_uri=https%3A%2F%2Fplatform.claude.com%2Foauth%2Fcode%2Fcallback&scope=org%3Acreate_api_key+user%3Aprofile+user%3Ainference+user%3Asessions%3Aclaude_code+user%3Amcp_servers+user%3Afile_upload&code_challenge=T-QixTMZgj7TDveOZ8EL3BBBX5gQ7vJIVp9UDezOUMA&code_challenge_method=S256&state=sLIw-VIESp5dlhdyLxzMbnlYMd_Ty8SOaffm7UNcGVs";
+        // Box interior is 100 cols; the pane is wider so no row ever terminal-wraps.
+        let interior = 100usize;
+        let width = 110u16;
+        let mut p = vt100::Parser::new(8, width, 0);
+        let chunks: Vec<&str> = url
+            .as_bytes()
+            .chunks(interior)
+            .map(|c| std::str::from_utf8(c).unwrap())
+            .collect();
+        for (i, chunk) in chunks.iter().enumerate() {
+            let row = format!("│ {chunk:<interior$} │");
+            p.process(format!("\x1b[{};1H{row}", i + 1).as_bytes());
+        }
+        assert!(chunks.len() >= 3, "the URL spans several box rows");
+        assert!(!(0..chunks.len() as u16).any(|r| p.screen().row_wrapped(r)));
+
+        // Detection: exactly one link, byte-identical to the real URL.
+        let links = pane_links(p.screen(), width, 8);
+        assert_eq!(
+            links.iter().map(|l| l.url.as_str()).collect::<Vec<_>>(),
+            vec![url]
+        );
+
+        // Copy across all rows recovers the same string — no border, no gutter, no newline.
+        let mut app = App::new(140, 40);
+        let t = TerminalId::new();
+        let mut parser = new_client_parser(8, width, 0);
+        for (i, chunk) in chunks.iter().enumerate() {
+            let row = format!("│ {chunk:<interior$} │");
+            parser.process(format!("\x1b[{};1H{row}", i + 1).as_bytes());
+        }
+        app.parsers.insert(t, parser);
+        let last_row = (chunks.len() - 1) as u16;
+        let last_len = chunks.last().unwrap().len() as u16;
+        app.selection = Some(Selection {
+            terminal: t,
+            inner: Rect::new(0, 0, width, 8),
+            anchor: (2, 0),
+            head: (2 + last_len - 1, last_row),
+            active: true,
+        });
+        assert_eq!(
+            app.selection_text().as_deref(),
+            Some(url),
+            "copy recovers the exact URL"
+        );
+    }
+
+    /// Double-clicking the *third* row of the real OAuth URL (a row with no `https://` of its own)
+    /// must select the whole URL across all rows, excluding the box borders and indents.
+    #[test]
+    fn double_clicking_the_third_row_of_the_real_oauth_url_selects_it_all() {
+        let url = "https://claude.com/cai/oauth/authorize?code=true&client_id=9d1c250a-e61b-44d9-88ed-5944d1962f5e&response_type=code&redirect_uri=https%3A%2F%2Fplatform.claude.com%2Foauth%2Fcode%2Fcallback&scope=org%3Acreate_api_key+user%3Aprofile+user%3Ainference+user%3Asessions%3Aclaude_code+user%3Amcp_servers+user%3Afile_upload&code_challenge=T-QixTMZgj7TDveOZ8EL3BBBX5gQ7vJIVp9UDezOUMA&code_challenge_method=S256&state=sLIw-VIESp5dlhdyLxzMbnlYMd_Ty8SOaffm7UNcGVs";
+        let interior = 100usize;
+        let width = 110u16;
+        let mut app = App::new(140, 40);
+        let t = TerminalId::new();
+        let mut parser = new_client_parser(8, width, 0);
+        let chunks: Vec<&str> = url
+            .as_bytes()
+            .chunks(interior)
+            .map(|c| std::str::from_utf8(c).unwrap())
+            .collect();
+        for (i, chunk) in chunks.iter().enumerate() {
+            parser.process(format!("\x1b[{};1H│ {chunk:<interior$} │", i + 1).as_bytes());
+        }
+        app.parsers.insert(t, parser);
+        let inner = Rect::new(0, 0, width, 8);
+        let sel = app
+            .token_selection(t, inner, 10, 2)
+            .expect("a URL character under the click");
+        app.selection = Some(sel);
+        assert_eq!(
+            app.selection_text().as_deref(),
+            Some(url),
+            "the whole URL, byte-exact"
         );
     }
 
