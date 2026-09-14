@@ -3985,15 +3985,27 @@ fn age_short(ts: DateTime<Utc>) -> String {
     }
 }
 
-/// How many rows of a terminal's grid are hidden above a pane that is shorter than the grid. A
-/// main-tree terminal is sized to the whole main area (`App::reconcile`), so a split pane is
-/// shorter than its grid and must show the grid's **bottom** rows — where a terminal UI keeps its
-/// cursor and most recent output. This is that offset; 0 when the grid fits (the common main pane).
+/// How many rows of a terminal's grid are hidden above a pane that is shorter than the grid.
+///
+/// A main-tree terminal is sized to the whole main area (`App::reconcile`), so a split pane shows a
+/// window of `inner.height` rows out of a taller grid. Which window is decided by the **cursor**:
+/// the window is bottom-anchored (the grid's last rows — where a full-screen TUI like Claude Code
+/// keeps its prompt and recent output) unless the cursor sits above it, in which case it slides up
+/// just far enough to keep the cursor row visible. A fresh shell puts its prompt and cursor on row 0
+/// of a 60-row grid; a pure bottom anchor showed rows 46..60 — all empty — so a new split pane
+/// looked dead although the daemon held a live shell. 0 when the grid fits (the common main pane).
+///
+/// This is the single source for the crop, shared by rendering, selection/copy, double-click, and
+/// link marking so a click always lands on the cell it appears over.
 fn crop_row_offset(screen: &vt100::Screen, inner: Rect) -> u16 {
-    screen.size().0.saturating_sub(inner.height)
+    let (grows, _) = screen.size();
+    let bottom_anchored = grows.saturating_sub(inner.height);
+    let cursor_row = screen.cursor_position().0;
+    // Slide the window up if the cursor would be above it.
+    bottom_anchored.min(cursor_row)
 }
 
-/// Render `screen` into `inner`, **bottom-anchored**: when the grid is taller than the pane, show
+/// Render `screen` into `inner` through the crop window (`crop_row_offset`): when the grid is taller than the pane, show
 /// its last `inner.height` rows (not the top — a diff-rendering TUI's content and prompt live at
 /// the bottom, so a top-anchored crop shows blank header rows, which is the split-pane "blank" bug).
 /// Columns are left-anchored. When the grid fits, it's a plain render.
@@ -4008,7 +4020,8 @@ fn render_screen_into(buf: &mut Buffer, inner: Rect, screen: &vt100::Screen) {
     let full = Rect::new(0, 0, gcols, grows);
     let mut scratch = Buffer::empty(full);
     PseudoTerminal::new(screen).render(full, &mut scratch);
-    let row_off = grows.saturating_sub(inner.height);
+    // The same window every other consumer (selection, double-click, links) uses.
+    let row_off = crop_row_offset(screen, inner);
     for y in 0..inner.height.min(grows) {
         for x in 0..inner.width.min(gcols) {
             if let Some(src) = scratch.cell((x, row_off + y)) {
@@ -4900,6 +4913,45 @@ mod tests {
             found,
             vec![(1, 11)],
             "the link is marked exactly once, on the translated pane row"
+        );
+    }
+
+    /// A freshly spawned shell draws its prompt on grid row 0 with the cursor near the top. Its
+    /// grid is the home size (the whole main area), but its pane is a split slot shorter than that,
+    /// so the bottom-anchored crop shows the grid's *bottom* rows — and row 0 is cropped away. The
+    /// user sees a blank pane although the daemon holds a live shell with a prompt. The crop must
+    /// follow the cursor: a screen whose content sits above the bottom window must show that
+    /// content (anchor so the cursor row is visible), not empty rows below it.
+    #[test]
+    fn a_short_split_pane_shows_a_new_shells_prompt_not_blank_rows() {
+        // 60-row home grid, prompt on row 0, cursor there — a fresh `bash`.
+        let mut parser = new_client_parser(60, 100, 0);
+        parser.process(b"user@host:~$ ");
+        assert_eq!(
+            parser.screen().cursor_position().0,
+            0,
+            "precondition: cursor on row 0"
+        );
+
+        // Shown in a 14-row split slot.
+        let inner = Rect::new(0, 0, 100, 14);
+        let mut buf = Buffer::empty(inner);
+        render_screen_into(&mut buf, inner, parser.screen());
+        let text: String = (0..inner.height)
+            .map(|y| {
+                (0..inner.width)
+                    .map(|x| {
+                        buf.cell((x, y))
+                            .map(|c| c.symbol().to_string())
+                            .unwrap_or_default()
+                    })
+                    .collect::<String>()
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(
+            text.contains("user@host:~$"),
+            "the prompt must be visible in the short slot, got:\n{text}"
         );
     }
 

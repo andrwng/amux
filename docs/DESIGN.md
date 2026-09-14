@@ -339,10 +339,16 @@ the proven mosh/agentapi-style split:
   `Event::Resize`, or the sidebar rail toggling. Splitting the main area, dragging a divider,
   promoting/demoting, or focus changes do **not** resize the app: the split only changes how much of
   the home-sized grid each pane renders. The grid size travels *to* the client (in
-  `OutputSnapshot { size, .. }`), which sizes its own parser to it; a pane smaller than the grid
-  **clips** (tui-term renders the top-left of the larger screen), a pane equal to it renders whole.
-  A parser sized to the viewport instead of the grid would mis-parse every byte the moment the two
-  differ, so the parser always follows the snapshot's size, never the pane's.
+  `OutputSnapshot { size, .. }`), which sizes its own parser to it; a pane equal to the grid renders
+  whole, and a pane **shorter** than the grid shows a *window* of it chosen by the **cursor**
+  (`crop_row_offset`): bottom-anchored — the grid's last rows, where a full-screen TUI like Claude
+  Code keeps its prompt and recent output — unless the cursor sits above that window, in which case
+  it slides up just enough to keep the cursor row visible. A fresh shell puts its prompt and cursor
+  on row 0 of a 60-row grid; a pure bottom anchor showed 14 empty rows, so a new split pane looked
+  dead while the daemon held a live shell. That one offset is the single source for rendering,
+  selection/copy, double-click, and link marking, so a click always lands on the cell it appears
+  over. A parser sized to the viewport instead of the grid would mis-parse every byte the moment
+  the two differ, so the parser always follows the snapshot's size, never the pane's.
 
   This is the whole blank-pane fix, and it was pinned by a daemon grid trace (§ "grid tracing"): a
   divider drag used to resize the pane's grid smaller on each step; vt100's keep-bottom `set_size`
