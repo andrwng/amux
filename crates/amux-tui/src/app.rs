@@ -902,6 +902,21 @@ impl App {
                 if let Some(parser) = self.parsers.get_mut(&terminal) {
                     parser.process(&bytes);
                 }
+                // Forward a clipboard write (OSC 52) the app just made to the real terminal. amux's
+                // parser consumes the app's OSC 52, so without this a program's "copy" (Claude
+                // Code's `c to copy` on its login URL) silently does nothing and the user pastes
+                // stale content. Only the focused pane may write the clipboard — matching a real
+                // terminal, where only the foreground program does — and the app's own base64 bytes
+                // are re-emitted verbatim, so no URL reconstruction is involved.
+                if self.focused_terminal() == Some(terminal) {
+                    if let Some(payload) = self
+                        .parsers
+                        .get_mut(&terminal)
+                        .and_then(|p| p.callbacks_mut().clipboard.take())
+                    {
+                        forward_clipboard(&payload);
+                    }
+                }
                 // A scrolled-back pane keeps showing the window it was served; live output lands in
                 // the parser above, ready for when the view returns to live. The daemon re-bases the
                 // position on the next step, so output arriving now doesn't move what's on screen.
@@ -2802,6 +2817,13 @@ struct Links {
     /// The open OSC 8, if the app is mid-link.
     pending: Option<(String, (u16, u16))>,
     spans: Vec<LinkSpan>,
+    /// The most recent OSC 52 clipboard write the app made (raw base64 payload after `52;c;`), not
+    /// yet forwarded to the outer terminal. amux's vt100 parser consumes the app's OSC 52 — it
+    /// never reaches the real terminal on its own — so a program's "copy to clipboard" (Claude
+    /// Code's `c to copy` on its login URL) would silently do nothing. Captured here and forwarded
+    /// verbatim for the focused pane (see `handle_daemon`), so the app's own exact bytes hit the
+    /// clipboard with no reconstruction.
+    clipboard: Option<Vec<u8>>,
 }
 
 /// How many app-declared spans a pane remembers. Bounded like everything else (`DESIGN.md` §2): a
@@ -2817,6 +2839,15 @@ struct LinkSpan {
 }
 
 impl vt100::Callbacks for Links {
+    /// OSC 52 clipboard *write*. vendored vt100 routes `52;<ty>;<base64>` here (not to
+    /// `unhandled_osc`); capture the payload so the client can forward it to the real terminal,
+    /// which amux otherwise never does. `data` is already base64 and validated by the parser.
+    fn copy_to_clipboard(&mut self, _screen: &mut vt100::Screen, _ty: &[u8], data: &[u8]) {
+        if !data.is_empty() {
+            self.clipboard = Some(data.to_vec());
+        }
+    }
+
     fn unhandled_osc(&mut self, screen: &mut vt100::Screen, params: &[&[u8]]) {
         if params.first() != Some(&b"8".as_slice()) {
             return;
@@ -3401,6 +3432,19 @@ fn highlight_selection(buf: &mut Buffer, sel: Selection) {
             }
         }
     }
+}
+
+/// Forward an app's OSC 52 clipboard payload (already base64, exactly as the app emitted it) to the
+/// outer terminal, so a program running in a pane can set the system clipboard. Re-emitting the
+/// app's own bytes means the clipboard gets the app's exact string — no cell-reconstruction, so a
+/// wrapped/bordered URL cannot be corrupted on the way (the bug behind Claude Code's `c to copy`).
+fn forward_clipboard(payload: &[u8]) {
+    use std::io::Write;
+    let mut out = std::io::stdout();
+    let _ = out.write_all(b"\x1b]52;c;");
+    let _ = out.write_all(payload);
+    let _ = out.write_all(b"\x07");
+    let _ = out.flush();
 }
 
 /// Copy `text` to the system clipboard via the OSC 52 terminal escape (dependency-free, works over
@@ -4723,6 +4767,49 @@ mod tests {
         );
     }
 
+    /// The app's OSC 52 clipboard write must be *captured* by the client parser (amux otherwise
+    /// drops it) so it can be forwarded verbatim to the outer terminal. This is Claude Code's
+    /// `c to copy`: the clipboard must get the app's exact bytes, not amux's cell reconstruction —
+    /// the fix for the login URL pasting wrong.
+    #[test]
+    fn an_apps_osc52_clipboard_write_is_captured_for_forwarding() {
+        let mut parser = new_client_parser(4, 80, 0);
+        // The app copies a URL: OSC 52, target `c`, base64 payload, BEL-terminated.
+        let url = "https://claude.com/cai/oauth/authorize?redirect_uri=x%2Fcallback";
+        let b64 = base64_encode(url.as_bytes());
+        parser.process(format!("\x1b]52;c;{b64}\x07").as_bytes());
+        let captured = parser
+            .callbacks_mut()
+            .clipboard
+            .take()
+            .expect("OSC 52 captured");
+        assert_eq!(
+            String::from_utf8(captured.clone()).unwrap(),
+            b64,
+            "the app's exact base64 payload is captured"
+        );
+        // And it decodes back to the app's exact URL — no reconstruction, no corruption.
+        let decoded = String::from_utf8(base64_decode(&captured)).unwrap();
+        assert_eq!(decoded, url);
+    }
+
+    /// A clipboard *query* (`52;c;?`) or clear (empty payload) is not a write and must not be
+    /// captured as one — forwarding those would echo garbage.
+    #[test]
+    fn an_osc52_query_or_clear_is_not_captured() {
+        let mut parser = new_client_parser(4, 80, 0);
+        parser.process(b"\x1b]52;c;?\x07");
+        assert!(
+            parser.callbacks_mut().clipboard.is_none(),
+            "a query is not a write"
+        );
+        parser.process(b"\x1b]52;c;\x07");
+        assert!(
+            parser.callbacks_mut().clipboard.is_none(),
+            "a clear is not a write"
+        );
+    }
+
     #[test]
     fn base64_matches_known_vectors() {
         assert_eq!(base64_encode(b""), "");
@@ -4730,6 +4817,43 @@ mod tests {
         assert_eq!(base64_encode(b"fo"), "Zm8=");
         assert_eq!(base64_encode(b"foo"), "Zm9v");
         assert_eq!(base64_encode(b"hello"), "aGVsbG8=");
+    }
+
+    /// Minimal base64 decode, test-only, to check a captured OSC 52 payload round-trips.
+    fn base64_decode(input: &[u8]) -> Vec<u8> {
+        fn val(c: u8) -> Option<u32> {
+            match c {
+                b'A'..=b'Z' => Some((c - b'A') as u32),
+                b'a'..=b'z' => Some((c - b'a' + 26) as u32),
+                b'0'..=b'9' => Some((c - b'0' + 52) as u32),
+                b'+' => Some(62),
+                b'/' => Some(63),
+                _ => None,
+            }
+        }
+        let mut out = Vec::new();
+        let mut acc = 0u32;
+        let mut n = 0;
+        for &c in input {
+            if let Some(v) = val(c) {
+                acc = (acc << 6) | v;
+                n += 1;
+                if n == 4 {
+                    out.push((acc >> 16) as u8);
+                    out.push((acc >> 8) as u8);
+                    out.push(acc as u8);
+                    acc = 0;
+                    n = 0;
+                }
+            }
+        }
+        if n == 3 {
+            out.push((acc >> 10) as u8);
+            out.push((acc >> 2) as u8);
+        } else if n == 2 {
+            out.push((acc >> 4) as u8);
+        }
+        out
     }
 
     #[test]
