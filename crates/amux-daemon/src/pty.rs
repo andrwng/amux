@@ -106,6 +106,53 @@ fn nonblank_rows(screen: &vt100::Screen) -> usize {
         .count()
 }
 
+/// Cap on a held partial escape: past this, flush rather than stall on a malformed unterminated
+/// sequence. Well beyond any real CSI a program emits, and generous enough for a large OSC (e.g. an
+/// OSC 52 clipboard write) that legitimately spans several reads.
+const MAX_ESC_CARRY: usize = 64 * 1024;
+
+/// How much of `buf` is safe to hand the parser *now* — everything except a **trailing incomplete
+/// escape sequence**, which must be carried to the next read.
+///
+/// A PTY `read()` splits escape sequences at arbitrary byte boundaries. If the daemon parser buffers
+/// such a partial, a snapshot taken between reads (on attach or resize) captures the grid but not the
+/// partial, and a client rebuilt from that snapshot then parses the sequence's *tail* as literal text
+/// — garbled/condensed rendering (`snapshot_between_halves_of_a_split_escape_round_trips`). Holding
+/// the partial here, outside the parser, keeps the parser and the broadcast escape-aligned, so no
+/// snapshot is ever mid-sequence and the client's byte stream matches the daemon's.
+fn complete_prefix_len(buf: &[u8]) -> usize {
+    const ESC: u8 = 0x1b;
+    let Some(i) = buf.iter().rposition(|&b| b == ESC) else {
+        return buf.len(); // no escape at all — all plain, all safe
+    };
+    let tail = &buf[i..];
+    if escape_is_complete(tail) || tail.len() > MAX_ESC_CARRY {
+        buf.len()
+    } else {
+        i // hold from the last ESC; everything before it is complete
+    }
+}
+
+/// Whether `s` (which starts at an ESC) is a complete escape sequence.
+fn escape_is_complete(s: &[u8]) -> bool {
+    const ESC: u8 = 0x1b;
+    let Some(&kind) = s.get(1) else {
+        return false; // a lone trailing ESC
+    };
+    match kind {
+        // CSI `ESC [ (params/intermediates)* final` — terminates at the first byte in 0x40..=0x7e.
+        b'[' => s[2..].iter().any(|&b| (0x40..=0x7e).contains(&b)),
+        // OSC `ESC ] … (BEL | ST)`.
+        b']' => s.contains(&0x07) || s.windows(2).any(|w| w == [ESC, b'\\']),
+        // DCS/SOS/PM/APC `ESC {P,X,^,_} … ST`.
+        b'P' | b'X' | b'^' | b'_' => s.windows(2).any(|w| w == [ESC, b'\\']),
+        // Charset designation `ESC (intermediate) (final)` — three bytes.
+        b'(' | b')' | b'*' | b'+' | b'-' | b'.' | b'/' => s.len() >= 3,
+        // Any other two-byte escape (`ESC 7`, `ESC =`, `ESC M`, …) — complete once its byte is here.
+        _ => true,
+    }
+}
+
 /// Where a client's scrolled-back window sits, and how deep history was when it was served.
 ///
 /// The pair is what makes a *relative* step exact: comparing the recorded depth with the current one
@@ -400,11 +447,27 @@ impl Session {
         let reader_thread = thread::spawn(move || {
             let mut buf = [0u8; 8192];
             let mut prev_nb: usize = 0; // for grid-trace transition detection
+            let mut carry: Vec<u8> = Vec::new(); // a trailing partial escape held for the next read
             loop {
                 match reader.read(&mut buf) {
                     Ok(0) => break,
                     Ok(n) => {
-                        let chunk = &buf[..n];
+                        // Prepend anything held from a mid-escape boundary, then split off a new
+                        // trailing partial so the parser and the broadcast stay escape-aligned and no
+                        // snapshot ever lands mid-sequence (see `complete_prefix_len`).
+                        let data = if carry.is_empty() {
+                            buf[..n].to_vec()
+                        } else {
+                            let mut d = std::mem::take(&mut carry);
+                            d.extend_from_slice(&buf[..n]);
+                            d
+                        };
+                        let keep = complete_prefix_len(&data);
+                        carry = data[keep..].to_vec();
+                        let chunk = &data[..keep];
+                        if chunk.is_empty() {
+                            continue; // the whole read was an unfinished escape — wait for the rest
+                        }
                         // Answer any terminal query in this chunk, but only *after* dropping the
                         // parser lock — see `Queries` — and only by enqueuing: a blocking write here
                         // would stall reading. Best-effort, so drop the reply if the queue is full.
@@ -427,7 +490,8 @@ impl Session {
                                 let c2j = chunk.windows(4).any(|w| w == b"\x1b[2J");
                                 let cj = chunk.windows(3).any(|w| w == b"\x1b[J");
                                 gtrace(&format!(
-                                    "sid={sid} OUTPUT grid {prev_nb}->{nb} {cols}x{rows} 2J={c2j} J={cj} len={n}"
+                                    "sid={sid} OUTPUT grid {prev_nb}->{nb} {cols}x{rows} 2J={c2j} J={cj} len={}",
+                                    chunk.len()
                                 ));
                             }
                             prev_nb = nb;
@@ -1241,6 +1305,197 @@ mod tests {
         assert!(
             !c.contains("line 0"),
             "the oldest rows scroll off the top, not the recent ones, got:\n{c}"
+        );
+    }
+}
+
+/// Minimal repros for snapshot-fidelity gaps. The client rebuilds its parser from `snapshot_bytes`
+/// and then applies the daemon's raw byte stream, so any parser state the snapshot fails to carry
+/// is a *permanent* divergence between what the daemon holds and what the user sees — which is what
+/// "condensed / missing newlines / garbled" looks like. Each test drives a daemon parser and a
+/// client rebuilt from its snapshot through the same subsequent bytes and demands identical screens.
+#[cfg(test)]
+mod snapshot_fidelity_repros {
+    use super::*;
+
+    fn visible(p: &vt100::Parser) -> (String, (u16, u16)) {
+        (p.screen().contents(), p.screen().cursor_position())
+    }
+
+    /// Writing exactly `cols` chars parks the cursor in vt100's pending-wrap state (`col == cols`).
+    /// The next char must wrap to the next row. If the snapshot clamps that cursor into the screen,
+    /// the client's next char lands on the last column instead — every char after is off by one and
+    /// wraps a column early: the text "condenses".
+    #[test]
+    fn pending_wrap_cursor_round_trips() {
+        let mut daemon = vt100::Parser::new(5, 10, 0);
+        daemon.process(b"0123456789"); // exactly 10 cols → pending wrap
+        let mut client = vt100::Parser::new(5, 10, 0);
+        client.process(&snapshot_bytes(daemon.screen()));
+
+        daemon.process(b"X");
+        client.process(b"X");
+        assert_eq!(
+            visible(&client),
+            visible(&daemon),
+            "a pending-wrap cursor must survive the snapshot"
+        );
+    }
+
+    /// The bug, at the parser level: if the daemon parser is fed a raw chunk ending inside a CSI, a
+    /// snapshot omits the buffered partial and a client rebuilt from it parses the tail as text. This
+    /// is *why* the reader must carry a trailing partial — kept as a guard that the hazard is real.
+    #[test]
+    fn feeding_the_parser_a_raw_partial_escape_diverges() {
+        let mut daemon = vt100::Parser::new(5, 20, 0);
+        daemon.process(b"hello");
+        daemon.process(b"\x1b["); // a raw read boundary inside a CSI (what the reader must NOT do)
+        let mut client = vt100::Parser::new(5, 20, 0);
+        client.process(&snapshot_bytes(daemon.screen()));
+        daemon.process(b"2Jworld");
+        client.process(b"2Jworld");
+        assert_ne!(
+            visible(&client),
+            visible(&daemon),
+            "sanity: a raw partial does diverge, so the reader's carry-over is load-bearing"
+        );
+    }
+
+    /// Mimic the reader: append `raw`, hand the parser only the escape-complete prefix, hold the
+    /// rest. Returns the bytes broadcast to clients (identical to what the parser processed).
+    fn feed(parser: &mut vt100::Parser, carry: &mut Vec<u8>, raw: &[u8]) -> Vec<u8> {
+        carry.extend_from_slice(raw);
+        let keep = complete_prefix_len(carry);
+        let emitted = carry[..keep].to_vec();
+        *carry = carry[keep..].to_vec();
+        parser.process(&emitted);
+        emitted
+    }
+
+    /// With the reader carrying the trailing partial, a snapshot taken at a read boundary that falls
+    /// mid-escape no longer diverges: the parser is escape-clean at snapshot time, and the client is
+    /// fed the same escape-aligned broadcast stream.
+    #[test]
+    fn snapshot_at_a_mid_escape_read_boundary_round_trips() {
+        let mut daemon = vt100::Parser::new(5, 20, 0);
+        let mut carry = Vec::new();
+        feed(&mut daemon, &mut carry, b"hello\x1b["); // read ends inside a CSI; "ESC[" is carried
+        assert_eq!(
+            carry, b"\x1b[",
+            "the partial CSI is held, not fed to the parser"
+        );
+
+        // A client attaches here — snapshot is taken between reads, parser is escape-clean.
+        let mut client = vt100::Parser::new(5, 20, 0);
+        client.process(&snapshot_bytes(daemon.screen()));
+
+        // The next read completes the CSI; the client sees the same escape-aligned broadcast.
+        let broadcast = feed(&mut daemon, &mut carry, b"2Jworld");
+        client.process(&broadcast);
+        assert_eq!(
+            visible(&client),
+            visible(&daemon),
+            "carrying the partial keeps the client in lockstep across a mid-escape snapshot"
+        );
+    }
+
+    /// Claude Code is dense with wide glyphs (emoji, CJK, powerline). Each is 2 columns, and one
+    /// that would overflow the last column wraps whole. The snapshot must round-trip them — cells,
+    /// widths, and the wrapped cursor — or a reattach shifts everything after a wide glyph.
+    #[test]
+    fn wide_chars_round_trip_including_a_wrap_at_the_margin() {
+        let mut daemon = vt100::Parser::new(3, 8, 0);
+        // 3 wide CJK (6 cols) + one more that cannot fit in the last 2 of an 8-wide row after it
+        // — force a margin wrap by starting near the edge.
+        daemon.process("ab日本語".as_bytes()); // a b (2 cols) + 日本語 (6 cols) = exactly 8 → wrap-pending
+        daemon.process("×".as_bytes()); // multi-byte but 1-col; lands on the next row
+        let mut client = vt100::Parser::new(3, 8, 0);
+        client.process(&snapshot_bytes(daemon.screen()));
+        assert_eq!(
+            visible(&client),
+            visible(&daemon),
+            "wide glyphs and the margin wrap must survive the snapshot"
+        );
+    }
+
+    /// A reattach rebuilds the client parser from the snapshot with a *fresh* OSC 8 link callback,
+    /// so hyperlinks the app declared before the snapshot are not carried — a documented cost, not a
+    /// garble. This pins that the *cells* are still correct (only the clickable-link overlay is lost
+    /// until the app repaints), so it never manifests as shifted/'garbled text.
+    #[test]
+    fn osc8_links_do_not_corrupt_cells_across_a_snapshot() {
+        let mut daemon = vt100::Parser::new(3, 40, 0);
+        daemon.process(b"see \x1b]8;;https://example.com/x\x1b\\example\x1b]8;;\x1b\\ ok");
+        let mut client = vt100::Parser::new(3, 40, 0);
+        client.process(&snapshot_bytes(daemon.screen()));
+        assert_eq!(
+            client.screen().contents(),
+            daemon.screen().contents(),
+            "the visible text of a hyperlink round-trips even if the link overlay does not"
+        );
+        assert!(client.screen().contents().contains("see example ok"));
+    }
+
+    #[test]
+    fn complete_prefix_len_holds_only_trailing_partials() {
+        // Complete inputs are handed over whole.
+        assert_eq!(complete_prefix_len(b"plain text"), 10);
+        assert_eq!(
+            complete_prefix_len(b"a\x1b[2Jb"),
+            6,
+            "a complete CSI mid-buffer"
+        );
+        assert_eq!(
+            complete_prefix_len(b"x\x1b]0;title\x07"),
+            11,
+            "OSC ended by BEL"
+        );
+        assert_eq!(
+            complete_prefix_len(b"x\x1b]0;t\x1b\\"),
+            8,
+            "OSC ended by ST"
+        );
+        assert_eq!(
+            complete_prefix_len(b"x\x1bP1;2\x1b\\"),
+            8,
+            "DCS ended by ST"
+        );
+        assert_eq!(
+            complete_prefix_len(b"x\x1b(B"),
+            4,
+            "3-byte charset designation"
+        );
+        assert_eq!(complete_prefix_len(b"x\x1b7"), 3, "2-byte escape");
+        // Trailing partials are held from the last ESC.
+        assert_eq!(complete_prefix_len(b"hi\x1b"), 2, "a lone trailing ESC");
+        assert_eq!(complete_prefix_len(b"hi\x1b[2"), 2, "an unfinished CSI");
+        assert_eq!(
+            complete_prefix_len(b"hi\x1b]0;ti"),
+            2,
+            "an unterminated OSC"
+        );
+        assert_eq!(
+            complete_prefix_len(b"hi\x1b("),
+            2,
+            "an unfinished charset designation"
+        );
+        // A completed sequence with plain text after it is all safe.
+        assert_eq!(complete_prefix_len(b"\x1b[2Jmore"), 8);
+    }
+
+    /// Rows that wrapped at one width carry a `wrapped` flag `contents_formatted` honours; a width
+    /// change must not let that flag re-join lines in the client that are separate on the daemon.
+    #[test]
+    fn wrapped_rows_survive_a_width_change() {
+        let mut daemon = vt100::Parser::new(5, 10, 0);
+        daemon.process(b"abcdefghijKLMNO\r\nnext"); // 15 chars wrap onto 2 rows, then a new line
+        daemon.screen_mut().set_size(5, 20); // widen: the wrapped pair now fits one row
+        let mut client = vt100::Parser::new(5, 20, 0);
+        client.process(&snapshot_bytes(daemon.screen()));
+        assert_eq!(
+            visible(&client),
+            visible(&daemon),
+            "wrapped rows must not re-join in the client after a width change"
         );
     }
 }
