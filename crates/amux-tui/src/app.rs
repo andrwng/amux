@@ -2953,16 +2953,19 @@ struct PaneLink {
 /// Claude Code indents body text 2–6 columns; the cap bounds false joins against deeper layout.
 const SOFT_WRAP_INDENT_MAX: u16 = 8;
 
-/// Whether the text of `line` runs into its end while inside a URL: a link scheme appears and no
-/// whitespace follows it. This is the gate for an *app* soft-wrap join — only a URL that hit the
-/// margin may continue onto the next row, so prose that merely ends at the margin stays two lines.
+/// Whether `line` ends inside a URL: a link scheme appears and, after it, the text runs to the end
+/// with no whitespace *inside* it. Trailing blanks (a right gutter the app left before the margin)
+/// are ignored — they are layout, and a URL that ends at the last text cell of a row is exactly the
+/// one the app wrapped. This is the gate for an *app* soft-wrap join, so prose that merely ends at
+/// the margin never joins.
 fn tail_in_url(line: &str) -> bool {
+    let trimmed = line.trim_end();
     LINK_SCHEMES
         .iter()
-        .filter_map(|s| line.rfind(s))
+        .filter_map(|s| trimmed.rfind(s))
         .max()
         .is_some_and(|start| {
-            let tail = line[start..].trim_end();
+            let tail = &trimmed[start..];
             !tail.is_empty() && !tail.chars().any(char::is_whitespace)
         })
 }
@@ -2971,9 +2974,10 @@ fn tail_in_url(line: &str) -> bool {
 /// starts. A line spans rows two ways. The *terminal* wrapped it — `row_wrapped` is set, the seam is
 /// exact, and the continuation starts at column 0. Or the *app* wrapped it: a TUI (ink / Claude
 /// Code) lays text out with cursor moves and breaks a long token itself, so `row_wrapped` stays
-/// false. That case is recognised only when it is unambiguous — the row is filled to its last cell,
-/// `line` (the logical line so far, ending with this row) runs into the margin **inside a URL**, and
-/// the next row starts non-blank within a small indent (the app's layout, not content); the
+/// false. That case is recognised only when it is unambiguous: `line` (the logical line so far,
+/// ending with this row) ends **inside a URL** — the URL runs to the row's last text cell, with only
+/// a possible right gutter of blanks after it — and the next row starts non-blank within a small
+/// indent (the app's layout, not content) with a character that can continue a URL. The
 /// continuation starts at that indent. Prose that happens to end at the margin never joins.
 /// Shared by link detection, copy, and double-click so all three agree on seams.
 fn continuation_start(
@@ -2989,15 +2993,18 @@ fn continuation_start(
     if screen.row_wrapped(row) {
         return Some(0);
     }
-    let nonblank = |y: u16, x: u16| {
+    if !tail_in_url(line) {
+        return None; // what reached the end of the row was not a URL — the line simply ended
+    }
+    let cell = |y: u16, x: u16| -> String {
         screen
             .cell(y, x)
-            .is_some_and(|c| !c.contents().trim().is_empty())
+            .map(|c| c.contents().to_string())
+            .unwrap_or_default()
     };
-    if !nonblank(row, width - 1) || !tail_in_url(line) {
-        return None; // the line simply ended, or what reached the margin was not a URL
-    }
-    (0..width.min(SOFT_WRAP_INDENT_MAX + 1)).find(|&x| nonblank(row + 1, x))
+    (0..width.min(SOFT_WRAP_INDENT_MAX + 1))
+        .find(|&x| !cell(row + 1, x).trim().is_empty())
+        .filter(|&x| is_token_char(&cell(row + 1, x)))
 }
 
 /// The text of one grid row, blanks as spaces so positions stay aligned (for seam decisions).
@@ -3041,6 +3048,20 @@ fn pane_links(screen: &vt100::Screen, width: u16, height: u16) -> Vec<PaneLink> 
             }
             match continuation_start(screen, last, width, height, &text) {
                 Some(start) => {
+                    // An app wrap (not a terminal wrap) leaves a right gutter of blank cells after
+                    // the URL on this row. They are layout, not text: drop them so the joined line
+                    // is a contiguous URL instead of `…/ab  cd…` — a URL with a space in it, which is
+                    // exactly what a click then opened.
+                    if !screen.row_wrapped(last) {
+                        while cells.last().is_some_and(|(_, _, c)| c.trim().is_empty()) {
+                            cells.pop();
+                            starts.pop();
+                        }
+                        text.truncate(starts.last().map_or(0, |&s| s));
+                        if let Some((_, _, c)) = cells.last() {
+                            text.push_str(c);
+                        }
+                    }
                     skip = start;
                     last += 1;
                 }
@@ -5996,6 +6017,48 @@ mod tests {
             links.iter().map(|l| l.url.as_str()).collect::<Vec<_>>(),
             vec!["https://ex.com/ab"],
             "an indented continuation joins, indent excluded from the URL"
+        );
+    }
+
+    /// The user's report: a long URL the app wrapped *with a right gutter* — the first row ends a
+    /// few cells before the margin, then the app continues on the next row. It looked right, but the
+    /// clicked link had a whitespace in it. The URL string the terminal receives (in the OSC 8) must
+    /// contain no whitespace and must be the *whole* URL, and the join must not require the first
+    /// row to be filled to its very last cell.
+    #[test]
+    fn a_gutter_wrapped_url_emits_one_whitespace_free_link() {
+        use ratatui::widgets::Widget;
+        let width = 20u16;
+        let mut parser = new_client_parser(3, width, 0);
+        // Row 0: 2-col indent + 16 URL chars, 2 gutter cells left blank at the right edge.
+        parser.process(b"  https://x.io/ab");
+        // Row 1: the app continues the URL itself (no terminal wrap), same indent.
+        parser.process(b"\x1b[2;1H  cd?state=Z");
+        assert!(
+            !parser.screen().row_wrapped(0),
+            "an app wrap, not a terminal wrap"
+        );
+
+        let inner = Rect::new(0, 0, width, 3);
+        let mut buf = Buffer::empty(inner);
+        PseudoTerminal::new(parser.screen()).render(inner, &mut buf);
+        mark_links(&mut buf, &parser, inner);
+        let wire: String = buf.content().iter().map(|c| c.symbol()).collect();
+        let links = linked_cells(&wire);
+        let urls: HashSet<String> = links.values().flatten().cloned().collect();
+        assert_eq!(
+            urls,
+            HashSet::from(["https://x.io/abcd?state=Z".to_string()]),
+            "one link, the whole URL, no whitespace: got {urls:?}"
+        );
+        // Every URL character on both rows is under that one link — 15 on row 0, 10 on row 1 — and
+        // nothing else is (the indent and gutter cells carry no link). `linked_cells` keys cells by
+        // its own walk of the wire, so count linked cells rather than address them by column.
+        let linked = links.values().filter(|v| v.is_some()).count();
+        assert_eq!(
+            linked,
+            15 + 10,
+            "exactly the URL's cells are linked, gutter/indent excluded"
         );
     }
 
