@@ -2888,29 +2888,59 @@ impl LinkSpan {
         if self.start.0 >= height || self.start > self.end {
             return None;
         }
-        let mut runs = Vec::new();
-        let mut text = String::new();
+        // Stitch the link from the URL-character cells inside the span, matching them against the
+        // declared URL as we go. The span's start/end are cursor positions; the app may draw the URL
+        // wrapped inside a box (`│ <url> │`) using cursor moves, so the rectangle between them is
+        // full of border and spacer cells. Matching only URL-ish cells against `self.url` skips
+        // those — the border can never enter a run — and works for plain, wrapped, indented, or
+        // boxed layouts alike. Runs are maximal same-row spans of consecutive matching cells.
+        let mut runs: Vec<(u16, u16, u16)> = Vec::new();
+        let mut matched = 0usize; // total URL bytes covered by emitted runs
         for row in self.start.0..=self.end.0.min(height.saturating_sub(1)) {
             let first = if row == self.start.0 { self.start.1 } else { 0 };
-            // The closer sits just past the last cell of the link, so `end.1` is exclusive.
             let last = if row == self.end.0 {
                 self.end.1.min(width)
             } else {
                 width
             };
-            if last <= first {
-                continue;
+            // Split the row into maximal spans of consecutive URL-character cells (border, space,
+            // and other layout cells break them). Keep a span whose text is a contiguous slice of
+            // the declared URL — that is the URL as this row shows it, be it a whole fragment, an
+            // indented continuation, or the interior of a `│ … │` box.
+            let mut x = first;
+            while x < last {
+                let c = |xx: u16| {
+                    screen
+                        .cell(row, xx)
+                        .map(|cell| cell.contents().to_string())
+                        .unwrap_or_default()
+                };
+                let here = c(x);
+                if here.is_empty() || !here.chars().all(is_url_char) {
+                    x += 1;
+                    continue;
+                }
+                let run_x0 = x;
+                let mut text = String::new();
+                let mut run_x1 = x;
+                while x < last {
+                    let cc = c(x);
+                    if cc.is_empty() || !cc.chars().all(is_url_char) {
+                        break;
+                    }
+                    text.push_str(&cc);
+                    run_x1 = x;
+                    x += 1;
+                }
+                if self.url.contains(&text) {
+                    matched += text.len();
+                    runs.push((row, run_x0, run_x1));
+                }
             }
-            for x in first..last {
-                let contents = screen
-                    .cell(row, x)
-                    .map(|c| c.contents().to_string())
-                    .unwrap_or_default();
-                text.push_str(&contents);
-            }
-            runs.push((row, first, last - 1));
         }
-        if runs.is_empty() || text.is_empty() || !self.url.contains(text.trim_end()) {
+        // Drop the span only if nothing under it still shows the URL (it was redrawn or scrolled
+        // away), so a stale span does not linger — but a fragment, box, or wrap is kept.
+        if runs.is_empty() || matched == 0 {
             return None;
         }
         Some(runs)
@@ -6458,6 +6488,65 @@ mod tests {
             links.iter().map(|l| l.url.as_str()).collect::<Vec<_>>(),
             vec!["https://x.io/abc"],
             "the URL ended; the line below is not part of it"
+        );
+    }
+
+    /// cmd+click path: the app declares its login URL as an OSC 8 hyperlink, then draws that URL
+    /// wrapped *inside a bordered box* (`│ <url> │`). The clickable href amux emits must be the
+    /// app's clean declared URL — never a reconstruction that pulled the border in. Regression for
+    /// the login link opening `…code│%2Fcallback` on cmd+click.
+    #[test]
+    fn cmd_click_emits_the_apps_clean_href_for_a_boxed_wrapped_url() {
+        use ratatui::widgets::Widget;
+        let url = "https://claude.com/cai/oauth/authorize?redirect_uri=https%3A%2F%2Fp.example%2Foauth%2Fcode%2Fcallback&state=xyz";
+        let cols = 40u16;
+        let mut parser = new_client_parser(6, cols, 0);
+        // App opens the OSC 8 link, then prints the URL wrapped inside a box across rows, each row
+        // `│ <chunk> │`, closing the link at the end. The declared href is clean.
+        parser.process(format!("\x1b]8;id=1;{url}\x1b\\").as_bytes());
+        let interior = 36usize; // 40 - "│ " - " │"
+        let bytes = url.as_bytes();
+        for (row, chunk) in (1..).zip(bytes.chunks(interior)) {
+            let c = std::str::from_utf8(chunk).unwrap();
+            parser.process(format!("\x1b[{row};1H│ {c:<interior$} │").as_bytes());
+        }
+        parser.process(b"\x1b]8;;\x1b\\");
+
+        // Render + mark_links, then extract every emitted OSC 8 href from the buffer.
+        let inner = Rect::new(0, 0, cols, 6);
+        let mut buf = Buffer::empty(inner);
+        PseudoTerminal::new(parser.screen()).render(inner, &mut buf);
+        mark_links(&mut buf, &parser, inner);
+        let mut hrefs = Vec::new();
+        for cell in buf.content() {
+            let sym = cell.symbol().as_bytes();
+            if let Some(a) = sym.windows(4).position(|w| w == b"\x1b]8;") {
+                let rest = &sym[a + 4..];
+                if let Some(t) = rest.windows(2).position(|w| w == b"\x1b\\") {
+                    let opener = &rest[..t];
+                    if let Some(semi) = opener.iter().rposition(|&b| b == b';') {
+                        let href = String::from_utf8_lossy(&opener[semi + 1..]).to_string();
+                        if !href.is_empty() {
+                            hrefs.push(href);
+                        }
+                    }
+                }
+            }
+        }
+        assert!(!hrefs.is_empty(), "the link must be clickable");
+        for h in &hrefs {
+            assert!(
+                !h.contains('\u{2502}'),
+                "href must not contain a box border: {h}"
+            );
+            assert!(
+                url.starts_with(h.as_str()) || h == url,
+                "href must be (a prefix of) the clean URL: {h}"
+            );
+        }
+        assert!(
+            hrefs.iter().any(|h| h == url),
+            "the full clean URL must be the emitted href, got {hrefs:?}"
         );
     }
 
