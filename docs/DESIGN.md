@@ -377,14 +377,18 @@ the proven mosh/agentapi-style split:
   harmful: an idle diff-renderer ignores the wobble's SIGWINCH, and because ink *clears* on SIGWINCH
   before repainting, the nudge can itself blank a pane. It is removed. With the stable home size a
   layout change never resizes the app, so there is no resize-induced blank to nudge away.
-- **Grid tracing.** A blank that only reproduces intermittently across reattaches is invisible to the
-  client-side `AMUX_RECORD` tap, which resets on every reattach and so always begins after the grid
-  is already blank. `AMUX_GRID_TRACE=<path>` turns on continuous daemon-side tracing (off — no cost —
-  otherwise): per session it logs spawn, every resize (nonblank rows before→after), each app-output
-  chunk that flips the grid content↔blank (flagged if it carried a `2J`), and attach. Because it
-  lives in the daemon it spans the whole session across detach/reattach, so it names the exact event
-  that blanked a grid — an app clear vs. an amux resize — which is what turned the stable-home fix
-  from a guess into a certainty.
+- **Grid tracing — always on.** A blank that only reproduces intermittently across reattaches is
+  invisible to the client-side `AMUX_RECORD` tap, which resets on every reattach and so always begins
+  after the grid is already blank. The daemon therefore traces continuously to
+  `<amux_home>/grid-trace.log` (override: `AMUX_GRID_TRACE=<path>`): per session it logs spawn,
+  every resize (nonblank rows before→after), each app-output chunk that flips the grid
+  content↔blank (flagged if it carried a `2J`/`J`), and attach, each line tagged with the daemon
+  pid. It was env-gated at first; the one time it was needed most a restarted daemon didn't have the
+  variable and the blank went unrecorded, so it is enabled by the daemon at startup and bounded
+  instead (rotates to `.1` past 4 MiB; `grid_trace_rotates_past_its_cap`). Tests never enable it,
+  so `cargo test` cannot write into a real home. Because it lives in the daemon it spans the whole
+  session across detach/reattach and names the exact event that blanked a grid — an app clear vs. an
+  amux resize — which is what turned the stable-home fix from a guess into a certainty.
 - **Late-join snapshot — and it must be a *faithful* one.** On `SubscribeOutput` the daemon sends
   `snapshot_bytes()`: a preamble of terminal state that `contents_formatted()` does not encode,
   followed by `contents_formatted()` (the visible cells), then the live stream. This is load-bearing,

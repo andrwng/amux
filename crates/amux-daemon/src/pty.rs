@@ -67,18 +67,32 @@ fn terminfo_exists(name: &str) -> bool {
 /// conversation; a session that never scrolls costs nothing.
 const SCROLLBACK: usize = 5000;
 
-/// Continuous, per-session grid tracing for the blank-pane investigation. Env-gated
-/// (`AMUX_GRID_TRACE=<path>`), so it is entirely off — no allocation, no cell scan — unless set.
-/// Unlike the client-side `AMUX_RECORD` tap (which resets on every TUI reattach and so always
-/// *starts* after the grid is already blank), this lives in the daemon and spans the whole session
-/// lifetime: it records the exact event that turns a grid content→blank (an app `2J`, a resize, an
-/// attach), which is the one fact needed to fix the right layer.
+/// Continuous, per-session grid tracing: the record of what turned a grid content→blank.
+///
+/// The client-side `AMUX_RECORD` tap resets on every TUI reattach, so it always *starts* after the
+/// grid is already blank; this lives in the daemon and spans a session's whole life. Per session it
+/// logs spawn, every resize (nonblank rows before→after), each app-output chunk that flips the grid
+/// content↔blank (flagged if it carried a `2J`/`J`), and attach. It is **always on** once the daemon
+/// enables it at startup ([`enable_grid_trace`], default `<amux_home>/grid-trace.log`, override
+/// `AMUX_GRID_TRACE`), because the one time it was needed most it was off: the blank was never
+/// recorded. Off until enabled — unit and integration tests never enable it, so `cargo test` cannot
+/// write into a real home. Lines carry the daemon pid so several daemons (one per repo) sharing a
+/// file stay distinguishable. Bounded: the file rotates to `.1` past [`GRID_TRACE_CAP`] (§2.6).
 static SESSION_SEQ: AtomicU64 = AtomicU64::new(0);
+static GRID_TRACE: OnceLock<std::path::PathBuf> = OnceLock::new();
+
+/// Size past which the trace file rotates (one previous generation kept as `<path>.1`). Lines are
+/// written only on transitions, so this covers weeks of normal use.
+const GRID_TRACE_CAP: u64 = 4 * 1024 * 1024;
+
+/// Turn grid tracing on for this process, writing to `path`. Called once by the daemon at startup;
+/// a second call is ignored.
+pub fn enable_grid_trace(path: std::path::PathBuf) {
+    let _ = GRID_TRACE.set(path);
+}
 
 fn grid_trace_path() -> Option<&'static Path> {
-    static P: OnceLock<Option<std::path::PathBuf>> = OnceLock::new();
-    P.get_or_init(|| std::env::var_os("AMUX_GRID_TRACE").map(std::path::PathBuf::from))
-        .as_deref()
+    GRID_TRACE.get().map(|p| p.as_path())
 }
 
 fn gtrace(msg: &str) {
@@ -89,13 +103,27 @@ fn gtrace(msg: &str) {
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_millis())
         .unwrap_or(0);
-    if let Ok(mut f) = std::fs::OpenOptions::new()
+    let line = format!("{ms} pid={} {msg}\n", std::process::id());
+    let _ = append_bounded(path, &line, GRID_TRACE_CAP);
+}
+
+/// Append `line` to `path`, rotating the file to `<path>.1` first when it has grown past `cap` —
+/// so the trace can stay on forever without growing without bound. One previous generation is kept
+/// so the events leading up to a rotation are not lost.
+fn append_bounded(path: &Path, line: &str, cap: u64) -> std::io::Result<()> {
+    if std::fs::metadata(path)
+        .map(|m| m.len() > cap)
+        .unwrap_or(false)
+    {
+        let mut rotated = path.as_os_str().to_owned();
+        rotated.push(".1");
+        std::fs::rename(path, rotated)?;
+    }
+    let mut f = std::fs::OpenOptions::new()
         .create(true)
         .append(true)
-        .open(path)
-    {
-        let _ = writeln!(f, "{ms} {msg}");
-    }
+        .open(path)?;
+    f.write_all(line.as_bytes())
 }
 
 /// Number of visible rows that hold any text — the "is the screen blank?" signal for tracing.
@@ -760,6 +788,42 @@ impl Drop for Session {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The grid trace is always on, so it must be bounded: past the cap the file rotates to `.1`
+    /// (one generation kept) and appending continues in a fresh file.
+    #[test]
+    fn grid_trace_rotates_past_its_cap() {
+        let dir = std::env::temp_dir().join(format!(
+            "amux-trace-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0)
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("grid-trace.log");
+        let cap = 64;
+        append_bounded(&path, "first line, well under the cap\n", cap).unwrap();
+        append_bounded(&path, "second line, pushing the file past 64 bytes\n", cap).unwrap();
+        assert!(
+            std::fs::metadata(&path).unwrap().len() > cap,
+            "precondition: over the cap"
+        );
+
+        append_bounded(&path, "third line\n", cap).unwrap();
+        let rotated = std::fs::read_to_string(dir.join("grid-trace.log.1")).unwrap();
+        assert!(
+            rotated.contains("first line") && rotated.contains("second line"),
+            "the previous generation is kept whole: {rotated:?}"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap(),
+            "third line\n",
+            "appending continues in a fresh file"
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
 
     /// A session fed `n` numbered lines through `cat`, once the parser has caught up (bounded wait,
     /// so a stuck child fails an assertion rather than hanging the suite).

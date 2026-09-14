@@ -47,6 +47,15 @@ pub fn run_blocking(repo: PathBuf) -> Result<()> {
         .with_context(|| format!("create runtime dir {}", paths.dir.display()))?;
     std::fs::set_permissions(&paths.dir, std::fs::Permissions::from_mode(0o700)).ok();
 
+    // Grid-transition trace, always on for a real daemon (bounded, see `pty::enable_grid_trace`).
+    // Enabled here — not by default inside `pty` — so tests, which never start a daemon this way,
+    // never write into a real amux home. `AMUX_GRID_TRACE=<path>` overrides the location.
+    let trace = match std::env::var_os("AMUX_GRID_TRACE") {
+        Some(p) if !p.is_empty() => PathBuf::from(p),
+        _ => amux_core::paths::amux_home()?.join("grid-trace.log"),
+    };
+    pty::enable_grid_trace(trace);
+
     let socket = paths.socket();
     let mailbox = paths.mailbox();
     for path in [&socket, &mailbox] {
