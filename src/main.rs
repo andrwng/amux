@@ -6,9 +6,46 @@ use std::path::PathBuf;
 
 use clap::{Parser, Subcommand};
 
+/// The version string for `--version`: the git commit and build time this binary was built from.
+/// The Cargo version is `0.0.0` and useless for telling two builds apart; the git hash is the fact
+/// that actually matters when confirming a freshly installed binary is the one running.
+fn amux_version() -> &'static str {
+    static V: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+    V.get_or_init(|| {
+        // Render the build epoch as a UTC `YYYY-MM-DD HH:MM:SS`, eyeball-comparable with a file
+        // mtime — dependency-free (the binary crate has no chrono), civil-from-days arithmetic.
+        let epoch: i64 = env!("AMUX_BUILD_EPOCH").parse().unwrap_or(0);
+        format!(
+            "{} (git {}, built {} UTC)",
+            env!("CARGO_PKG_VERSION"),
+            env!("AMUX_GIT_HASH"),
+            fmt_utc(epoch)
+        )
+    })
+}
+
+/// Format a Unix timestamp as `YYYY-MM-DD HH:MM:SS`, UTC, without a date crate (days-since-epoch to
+/// civil date via Howard Hinnant's algorithm). Only used for the `--version` build stamp.
+fn fmt_utc(secs: i64) -> String {
+    let days = secs.div_euclid(86_400);
+    let rem = secs.rem_euclid(86_400);
+    let (h, mi, s) = (rem / 3600, (rem % 3600) / 60, rem % 60);
+    let z = days + 719_468;
+    let era = z.div_euclid(146_097);
+    let doe = z.rem_euclid(146_097);
+    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
+    let y = yoe + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = doy - (153 * mp + 2) / 5 + 1;
+    let m = if mp < 10 { mp + 3 } else { mp - 9 };
+    let y = if m <= 2 { y + 1 } else { y };
+    format!("{y:04}-{m:02}-{d:02} {h:02}:{mi:02}:{s:02}")
+}
+
 /// Multiplex AI coding agents in isolated git worktrees.
 #[derive(Parser)]
-#[command(name = "amux", version, about)]
+#[command(name = "amux", version = amux_version(), about)]
 struct Cli {
     #[command(subcommand)]
     command: Option<Command>,
