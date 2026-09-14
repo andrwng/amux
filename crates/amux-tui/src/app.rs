@@ -2982,6 +2982,13 @@ struct PaneLink {
 /// copy without a newline spliced into it. Cost: a rare false join — a line that ends exactly at
 /// the margin followed by one starting at column 0 reads as one line — accepted against the common
 /// breakage it fixes. Shared by link detection, copy, and double-click so they agree on seams.
+/// Widest right gutter between a wrapped URL's last character and the pane's right edge. A URL that
+/// actually wrapped ran to (or near) the margin — a bordered box leaves 1-2 cells for `│`. A URL
+/// that ends far short of the margin did not wrap; it simply ended, and must not join the line
+/// below. This is what distinguishes `…/callback │` (gutter 2, a wrap) from `see …/abc` followed by
+/// 150 blanks (not a wrap).
+const SOFT_WRAP_GUTTER_MAX: u16 = 4;
+
 /// Widest indent an app-wrapped continuation row may carry and still count as a continuation.
 /// Claude Code indents body text 2–6 columns; the cap bounds false joins against deeper layout.
 const SOFT_WRAP_INDENT_MAX: u16 = 8;
@@ -3047,6 +3054,24 @@ fn continuation_start(
             .map(|c| c.contents().to_string())
             .unwrap_or_default()
     };
+    // A wrap only happened if the URL ran to a boundary: the pane's right edge (a plain `\r\n`
+    // wrap fills to the margin) or a box border a cell or two past it (`│ …url │`). A URL that ends
+    // in open blanks — the margin far away, no border — did not wrap; it ended, and the line below
+    // is a new line. Scan the small gutter after the URL's last character for that boundary.
+    let last_url_col = (0..width)
+        .rev()
+        .find(|&x| !cell(row, x).trim().is_empty() && cell(row, x).chars().all(is_url_char))?;
+    let reached_boundary = (1..=SOFT_WRAP_GUTTER_MAX).any(|off| {
+        let x = last_url_col + off;
+        if x >= width {
+            return true; // the pane's right edge — a plain wrap filled to the margin
+        }
+        let c = cell(row, x);
+        !c.trim().is_empty() && !c.chars().all(is_url_char) // a border/layout glyph — a box wrap
+    }) || last_url_col + 1 >= width;
+    if !reached_boundary {
+        return None;
+    }
     // The continuation starts at the first URL character within the indent window. Blanks are the
     // app's indent; a leading layout glyph (a box border `│`) is skipped the same way — neither is
     // URL text. If no URL character appears within the window, the rows are not one URL.
@@ -6285,6 +6310,23 @@ mod tests {
             app.selection_text().as_deref(),
             Some(url),
             "the whole URL, byte-exact"
+        );
+    }
+
+    /// A URL that simply *ends* (far from the right margin) must NOT be joined to a url-ish line
+    /// below it — e.g. Claude prints the URL, then a spacer, then "Hold Option while selecting…".
+    /// Only a URL that ran to the margin (a small gutter aside) actually wrapped. Regression for a
+    /// tail over-capture the login render exposed (`…4dU` gaining a stray char from the next line).
+    #[test]
+    fn a_url_that_ends_before_the_margin_does_not_join_below() {
+        let mut p = vt100::Parser::new(4, 40, 0);
+        p.process(b"see https://x.io/abc"); // ends at col 20 of 40 — nowhere near the margin
+        p.process(b"\x1b[2;1HHold on"); // a url-ish word right below
+        let links = pane_links(p.screen(), 40, 4);
+        assert_eq!(
+            links.iter().map(|l| l.url.as_str()).collect::<Vec<_>>(),
+            vec!["https://x.io/abc"],
+            "the URL ended; the line below is not part of it"
         );
     }
 
