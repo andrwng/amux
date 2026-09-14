@@ -1959,7 +1959,14 @@ impl App {
             // and gets no separator: re-inserting a break the program never printed would corrupt a
             // URL (or any long token) on paste. A row that ends because the program printed a
             // newline is trimmed and separated as before.
-            let wrapped = screen.row_wrapped((y - sel.inner.y) + row_off) && c1 == right;
+            // A row that continues onto the next (terminal- or app-wrapped) keeps its trailing
+            // cells and gets no separator — see `continues_on_next_row`.
+            let wrapped = continues_on_next_row(
+                screen,
+                (y - sel.inner.y) + row_off,
+                sel.inner.width,
+                screen.size().0,
+            ) && c1 == right;
             if !wrapped {
                 while line.ends_with(' ') {
                     line.pop();
@@ -1989,8 +1996,13 @@ impl App {
         row: u16,
     ) -> Option<Selection> {
         let screen = self.parsers.get(&terminal)?.screen();
-        let cy = row.checked_sub(inner.y)?;
+        // Work in grid rows: a split pane shows the grid's bottom rows (see `render_screen`), so the
+        // clicked frame row maps `row_off` lower in the grid, and only rows within the visible window
+        // `[row_off, row_off + inner.height)` are selectable.
+        let row_off = crop_row_offset(screen, inner);
+        let cy = row.checked_sub(inner.y)? + row_off;
         let cx = col.checked_sub(inner.x)?;
+        let (top, bottom) = (row_off, row_off + inner.height);
         let cells = |y: u16| -> Vec<String> {
             (0..inner.width)
                 .map(|x| {
@@ -2003,12 +2015,14 @@ impl App {
         };
         let last = inner.width.saturating_sub(1) as usize;
         let (x0, x1) = token_span(&cells(cy), cx as usize)?;
+        let rows = screen.size().0;
 
-        // Backwards over seams: this row continues the one above only if that row was wrapped, and
-        // the token has to actually reach the seam on both sides of it.
+        // Backwards over seams: this row continues the one above only if that row continues onto
+        // it (terminal- or app-wrapped) *at exactly where this token starts* — column 0 for a
+        // terminal wrap, the app's indent for a soft wrap — and the token reaches the seam above.
         let mut y0 = cy;
         let mut x0 = x0;
-        while x0 == 0 && y0 > 0 && screen.row_wrapped(y0 - 1) {
+        while y0 > top && continuation_start(screen, y0 - 1, inner.width, rows) == Some(x0 as u16) {
             let above = cells(y0 - 1);
             match token_span(&above, last) {
                 Some((ax0, _)) => {
@@ -2018,12 +2032,15 @@ impl App {
                 None => break,
             }
         }
-        // Forwards over seams, symmetrically.
+        // Forwards over seams, symmetrically: the continuation's token begins at the start column.
         let mut y1 = cy;
         let mut x1 = x1;
-        while x1 == last && screen.row_wrapped(y1) && y1 + 1 < inner.height {
+        while x1 == last && y1 + 1 < bottom {
+            let Some(start) = continuation_start(screen, y1, inner.width, rows) else {
+                break;
+            };
             let below = cells(y1 + 1);
-            match token_span(&below, 0) {
+            match token_span(&below, start as usize) {
                 Some((_, bx1)) => {
                     y1 += 1;
                     x1 = bx1;
@@ -2034,8 +2051,8 @@ impl App {
         Some(Selection {
             terminal,
             inner,
-            anchor: (inner.x + x0 as u16, inner.y + y0),
-            head: (inner.x + x1 as u16, inner.y + y1),
+            anchor: (inner.x + x0 as u16, inner.y + (y0 - row_off)),
+            head: (inner.x + x1 as u16, inner.y + (y1 - row_off)),
             active: true,
         })
     }
@@ -2888,25 +2905,71 @@ struct PaneLink {
 /// what makes a long URL findable at all — then each match is mapped back to the cells it came from.
 /// The mapping is by cell count rather than by byte offset so a wide glyph earlier in the line
 /// cannot shift a run.
+/// Whether row `row` continues onto `row + 1` as one logical line.
+///
+/// A line spans rows two ways. The *terminal* wrapped it — `row_wrapped` is set and the seam is
+/// exact. Or the *app* wrapped it: a TUI (ink / Claude Code) lays text out with cursor moves and
+/// breaks a long token itself, so `row_wrapped` stays false and, to the terminal, the rows are
+/// unrelated. For that case, a row filled to its last cell whose next row starts non-blank at
+/// column 0 is treated as continuing. This is what lets a URL the app wrapped read as one link and
+/// copy without a newline spliced into it. Cost: a rare false join — a line that ends exactly at
+/// the margin followed by one starting at column 0 reads as one line — accepted against the common
+/// breakage it fixes. Shared by link detection, copy, and double-click so they agree on seams.
+fn continues_on_next_row(screen: &vt100::Screen, row: u16, width: u16, height: u16) -> bool {
+    continuation_start(screen, row, width, height).is_some()
+}
+
+/// Widest indent an app-wrapped continuation row may carry and still count as a continuation.
+/// Claude Code indents body text 2–6 columns; the cap bounds false joins against deeper layout.
+const SOFT_WRAP_INDENT_MAX: u16 = 8;
+
+/// If row `row` continues onto `row + 1`, the column on `row + 1` where the continuation's text
+/// starts: `0` for a terminal wrap (the seam is exact), or the first non-blank column — the app's
+/// indent, which is layout rather than content — for an app wrap. `None` when the rows are separate.
+/// See `continues_on_next_row` for why both kinds exist.
+fn continuation_start(screen: &vt100::Screen, row: u16, width: u16, height: u16) -> Option<u16> {
+    if row + 1 >= height || width == 0 {
+        return None;
+    }
+    if screen.row_wrapped(row) {
+        return Some(0);
+    }
+    let nonblank = |y: u16, x: u16| {
+        screen
+            .cell(y, x)
+            .is_some_and(|c| !c.contents().trim().is_empty())
+    };
+    if !nonblank(row, width - 1) {
+        return None; // not filled to the margin — the line simply ended
+    }
+    (0..width.min(SOFT_WRAP_INDENT_MAX + 1)).find(|&x| nonblank(row + 1, x))
+}
+
 fn pane_links(screen: &vt100::Screen, width: u16, height: u16) -> Vec<PaneLink> {
     let mut links = Vec::new();
     let mut y = 0;
     while y < height {
-        // Gather one logical line: this row plus every row it wrapped onto.
+        // Gather one logical line: this row plus every row it continues onto (terminal- or
+        // app-wrapped — see `continues_on_next_row`).
         let mut cells: Vec<(u16, u16, String)> = Vec::new();
         let mut last = y;
+        // Leading cells to drop from a continuation row: an app-wrapped row's indent is layout,
+        // not part of the token that wrapped onto it (0 for a terminal wrap, whose seam is exact).
+        let mut skip: u16 = 0;
         loop {
-            for x in 0..width {
+            for x in skip..width {
                 let contents = screen
                     .cell(last, x)
                     .map(|c| c.contents().to_string())
                     .unwrap_or_default();
                 cells.push((last, x, contents));
             }
-            if screen.row_wrapped(last) && last + 1 < height {
-                last += 1;
-            } else {
-                break;
+            match continuation_start(screen, last, width, height) {
+                Some(start) => {
+                    skip = start;
+                    last += 1;
+                }
+                None => break,
             }
         }
         // The logical line, plus the cell each character starts at.
@@ -5780,6 +5843,79 @@ mod tests {
     /// three rows, and clicking any of them yields the whole URL. Before this, `token_span` stopped
     /// at the pane's right edge and copied `https://example.` — a truncation that looks like a
     /// working copy until you paste it.
+    /// A URL the *terminal* wraps sets `row_wrapped`, and `pane_links` joins the rows into one link.
+    #[test]
+    fn a_hard_wrapped_url_is_one_link() {
+        let mut p = vt100::Parser::new(3, 10, 0);
+        p.process(b"https://ex.com/ab"); // 17 chars on a 10-col row → terminal wraps at col 10
+        let links = pane_links(p.screen(), 10, 3);
+        assert_eq!(
+            links.iter().map(|l| l.url.as_str()).collect::<Vec<_>>(),
+            vec!["https://ex.com/ab"]
+        );
+    }
+
+    /// A URL the *app* wraps itself (ink/Claude Code addresses each row with a cursor move, so
+    /// `row_wrapped` stays false) must still be detected as one link — not a fragment that opens a
+    /// truncated URL when clicked. This is the "multi-line URL is buggy" report.
+    #[test]
+    fn an_app_soft_wrapped_url_is_one_link() {
+        let mut p = vt100::Parser::new(3, 10, 0);
+        p.process(b"https://ex"); // fills row 0 exactly, no terminal wrap
+        p.process(b"\x1b[2;1H.com/ab"); // the app continues it on row 1 itself
+        assert!(
+            !p.screen().row_wrapped(0),
+            "precondition: a soft wrap, not a terminal wrap"
+        );
+        let links = pane_links(p.screen(), 10, 3);
+        assert_eq!(
+            links.iter().map(|l| l.url.as_str()).collect::<Vec<_>>(),
+            vec!["https://ex.com/ab"],
+            "the two rows must join into one URL"
+        );
+    }
+
+    /// Claude Code indents its body text ("  ⎿ …", "  - …"), so a URL it wraps continues on the next
+    /// row *after an indent*, not at column 0. The indent is layout, not part of the URL: the two
+    /// rows must still join into one link, with the indent dropped.
+    #[test]
+    fn an_indented_app_soft_wrapped_url_is_one_link() {
+        let mut p = vt100::Parser::new(3, 12, 0);
+        p.process(b"  https://ex"); // 2-col indent + 10 chars fills the 12-col row
+        p.process(b"\x1b[2;1H  .com/ab"); // continuation, indented to the same margin
+        assert!(!p.screen().row_wrapped(0));
+        let links = pane_links(p.screen(), 12, 3);
+        assert_eq!(
+            links.iter().map(|l| l.url.as_str()).collect::<Vec<_>>(),
+            vec!["https://ex.com/ab"],
+            "an indented continuation joins, indent excluded from the URL"
+        );
+    }
+
+    /// Copying across an app-soft-wrapped URL must not insert a newline where the app broke the line
+    /// — pasted, that is a broken link. (`row_wrapped` is false here, so the terminal-wrap rule in
+    /// `selection_text` does not fire on its own.)
+    #[test]
+    fn copying_an_app_soft_wrapped_url_has_no_newline() {
+        let mut app = App::new(100, 40);
+        let t = TerminalId::new();
+        let mut parser = new_client_parser(3, 10, 0);
+        parser.process(b"https://ex\x1b[2;1H.com/ab");
+        app.parsers.insert(t, parser);
+        app.selection = Some(Selection {
+            terminal: t,
+            inner: Rect::new(0, 0, 10, 3),
+            anchor: (0, 0),
+            head: (6, 1),
+            active: true,
+        });
+        assert_eq!(
+            app.selection_text().as_deref(),
+            Some("https://ex.com/ab"),
+            "no newline may be inserted inside the URL"
+        );
+    }
+
     #[tokio::test]
     async fn a_double_clicked_url_survives_wrapping() {
         let url = "https://example.com/a/very/long/path/x?q=1";
