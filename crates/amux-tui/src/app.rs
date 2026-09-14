@@ -2938,9 +2938,16 @@ fn urls_in_line(line: &str) -> Vec<std::ops::Range<usize>> {
                 .iter()
                 .find(|s| line[start..].starts_with(**s))
                 .map_or(0, |s| s.len());
+        // A URL ends at the first character that cannot be in one: whitespace, or any other
+        // non-URL glyph. The latter is load-bearing — a box border `│` (U+2502) is not whitespace,
+        // so ending only at whitespace let a bordered/wrapped URL swallow the border, which is how
+        // `…%2Fcode│%2Fcallback` reached the browser and broke the OAuth redirect_uri. Ending at
+        // the URL character class guarantees no layout glyph can ever sit inside a detected URL,
+        // whatever the row-join produced.
         let mut end = line[after_scheme..]
-            .find(char::is_whitespace)
-            .map_or(line.len(), |i| after_scheme + i);
+            .char_indices()
+            .find(|(_, c)| !is_url_char(*c))
+            .map_or(line.len(), |(i, _)| after_scheme + i);
         while end > after_scheme
             && line[..end]
                 .chars()
@@ -6327,6 +6334,21 @@ mod tests {
             links.iter().map(|l| l.url.as_str()).collect::<Vec<_>>(),
             vec!["https://x.io/abc"],
             "the URL ended; the line below is not part of it"
+        );
+    }
+
+    /// A box border (or any non-URL glyph) embedded in the text must terminate the URL, never be
+    /// swallowed into it — the defensive root fix for the OAuth login corruption
+    /// (`...%2Fcode<border>%2Fcallback`). Whatever the row-join produces, `urls_in_line` stops at it.
+    #[test]
+    fn a_url_terminates_at_a_box_border_glyph() {
+        let line = "https://x.io/oauth/code\u{2502}/callback more";
+        let ranges = urls_in_line(line);
+        let urls: Vec<&str> = ranges.iter().map(|r| &line[r.clone()]).collect();
+        assert_eq!(
+            urls,
+            vec!["https://x.io/oauth/code"],
+            "the URL ends at the border glyph; it and the rest are not part of it"
         );
     }
 
