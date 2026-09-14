@@ -2831,6 +2831,10 @@ struct Links {
 /// most likely been redrawn anyway.
 const MAX_LINK_SPANS: usize = 256;
 
+/// The fewest URI bytes the cells under an app-declared span must reproduce for the span to still
+/// count as that link (see `LinkSpan::runs_in`). Shorter matches are prose coincidences.
+const MIN_LINK_TEXT: usize = 8;
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct LinkSpan {
     url: String,
@@ -2888,14 +2892,11 @@ impl LinkSpan {
         if self.start.0 >= height || self.start > self.end {
             return None;
         }
-        // Stitch the link from the URL-character cells inside the span, matching them against the
-        // declared URL as we go. The span's start/end are cursor positions; the app may draw the URL
-        // wrapped inside a box (`│ <url> │`) using cursor moves, so the rectangle between them is
-        // full of border and spacer cells. Matching only URL-ish cells against `self.url` skips
-        // those — the border can never enter a run — and works for plain, wrapped, indented, or
-        // boxed layouts alike. Runs are maximal same-row spans of consecutive matching cells.
-        let mut runs: Vec<(u16, u16, u16)> = Vec::new();
-        let mut matched = 0usize; // total URL bytes covered by emitted runs
+        // Collect the runs of URL-character cells inside the span, row-major. The span's start/end
+        // are cursor positions; the app may draw the URL wrapped inside a box (`│ <url> │`) using
+        // cursor moves, so the rectangle between them holds border and spacer cells — never URL
+        // characters, so they can't join a run.
+        let mut runs: Vec<((u16, u16, u16), String)> = Vec::new();
         for row in self.start.0..=self.end.0.min(height.saturating_sub(1)) {
             let first = if row == self.start.0 { self.start.1 } else { 0 };
             let last = if row == self.end.0 {
@@ -2903,18 +2904,14 @@ impl LinkSpan {
             } else {
                 width
             };
-            // Split the row into maximal spans of consecutive URL-character cells (border, space,
-            // and other layout cells break them). Keep a span whose text is a contiguous slice of
-            // the declared URL — that is the URL as this row shows it, be it a whole fragment, an
-            // indented continuation, or the interior of a `│ … │` box.
+            let c = |xx: u16| {
+                screen
+                    .cell(row, xx)
+                    .map(|cell| cell.contents().to_string())
+                    .unwrap_or_default()
+            };
             let mut x = first;
             while x < last {
-                let c = |xx: u16| {
-                    screen
-                        .cell(row, xx)
-                        .map(|cell| cell.contents().to_string())
-                        .unwrap_or_default()
-                };
                 let here = c(x);
                 if here.is_empty() || !here.chars().all(is_url_char) {
                     x += 1;
@@ -2932,18 +2929,47 @@ impl LinkSpan {
                     run_x1 = x;
                     x += 1;
                 }
-                if self.url.contains(&text) {
-                    matched += text.len();
-                    runs.push((row, run_x0, run_x1));
-                }
+                runs.push(((row, run_x0, run_x1), text));
             }
         }
-        // Drop the span only if nothing under it still shows the URL (it was redrawn or scrolled
-        // away), so a stale span does not linger — but a fragment, box, or wrap is kept.
-        if runs.is_empty() || matched == 0 {
+        // What the cells must show to still be this link — one of two shapes, nothing looser:
+        //
+        // 1. **A fragment.** Every run in the rectangle, concatenated in order, is one contiguous
+        //    slice of the URI. This is a whole URL, a row of a wrapped one (Claude Code declares
+        //    each row of its login URL as its own span showing that row's slice), or the interior
+        //    of a `│ … │` box. No other text may share the rectangle.
+        // 2. **A tail with trailing text.** Walking the runs backwards, skip text after the link on
+        //    its last row (`Read(path) 240 lines`), then each earlier run must end exactly where the
+        //    reconstructed tail begins, and the tail is a suffix of the URI — the whole URL, or the
+        //    relative path an app shows for a `file://` link.
+        //
+        // The earlier rule — keep any run whose text is a *substring* of the URI — underlined
+        // prose: once the app redrew a row that used to hold a `file://` path, every word there
+        // that happened to occur in the path ("config", "src", "tests", "a", "h") was marked as
+        // that file link. Either shape must also reproduce at least `MIN_LINK_TEXT` bytes of the
+        // URI (or all of a shorter one): "h" or ".cc" alone is prose.
+        let need = MIN_LINK_TEXT.min(self.url.len());
+        let whole: String = runs.iter().map(|(_, t)| t.as_str()).collect();
+        if whole.len() >= need && self.url.contains(whole.as_str()) {
+            return Some(runs.into_iter().map(|(run, _)| run).collect());
+        }
+        let mut remaining = self.url.len(); // the chain reconstructs `url[remaining..]`
+        let mut chain: Vec<(u16, u16, u16)> = Vec::new();
+        for (run, text) in runs.iter().rev() {
+            if self.url[..remaining].ends_with(text.as_str()) {
+                remaining -= text.len();
+                chain.push(*run);
+            } else if chain.is_empty() {
+                continue; // trailing text on the link's last row, after the link
+            } else {
+                break; // text before the link on its first row
+            }
+        }
+        if chain.is_empty() || self.url.len() - remaining < need {
             return None;
         }
-        Some(runs)
+        chain.reverse();
+        Some(chain)
     }
 }
 
@@ -5021,6 +5047,48 @@ mod tests {
                 "cell ({x},{y}) link state"
             );
         }
+    }
+
+    /// Claude Code hyperlinks file paths (`file:///…/src/v/config/configuration.cc`, shown as the
+    /// relative path). When it later redraws that row with prose, the span's rectangle now holds
+    /// ordinary words — and several of them ("config", "src", "tests", "a", "h") occur somewhere in
+    /// the path. Matching runs as *substrings* of the URI marked every one of them as the file
+    /// link, so the terminal underlined random words. The cells under a span must reconstruct a
+    /// contiguous suffix of the URI, in order, and at least `MIN_LINK_TEXT` of it.
+    #[test]
+    fn prose_redrawn_over_a_file_link_is_not_underlined_as_the_link() {
+        let url = "file:///data/xfs2/.amux/worktrees/redpanda-7cbc4aca/nodewise/src/v/config/configuration.cc";
+        let shown = "src/v/config/configuration.cc";
+        let mut parser = new_client_parser(4, 80, CLIENT_SCROLLBACK);
+        parser.process(
+            format!("\x1b[1;1H  Read(\x1b]8;id=1g8dlue;{url}\x07{shown}\x1b]8;;\x07) 240 lines")
+                .as_bytes(),
+        );
+        // While the path is on screen: exactly the path cells are linked, not "Read" or "240".
+        let links = app_links(&parser, 80, 4);
+        assert_eq!(links.len(), 1, "{links:?}");
+        assert_eq!(links[0].url, url);
+        let x0 = "  Read(".len() as u16;
+        assert_eq!(
+            links[0].runs,
+            vec![(0, x0, x0 + shown.len() as u16 - 1)],
+            "only the shown path"
+        );
+
+        // The app redraws the row as prose: words that occur inside the URI, in the old rectangle.
+        parser
+            .process(b"\x1b[1;1H\x1b[2K  the config in src has tests and a .h file, see xfs2 data");
+        let links = app_links(&parser, 80, 4);
+        assert!(
+            links.is_empty(),
+            "prose must not be marked as the file link: {links:?}"
+        );
+
+        // But the path redrawn in the same place (a different tool, same columns) is still it.
+        parser.process(format!("\x1b[1;1H\x1b[2K  Edit({shown}) 3 lines").as_bytes());
+        let links = app_links(&parser, 80, 4);
+        assert_eq!(links.len(), 1, "{links:?}");
+        assert_eq!(links[0].runs, vec![(0, x0, x0 + shown.len() as u16 - 1)]);
     }
 
     #[test]

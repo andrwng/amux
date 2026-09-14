@@ -433,9 +433,15 @@ drawn, from two sources in priority order:
    login URL as OSC 8, once per visual row, each opener naming the whole URI. A vt100 grid has no
    per-cell hyperlink concept, so this was being *destroyed*: the `Links` callbacks on the client's
    parser record each span from the cursor and `mark_links` replays them. Nothing hooks a cell write,
-   so a span is re-validated every frame against the cells it claims — the characters under it must
-   still appear in the URI — which drops spans whose rows the app has redrawn. Bounded at
-   `MAX_LINK_SPANS`.
+   so a span is re-validated every frame against the cells it claims (`LinkSpan::runs_in`): the
+   URL-class runs in its rectangle must either concatenate to one contiguous slice of the URI (a
+   whole URL, one row of a wrapped one, a box interior — with nothing else in the rectangle) or,
+   after skipping trailing text on the last row, chain into a **suffix** of the URI (the relative
+   path Claude Code shows for a `file://` link), and reproduce at least `MIN_LINK_TEXT` bytes of it.
+   "Any run that is a substring of the URI" was the first rule and it underlined prose: Claude Code
+   hyperlinks every file path it prints, and once it redrew such a row with ordinary text, each word
+   there that occurred in the path — "config", "src", "tests", "a", "h" — was marked as that link
+   (`prose_redrawn_over_a_file_link_is_not_underlined_as_the_link`). Bounded at `MAX_LINK_SPANS`.
 2. **What amux detects itself**, for output carrying no markup. Rows are joined into logical lines
    with `row_wrapped`, the same fact `token_selection` uses to copy a wrapped URL whole. This sees
    only *margin* wrapping: a TUI wraps text itself, so no flag is set and only source 1 recovers it.
