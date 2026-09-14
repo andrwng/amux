@@ -1977,12 +1977,16 @@ impl App {
             // newline is trimmed and separated as before.
             // A row that continues onto the next (terminal- or app-wrapped) keeps its trailing
             // cells and gets no separator — see `continues_on_next_row`.
-            let wrapped = continues_on_next_row(
+            let srow = (y - sel.inner.y) + row_off;
+            let wrapped = continuation_start(
                 screen,
-                (y - sel.inner.y) + row_off,
+                srow,
                 sel.inner.width,
                 screen.size().0,
-            ) && c1 == right;
+                &row_text(screen, srow, sel.inner.width),
+            )
+            .is_some()
+                && c1 == right;
             if !wrapped {
                 while line.ends_with(' ') {
                     line.pop();
@@ -2038,7 +2042,15 @@ impl App {
         // terminal wrap, the app's indent for a soft wrap — and the token reaches the seam above.
         let mut y0 = cy;
         let mut x0 = x0;
-        while y0 > top && continuation_start(screen, y0 - 1, inner.width, rows) == Some(x0 as u16) {
+        while y0 > top
+            && continuation_start(
+                screen,
+                y0 - 1,
+                inner.width,
+                rows,
+                &row_text(screen, y0 - 1, inner.width),
+            ) == Some(x0 as u16)
+        {
             let above = cells(y0 - 1);
             match token_span(&above, last) {
                 Some((ax0, _)) => {
@@ -2052,7 +2064,13 @@ impl App {
         let mut y1 = cy;
         let mut x1 = x1;
         while x1 == last && y1 + 1 < bottom {
-            let Some(start) = continuation_start(screen, y1, inner.width, rows) else {
+            let Some(start) = continuation_start(
+                screen,
+                y1,
+                inner.width,
+                rows,
+                &row_text(screen, y1, inner.width),
+            ) else {
                 break;
             };
             let below = cells(y1 + 1);
@@ -2931,19 +2949,40 @@ struct PaneLink {
 /// copy without a newline spliced into it. Cost: a rare false join — a line that ends exactly at
 /// the margin followed by one starting at column 0 reads as one line — accepted against the common
 /// breakage it fixes. Shared by link detection, copy, and double-click so they agree on seams.
-fn continues_on_next_row(screen: &vt100::Screen, row: u16, width: u16, height: u16) -> bool {
-    continuation_start(screen, row, width, height).is_some()
-}
-
 /// Widest indent an app-wrapped continuation row may carry and still count as a continuation.
 /// Claude Code indents body text 2–6 columns; the cap bounds false joins against deeper layout.
 const SOFT_WRAP_INDENT_MAX: u16 = 8;
 
+/// Whether the text of `line` runs into its end while inside a URL: a link scheme appears and no
+/// whitespace follows it. This is the gate for an *app* soft-wrap join — only a URL that hit the
+/// margin may continue onto the next row, so prose that merely ends at the margin stays two lines.
+fn tail_in_url(line: &str) -> bool {
+    LINK_SCHEMES
+        .iter()
+        .filter_map(|s| line.rfind(s))
+        .max()
+        .is_some_and(|start| {
+            let tail = line[start..].trim_end();
+            !tail.is_empty() && !tail.chars().any(char::is_whitespace)
+        })
+}
+
 /// If row `row` continues onto `row + 1`, the column on `row + 1` where the continuation's text
-/// starts: `0` for a terminal wrap (the seam is exact), or the first non-blank column — the app's
-/// indent, which is layout rather than content — for an app wrap. `None` when the rows are separate.
-/// See `continues_on_next_row` for why both kinds exist.
-fn continuation_start(screen: &vt100::Screen, row: u16, width: u16, height: u16) -> Option<u16> {
+/// starts. A line spans rows two ways. The *terminal* wrapped it — `row_wrapped` is set, the seam is
+/// exact, and the continuation starts at column 0. Or the *app* wrapped it: a TUI (ink / Claude
+/// Code) lays text out with cursor moves and breaks a long token itself, so `row_wrapped` stays
+/// false. That case is recognised only when it is unambiguous — the row is filled to its last cell,
+/// `line` (the logical line so far, ending with this row) runs into the margin **inside a URL**, and
+/// the next row starts non-blank within a small indent (the app's layout, not content); the
+/// continuation starts at that indent. Prose that happens to end at the margin never joins.
+/// Shared by link detection, copy, and double-click so all three agree on seams.
+fn continuation_start(
+    screen: &vt100::Screen,
+    row: u16,
+    width: u16,
+    height: u16,
+    line: &str,
+) -> Option<u16> {
     if row + 1 >= height || width == 0 {
         return None;
     }
@@ -2955,10 +2994,23 @@ fn continuation_start(screen: &vt100::Screen, row: u16, width: u16, height: u16)
             .cell(y, x)
             .is_some_and(|c| !c.contents().trim().is_empty())
     };
-    if !nonblank(row, width - 1) {
-        return None; // not filled to the margin — the line simply ended
+    if !nonblank(row, width - 1) || !tail_in_url(line) {
+        return None; // the line simply ended, or what reached the margin was not a URL
     }
     (0..width.min(SOFT_WRAP_INDENT_MAX + 1)).find(|&x| nonblank(row + 1, x))
+}
+
+/// The text of one grid row, blanks as spaces so positions stay aligned (for seam decisions).
+fn row_text(screen: &vt100::Screen, row: u16, width: u16) -> String {
+    (0..width)
+        .map(|x| {
+            screen
+                .cell(row, x)
+                .map(|c| c.contents().to_string())
+                .filter(|s| !s.is_empty())
+                .unwrap_or_else(|| " ".to_string())
+        })
+        .collect()
 }
 
 fn pane_links(screen: &vt100::Screen, width: u16, height: u16) -> Vec<PaneLink> {
@@ -2966,8 +3018,12 @@ fn pane_links(screen: &vt100::Screen, width: u16, height: u16) -> Vec<PaneLink> 
     let mut y = 0;
     while y < height {
         // Gather one logical line: this row plus every row it continues onto (terminal- or
-        // app-wrapped — see `continues_on_next_row`).
+        // app-wrapped — see `continuation_start`), building the text as we go so the seam decision
+        // can see whether the line so far runs into the margin inside a URL.
         let mut cells: Vec<(u16, u16, String)> = Vec::new();
+        // The logical line, plus the cell each character starts at.
+        let mut text = String::new();
+        let mut starts: Vec<usize> = Vec::new();
         let mut last = y;
         // Leading cells to drop from a continuation row: an app-wrapped row's indent is layout,
         // not part of the token that wrapped onto it (0 for a terminal wrap, whose seam is exact).
@@ -2978,24 +3034,18 @@ fn pane_links(screen: &vt100::Screen, width: u16, height: u16) -> Vec<PaneLink> 
                     .cell(last, x)
                     .map(|c| c.contents().to_string())
                     .unwrap_or_default();
+                starts.push(text.len());
+                // An empty cell is a blank on screen; it must occupy a byte so offsets stay aligned.
+                text.push_str(if contents.is_empty() { " " } else { &contents });
                 cells.push((last, x, contents));
             }
-            match continuation_start(screen, last, width, height) {
+            match continuation_start(screen, last, width, height, &text) {
                 Some(start) => {
                     skip = start;
                     last += 1;
                 }
                 None => break,
             }
-        }
-        // The logical line, plus the cell each character starts at.
-        let mut text = String::new();
-        let mut starts: Vec<usize> = Vec::new();
-        for (i, (_, _, contents)) in cells.iter().enumerate() {
-            starts.push(text.len());
-            // An empty cell is a blank on screen; it must occupy a byte so offsets stay aligned.
-            text.push_str(if contents.is_empty() { " " } else { contents });
-            let _ = i;
         }
         starts.push(text.len());
         for range in urls_in_line(&text) {
@@ -5946,6 +5996,30 @@ mod tests {
             links.iter().map(|l| l.url.as_str()).collect::<Vec<_>>(),
             vec!["https://ex.com/ab"],
             "an indented continuation joins, indent excluded from the URL"
+        );
+    }
+
+    /// The soft-wrap join must be URL-aware: a prose line that merely ends exactly at the margin,
+    /// followed by an indented line, is two lines — copying them must keep the newline. Joining on
+    /// "filled to the margin" alone would glue unrelated prose.
+    #[test]
+    fn copying_prose_that_ends_at_the_margin_keeps_the_newline() {
+        let mut app = App::new(100, 40);
+        let t = TerminalId::new();
+        let mut parser = new_client_parser(3, 12, 0);
+        parser.process(b"twelve chars\x1b[2;1H  Next line"); // row 0 fills 12 cols; no URL anywhere
+        app.parsers.insert(t, parser);
+        app.selection = Some(Selection {
+            terminal: t,
+            inner: Rect::new(0, 0, 12, 3),
+            anchor: (0, 0),
+            head: (10, 1),
+            active: true,
+        });
+        assert_eq!(
+            app.selection_text().as_deref(),
+            Some("twelve chars\n  Next line"),
+            "prose lines stay separate — only a URL at the seam may join"
         );
     }
 
