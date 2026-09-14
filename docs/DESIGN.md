@@ -441,13 +441,28 @@ paint: a repaint that restyles the middle of a link re-sends those cells alone, 
 them, and the re-sent closer shuts whatever link the terminal had open. A repainting TUI broke links
 within a frame or two, which is why an earlier attempt was reverted wholesale (c4eb2ac).
 
-So a link **run** is moved into a single carrier cell — opener, the run's whole text, closer — with
-the covered cells marked `CellDiffOption::Skip`, which is precisely what that option documents
+So a link **run** is moved into a single carrier cell holding the run's whole text, with the
+covered cells marked `CellDiffOption::Skip`, which is precisely what that option documents
 ("prevent the buffer from overwriting a cell that is covered by something from an escape sequence,
-such as graphics or links"). The run becomes one diff unit, so it can never travel without its
-opener. Runs split where the cell **style** changes, since a carrier holds one style; that is also
-what keeps a selection highlight working, as `highlight_selection` runs first and its edges become
-run boundaries. One `id` per URL, so a terminal treats a wrapped link's rows as one link.
+such as graphics or links"). A run is one diff unit. Runs split where the cell **style** changes,
+since a carrier holds one style; that is also what keeps a selection highlight working, as
+`highlight_selection` runs first and its edges become run boundaries.
+
+A URL's runs — across every row it wraps onto, and across every span the app declared for it — are
+emitted as **one hyperlink**: the OSC 8 opener on the first run, the closer on the last, the runs
+between carrying only their text. The backend moves the cursor between non-contiguous cells and
+prints each carrier verbatim, so a link opened on one row is still open on the next — the same
+shape the app drew (one open spanning the wrapped rows, one close), and what makes the terminal
+hover-highlight the whole wrapped URL as a unit. Opening and closing on *every* run was tried first:
+correct `id`, same URI on each row, yet iTerm2 highlighted each row as its own link, because its
+grouping keys on the open…close region rather than the `id`. Grouping is by URL, not by declared
+span, since an app may declare a wrapped link once per row (Claude Code does).
+
+The cost, accepted knowingly: a repaint that re-sends only a *middle* run of a link (a selection
+restyling that row) prints its text with no opener, so that row shows unlinked until the link is
+next painted whole. It is momentary and cosmetic, and a click on a fully painted link — the case
+that matters — is never affected. (`a_wrapped_link_is_one_hyperlink_across_rows`,
+`a_full_paint_links_exactly_the_url_cells_and_a_repaint_never_leaks_the_link`.)
 
 Marking per *cell* instead would also be correct, and never decays, but it repeats the URI in every
 cell — quadratic in the URL's length, ~206 KB per paint for a 450-character login URL versus ~2.8 KB
