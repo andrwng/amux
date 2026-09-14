@@ -452,21 +452,21 @@ such as graphics or links"). A run is one diff unit. Runs split where the cell *
 since a carrier holds one style; that is also what keeps a selection highlight working, as
 `highlight_selection` runs first and its edges become run boundaries.
 
-A URL's runs — across every row it wraps onto, and across every span the app declared for it — are
-emitted as **one hyperlink**: the OSC 8 opener on the first run, the closer on the last, the runs
-between carrying only their text. The backend moves the cursor between non-contiguous cells and
-prints each carrier verbatim, so a link opened on one row is still open on the next — the same
-shape the app drew (one open spanning the wrapped rows, one close), and what makes the terminal
-hover-highlight the whole wrapped URL as a unit. Opening and closing on *every* run was tried first:
-correct `id`, same URI on each row, yet iTerm2 highlighted each row as its own link, because its
-grouping keys on the open…close region rather than the `id`. Grouping is by URL, not by declared
-span, since an app may declare a wrapped link once per row (Claude Code does).
+Every carrier is a **complete** hyperlink — opener, the run's text, closer — and a wrapped URL's
+runs share one `id` and one URI, which is what the OSC 8 spec defines as a single hyperlink
+(grouping is by URL, not by declared span, since an app may declare a wrapped link once per row —
+Claude Code does). Completeness is not negotiable: ratatui ships a per-cell diff, so any run can be
+re-sent alone, and a run that opens a link without closing it leaves that link open in the outer
+terminal for *everything the frame emits after it* — the rest of the pane, the sidebar, other panes
+— until some later closer. That was shipped once (d8e1b5d: opener on a wrapped link's first run,
+closer on its last, so a terminal would hover-highlight the rows as one). Restyling the first row
+alone re-sent the opener and nothing else, and iTerm2 hyperlinked — and underlined — unrelated cells
+across the screen, which the user saw as dashed lines through another agent's pane.
+`every_repainted_cell_arrives_with_correct_link_state` now replays a first-run-only restyle with an
+unrelated cell further down the frame and requires that cell to arrive unlinked.
 
-The cost, accepted knowingly: a repaint that re-sends only a *middle* run of a link (a selection
-restyling that row) prints its text with no opener, so that row shows unlinked until the link is
-next painted whole. It is momentary and cosmetic, and a click on a fully painted link — the case
-that matters — is never affected. (`a_wrapped_link_is_one_hyperlink_across_rows`,
-`a_full_paint_links_exactly_the_url_cells_and_a_repaint_never_leaks_the_link`.)
+Whether a terminal hover-highlights a wrapped link's rows together is the terminal's choice; iTerm2
+highlights per row for cells reached via the pane (hard line ends), and that is accepted.
 
 Marking per *cell* instead would also be correct, and never decays, but it repeats the URI in every
 cell — quadratic in the URL's length, ~206 KB per paint for a 450-character login URL versus ~2.8 KB

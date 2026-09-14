@@ -3353,10 +3353,10 @@ fn mark_links(buf: &mut Buffer, parser: &vt100::Parser<Links>, inner: Rect) {
     // One `id` per *URL*, not per run. A wrapped link is several runs, and a terminal uses `id` to
     // decide which cells form a single link — numbering runs made each row its own link, so hover
     // highlighted only the row under the pointer.
-    // Group every visible style-run by **URL** — across links, not per link. An app may declare a
-    // wrapped URL as one span per row (Claude Code does), which arrives here as several `PaneLink`s
-    // with the same URL; a terminal must still see them as ONE hyperlink, opened once on the first
-    // run and closed once on the last, or it hover-highlights each row on its own.
+    // Group every visible style-run by **URL** — across links, not per link — so one URL gets one
+    // `id`. An app may declare a wrapped URL as one span per row (Claude Code does), which arrives
+    // here as several `PaneLink`s with the same URL; per the OSC 8 spec, cells with the same URI
+    // and the same non-empty `id` belong to one hyperlink.
     let mut by_url: Vec<(String, Vec<Run>)> = Vec::new();
     for link in declared.into_iter().chain(detected) {
         let runs = match by_url.iter_mut().find(|(u, _)| *u == link.url) {
@@ -3379,31 +3379,19 @@ fn mark_links(buf: &mut Buffer, parser: &vt100::Parser<Links>, inner: Rect) {
             }
         }
     }
-    // One `id` per URL (its index here), one open…close per URL, runs in backend draw order.
+    // One `id` per URL (its index here). Every run is a self-contained open…close — see `mark_run`
+    // for why a link may never be left open across diff units.
     for (id, (url, mut runs)) in by_url.into_iter().enumerate() {
         runs.sort_unstable();
         runs.dedup();
-        let last = runs.len().saturating_sub(1);
-        for (i, (row, sx0, sx1)) in runs.into_iter().enumerate() {
-            let edge = LinkEdge {
-                open: i == 0,
-                close: i == last,
-            };
-            mark_run(buf, inner, (row, sx0, sx1), &url, id, edge);
+        for run in runs {
+            mark_run(buf, inner, run, &url, id);
         }
     }
 }
 
 /// One visible, uniformly styled run of a link's cells, pane-relative: `(row, first_col, last_col)`.
 type Run = (u16, u16, u16);
-
-/// Which hyperlink boundaries a carrier cell emits: the OSC 8 opener on the link's first run, the
-/// closer on its last. A link spans rows as **one** open…close, exactly as the app drew it.
-#[derive(Clone, Copy)]
-struct LinkEdge {
-    open: bool,
-    close: bool,
-}
 
 /// Split the cells `x0..=x1` of `row` into maximal spans that share a style — the granularity a
 /// carrier cell can represent. Coordinates are pane-relative; the returned pairs are too.
@@ -3426,7 +3414,7 @@ fn style_runs(buf: &Buffer, inner: Rect, row: u16, x0: u16, x1: u16) -> Vec<(u16
 }
 
 /// Move `x0..=x1` of `row` into a single OSC 8 carrier cell at `x0`, skipping the cells it covers.
-fn mark_run(buf: &mut Buffer, inner: Rect, run: Run, url: &str, id: usize, edge: LinkEdge) {
+fn mark_run(buf: &mut Buffer, inner: Rect, run: Run, url: &str, id: usize) {
     let (row, x0, x1) = run;
     let at = |x: u16| (inner.x + x, inner.y + row);
     if !inner.contains(at(x0).into()) || !inner.contains(at(x1).into()) {
@@ -3441,30 +3429,19 @@ fn mark_run(buf: &mut Buffer, inner: Rect, run: Run, url: &str, id: usize, edge:
             text.push_str(cell.symbol());
         }
     }
-    // One hyperlink per URL, not one per row. The opener goes on the link's *first* run and the
-    // closer on its *last*; runs between carry only their text. The link therefore stays open
-    // across the row breaks — the backend moves the cursor between non-contiguous cells and prints
-    // each carrier's symbol verbatim, so the OSC 8 opened on row N is still open on row N+1 — which
-    // is how the app itself drew it (one open spanning the wrapped rows, one close) and what makes
-    // the terminal hover-highlight the whole URL as one link. Closing and reopening on every row
-    // made each row its own link: correct `id`, same URI, yet iTerm2 highlighted them separately,
-    // because its grouping keys on the open…close region, not the `id`.
-    //
-    // Accepted tradeoff: ratatui diffs per cell, so a repaint that re-sends only a *middle* row of
-    // a link (a selection restyling that row) prints its text without an opener, and the terminal
-    // shows that row unlinked until the link is next painted whole. Momentary and cosmetic; a
-    // click on a fully painted link — the case that matters — is never affected.
-    let mut sym = String::new();
-    if edge.open {
-        sym.push_str(&format!("\x1b]8;id={id};{url}\x1b\\"));
-    }
-    sym.push_str(&text);
-    if edge.close {
-        sym.push_str("\x1b]8;;\x1b\\");
-    }
+    // Every carrier is a complete hyperlink: opener, the run's text, closer. This is not optional.
+    // ratatui ships a per-cell diff, so any run can be re-sent on its own — and a run that opens a
+    // link without closing it leaves the link open in the terminal for *everything the frame
+    // emits after it*: the rest of the pane, the sidebar, other panes, until some later closer.
+    // That was shipped once (opener on a wrapped link's first run, closer on its last, to make a
+    // terminal hover-highlight the rows as one): restyling the first row alone re-sent the opener
+    // and nothing else, and the terminal underlined and hyperlinked unrelated cells across the
+    // screen. The rows of a wrapped link share one `id` and one URI, which is what the OSC 8 spec
+    // defines as one hyperlink; whether a given terminal hover-highlights them together is its
+    // choice, and not one worth a leak.
     let width = NonZeroU16::new(x1 - x0 + 1).expect("a run is at least one column");
     if let Some(cell) = buf.cell_mut(at(x0)) {
-        cell.set_symbol(&sym)
+        cell.set_symbol(&format!("\x1b]8;id={id};{url}\x1b\\{text}\x1b]8;;\x1b\\"))
             .set_diff_option(CellDiffOption::ForcedWidth(width));
     }
     for x in (x0 + 1)..=x1 {
@@ -5010,11 +4987,11 @@ mod tests {
         );
     }
 
-    /// A URL the terminal wrapped across two rows reaches the terminal as ONE hyperlink — one
-    /// opener, one closer, the second row's text inside it — so it hover-highlights as a unit.
-    /// Per-row open/close (the old carrier) made each row its own link in iTerm2.
+    /// A URL the terminal wrapped across two rows: both rows carry a complete hyperlink with the
+    /// same id and URI (one hyperlink per the OSC 8 spec), and a terminal replaying the paint sees
+    /// every URL cell linked and nothing else.
     #[test]
-    fn a_wrapped_link_is_one_hyperlink_across_rows() {
+    fn a_wrapped_links_rows_share_one_id_and_each_closes_itself() {
         let mut parser = new_client_parser(3, 20, CLIENT_SCROLLBACK);
         parser.process(b"https://ex.com/abcde"); // fills row 0, wraps
         parser.process(b"fghij");
@@ -5022,37 +4999,24 @@ mod tests {
         let buf = marked_buffer(&parser, inner);
         let printed = wire(&Buffer::empty(inner), &buf);
         assert_eq!(
-            printed.matches("\x1b]8;id=").count(),
-            1,
-            "one opener: {printed:?}"
+            printed
+                .matches("\x1b]8;id=0;https://ex.com/abcdefghij")
+                .count(),
+            2,
+            "two rows, one id, the whole URL on each: {printed:?}"
         );
         assert_eq!(
             printed.matches("\x1b]8;;").count(),
-            1,
-            "one closer: {printed:?}"
+            2,
+            "each row closes: {printed:?}"
         );
-        let open_at = printed.find("\x1b]8;id=").unwrap();
-        let close_at = printed.find("\x1b]8;;").unwrap();
-        assert!(open_at < close_at);
-        let body = &printed[open_at..close_at];
-        assert!(
-            body.contains("https://ex.com/abcde") && body.contains("fghij"),
-            "both rows inside: {printed:?}"
-        );
-        // And every URL cell is reported linked by a terminal replaying the paint.
         let seen = linked_cells(&printed);
-        for x in 0..20u16 {
+        for (&(x, y), open) in &seen {
+            let inside = y == 0 || (y == 1 && x < 5);
             assert_eq!(
-                seen.get(&(x, 0)).cloned().flatten().as_deref(),
-                Some("https://ex.com/abcdefghij"),
-                "row0 col{x}"
-            );
-        }
-        for x in 0..5u16 {
-            assert_eq!(
-                seen.get(&(x, 1)).cloned().flatten().as_deref(),
-                Some("https://ex.com/abcdefghij"),
-                "row1 col{x}"
+                open.as_deref(),
+                inside.then_some("https://ex.com/abcdefghij"),
+                "cell ({x},{y}) link state"
             );
         }
     }
@@ -6985,7 +6949,7 @@ mod tests {
     /// link the terminal had. A carrier cell makes the run one diff unit, so it always travels with
     /// its opener.
     #[test]
-    fn a_full_paint_links_exactly_the_url_cells_and_a_repaint_never_leaks_the_link() {
+    fn every_repainted_cell_arrives_with_correct_link_state() {
         use ratatui::widgets::Widget;
         let url = "https://example.com/a/long/path?q=1";
         let inner = Rect::new(0, 0, 40, 2);
@@ -7013,42 +6977,36 @@ mod tests {
 
         let plain = frame(None);
         let last = url.chars().count() as u16 - 1;
-
-        // A full paint: every cell of the URL arrives inside the link, nothing outside it does.
-        let full = linked_cells(&wire(&Buffer::empty(inner), &plain));
-        for (&(x, y), open) in &full {
-            let inside = y == 0 && x <= last;
-            assert_eq!(
-                open.as_deref(),
-                inside.then_some(url),
-                "cell ({x},{y}) arrived with the wrong link state on a full paint"
+        // Every cell a repaint prints must arrive with the right link state: linked iff it is a
+        // URL cell — and a repaint must never leave a link open over cells outside the URL. Three
+        // repaints: a full paint, a restyle of the link's middle, and a restyle of its *first*
+        // cells only (the run that carries the opener — the case that leaked when a wrapped
+        // link was emitted as one open…close across runs).
+        for (label, prev, next) in [
+            ("full paint", Buffer::empty(inner), plain.clone()),
+            ("middle restyled", plain.clone(), frame(Some((10, 20)))),
+            ("first cells restyled", plain.clone(), frame(Some((0, 3)))),
+        ] {
+            // Something unrelated further down the frame also changes, as it always does in a
+            // real frame (another pane, the sidebar): if a link were left open, this is what it
+            // would swallow.
+            let mut next = next;
+            next.cell_mut((0u16, 1u16)).unwrap().set_symbol("X");
+            let seen = linked_cells(&wire(&prev, &next));
+            assert!(!seen.is_empty(), "{label}: the repaint printed nothing");
+            for (&(x, y), open) in &seen {
+                let inside = y == 0 && x <= last;
+                assert_eq!(
+                    open.as_deref(),
+                    inside.then_some(url),
+                    "{label}: cell ({x},{y}) arrived with the wrong link state"
+                );
+            }
+            assert!(
+                seen.contains_key(&(0, 1)),
+                "{label}: the unrelated cell was not repainted, so the test proves nothing"
             );
         }
-
-        // A repaint that restyles the middle of the link and nothing else. With one open…close
-        // spanning the whole link (so a wrapped URL is ONE hyperlink, as the app drew it), a
-        // re-sent middle run carries no opener: those cells arrive unlinked until the link is next
-        // painted whole — the accepted, momentary cost of not splitting the link per run. What must
-        // still hold: the repaint never *leaks* the link onto cells outside the URL.
-        let restyled = frame(Some((10, 20)));
-        let seen = linked_cells(&wire(&plain, &restyled));
-        assert!(!seen.is_empty(), "the repaint printed nothing");
-        for (&(x, y), open) in &seen {
-            let inside = y == 0 && x <= last;
-            if !inside {
-                assert_eq!(
-                    open, &None,
-                    "cell ({x},{y}) outside the URL must not be linked"
-                );
-            } else if let Some(o) = open {
-                assert_eq!(o, url, "a linked cell inside the URL names the right URL");
-            }
-        }
-        assert!(
-            (10..=20).any(|x| seen.contains_key(&(x, 0))),
-            "the restyled cells were not repainted: {:?}",
-            seen.keys().collect::<Vec<_>>()
-        );
     }
 
     /// A carrier cell carries one style, so a run is split where the style changes — which is what
@@ -7076,26 +7034,21 @@ mod tests {
         );
         mark_links(&mut buf, &parser, inner);
 
-        // Two carrier cells (the run splits at the style edge), but ONE hyperlink: the opener is on
-        // the first carrier only, the closer on the last; the link stays open across the seam.
+        // Two carrier cells (the run splits at the style edge), each a complete hyperlink with the
+        // shared id.
         // A carrier's symbol holds a whole run's text (more than one glyph); covered cells keep
         // their single glyph. The opener is on the first carrier only, the closer on the last.
         let carriers: Vec<u16> = (0..40)
             .filter(|&x| buf[(x, 0u16)].symbol().chars().count() > 1)
             .collect();
         assert_eq!(carriers, vec![0, 8], "run split at the selection edge");
-        assert!(
-            buf[(0u16, 0u16)].symbol().contains("\x1b]8;id="),
-            "the first carrier opens the link"
-        );
-        assert!(
-            !buf[(8u16, 0u16)].symbol().contains("\x1b]8;id="),
-            "the second carrier does not reopen it (one link, not two)"
-        );
-        assert!(
-            buf[(8u16, 0u16)].symbol().ends_with("\x1b]8;;\x1b\\"),
-            "the last carrier closes the link"
-        );
+        for x in [0u16, 8] {
+            let sym = buf[(x, 0u16)].symbol();
+            assert!(
+                sym.contains("\x1b]8;id=0;") && sym.ends_with("\x1b]8;;\x1b\\"),
+                "carrier at {x} is a complete open…close: {sym:?}"
+            );
+        }
         assert!(
             buf[(0u16, 0u16)]
                 .style()
@@ -7110,11 +7063,13 @@ mod tests {
                 .contains(Modifier::REVERSED),
             "the unselected run does not"
         );
-        // The opener names the whole URL.
-        assert!(
-            buf[(0u16, 0u16)].symbol().contains(url),
-            "the opener names the full URL"
-        );
+        // Both halves still point at the whole URL.
+        for x in carriers {
+            assert!(
+                buf[(x, 0u16)].symbol().contains(url),
+                "carrier at {x} names the full URL"
+            );
+        }
     }
 
     /// A pane app that marks its own hyperlinks (Claude Code does, per visual row, each opener
@@ -7147,39 +7102,29 @@ mod tests {
         }
 
         let buf = marked_buffer(&parser, inner);
-        // Three rows, ONE hyperlink: a single opener (on the first row) naming the whole URL and a
-        // single closer (on the last). The app declared a span per row, but they are the same URL,
-        // so they must reach the terminal as one open…close — that is what makes hover highlight
-        // the whole wrapped link at once instead of row by row.
-        let printed = wire(&Buffer::empty(inner), &buf);
-        assert_eq!(
-            printed.matches("\x1b]8;id=").count(),
-            1,
-            "exactly one opener for the wrapped link: {printed:?}"
-        );
-        assert_eq!(
-            printed.matches("\x1b]8;;").count(),
-            1,
-            "exactly one closer for the wrapped link: {printed:?}"
-        );
+        let openers: Vec<String> = buf
+            .content()
+            .iter()
+            .map(|c| c.symbol().to_string())
+            .filter(|s| s.contains("\x1b]8;") && s.contains(url))
+            .collect();
+        assert_eq!(openers.len(), 3, "all three rows link: {openers:?}");
+        // One id for one URL: per the OSC 8 spec, same URI + same non-empty id = one hyperlink.
         assert!(
-            printed.contains(&format!("\x1b]8;id=0;{url}\x1b\\")),
-            "the opener names the URL"
+            openers.iter().all(|s| s.contains("id=0;")),
+            "every row shares the link's id: {openers:?}"
         );
-        // The rows print their own text, in order, inside the one link.
-        let open_at = printed.find("\x1b]8;id=").unwrap();
-        let close_at = printed.find("\x1b]8;;").unwrap();
-        let body = &printed[open_at..close_at];
-        for frag in [
-            "https://claude.com/cai/oauth/",
-            "authorize?code=true&client_i",
-            "d=9d1c&state=C9vq",
-        ] {
-            assert!(
-                body.contains(frag),
-                "row text {frag:?} is inside the link: {printed:?}"
-            );
-        }
+        // Each row's carrier is complete — opener, its own text, closer — so no diff unit can
+        // leave the link open over the rest of the frame.
+        assert!(
+            openers.iter().all(|s| s.ends_with("\x1b]8;;\x1b\\")),
+            "every carrier closes its link: {openers:?}"
+        );
+        let printed = wire(&Buffer::empty(inner), &buf);
+        assert!(
+            printed.contains("\x1b\\authorize?code=true&client_i\x1b]8;;"),
+            "the row prints its own text inside the link: {printed:?}"
+        );
     }
 
     /// A stale span is dropped rather than mislabelling whatever now occupies those cells: the app
