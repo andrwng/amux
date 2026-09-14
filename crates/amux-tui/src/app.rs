@@ -1557,10 +1557,14 @@ impl App {
         terminal: TerminalId,
         sink: &mut Sink,
     ) -> Result<Flow> {
+        // A page is what the user can *see*, not the grid's height: a split pane shows a
+        // bottom-anchored crop of a home-sized grid (see `render_screen`), so paging by
+        // `attached[terminal].rows` would jump several screenfuls. Minis are sized to their cell,
+        // so for them the attached size *is* the visible size.
         let page = self
-            .attached
-            .get(&terminal)
-            .map(|s| s.rows as usize)
+            .visible_rows(terminal)
+            .or_else(|| self.attached.get(&terminal).map(|s| s.rows))
+            .map(|r| r as usize)
             .unwrap_or(24)
             .max(1) as i32;
         let half = (page / 2).max(1);
@@ -1588,6 +1592,18 @@ impl App {
         };
         sink.send(ClientMsg::Scroll { terminal, lines }).await?;
         Ok(Flow::Continue)
+    }
+
+    /// The rows of `terminal` actually on screen when it is a main-tree pane: its slot's content
+    /// height, which for a split is less than the home-sized grid it renders a crop of. `None` when
+    /// it is not in the main tree (a mini, or not shown).
+    fn visible_rows(&self, terminal: TerminalId) -> Option<u16> {
+        let (pane_area, _) = self.regions();
+        self.tree
+            .layout(pane_area)
+            .into_iter()
+            .find(|p| p.payload == Some(terminal))
+            .map(|p| pane_size(p.rect).rows)
     }
 
     /// Leave scroll mode: back to rendering live output, and tell the daemon to forget where we were.
@@ -4148,7 +4164,9 @@ mod tests {
 
     /// A pane with a served window in it, as if the daemon had just answered a scroll request.
     fn scrolled_app(offset: usize, available: usize) -> (App, TerminalId) {
-        let mut app = App::new(100, 40);
+        // 7 terminal rows → a 6-row main area → a single pane with 4 content rows, so the layout's
+        // visible height and the 4-row `attached` size below agree, as they always do in production.
+        let mut app = App::new(100, 7);
         let t = TerminalId::new();
         app.tree.open(t);
         app.terminals.insert(t, AgentId::new());
@@ -4185,6 +4203,45 @@ mod tests {
                 }
                 other => panic!("expected a Scroll step for {pressed:?}, got {other:?}"),
             }
+        }
+    }
+
+    /// In a split, a pane renders a bottom-anchored crop of the home-sized grid, so a "page" must be
+    /// the pane's *visible* rows — paging by the grid height jumped several screenfuls per key.
+    #[tokio::test]
+    async fn paging_in_a_split_pane_moves_by_the_visible_rows() {
+        let mut app = App::new(100, 40);
+        app.restoring = false;
+        let (t, other) = (TerminalId::new(), TerminalId::new());
+        app.tree.open(t);
+        app.tree.split(Axis::TopBottom); // t shares the main area with another pane
+        app.tree.open(other);
+        app.terminals.insert(t, AgentId::new());
+        let home = pane_size(app.regions().0);
+        let visible = app.visible_rows(t).expect("t is in the tree");
+        assert!(
+            visible < home.rows,
+            "precondition: the split slot is shorter than the grid"
+        );
+        app.parsers.insert(
+            t,
+            new_client_parser(home.rows, home.cols, CLIENT_SCROLLBACK),
+        );
+        app.attached.insert(t, home);
+        app.on_scroll_view(t, 10, 500, b"served window");
+        let (mut sink, mut server) = test_server();
+
+        app.key_scroll(key(KeyCode::PageDown), t, &mut sink)
+            .await
+            .unwrap();
+        match next_msg(&mut server).await {
+            Some(ClientMsg::Scroll { lines, .. }) => assert_eq!(
+                lines,
+                -(visible as i32),
+                "a page is the visible slot height, not the grid's {}",
+                home.rows
+            ),
+            other => panic!("expected a Scroll step, got {other:?}"),
         }
     }
 
