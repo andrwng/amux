@@ -1851,6 +1851,75 @@ mod resize_experiment {
     /// SIGWINCH, redraw the whole transcript — or only its input box, leaving the dropped rows
     /// permanently blank? Build a TALL transcript first (the throwaway UIs that "recovered" in the
     /// storm test had almost none), then shrink once (reconnect smaller), settle, grow back.
+    /// Does a resize racing the app's own output (a reconnect resize landing while Claude is mid
+    /// input-echo or repaint) diverge the grid? Tightly interleave Input and Resize, then type a
+    /// known marker with NO trailing resize, settle, and check the marker actually appears in the
+    /// grid. If it does not, amux's grid has diverged from Claude — the live bug, reproduced.
+    #[test]
+    #[ignore]
+    fn manual_resize_racing_input_does_not_diverge() {
+        let dir = tempfile::tempdir().unwrap();
+        let s = Session::spawn(
+            &["claude".to_string()],
+            dir.path(),
+            &[],
+            Size {
+                cols: 120,
+                rows: 40,
+            },
+        )
+        .unwrap();
+        let mut rx = s.subscribe();
+        std::thread::sleep(std::time::Duration::from_secs(6));
+        while rx.try_recv().is_ok() {}
+        s.write_input(b"\x1b[B").unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(400));
+        s.write_input(b"\r").unwrap();
+        std::thread::sleep(std::time::Duration::from_secs(10));
+        while rx.try_recv().is_ok() {}
+
+        // Race: type a chunk, immediately resize, many times, no settle between.
+        for i in 0..12 {
+            s.write_input(format!("abc{i} ").as_bytes()).unwrap();
+            let r = if i % 2 == 0 { 34 } else { 40 };
+            s.resize(Size { cols: 120, rows: r }).unwrap();
+            std::thread::sleep(std::time::Duration::from_millis(8));
+        }
+        s.resize(Size {
+            cols: 120,
+            rows: 40,
+        })
+        .unwrap();
+        std::thread::sleep(std::time::Duration::from_secs(2));
+        while rx.try_recv().is_ok() {}
+        dump("after resize/input race", &s.snapshot(), 40, 120);
+
+        // Now type a clean marker with NO resize, settle, and require it to be present.
+        s.write_input(b" UNIQUEMARKER99").unwrap();
+        std::thread::sleep(std::time::Duration::from_secs(2));
+        while rx.try_recv().is_ok() {}
+        let snap = s.snapshot();
+        let mut p = vt100::Parser::new(40, 120, 0);
+        p.process(&snap);
+        let sc = p.screen();
+        let mut found = false;
+        let mut whole = String::new();
+        for y in 0..40 {
+            for x in 0..120 {
+                if let Some(c) = sc.cell(y, x) {
+                    let t = c.contents();
+                    whole.push_str(if t.is_empty() { " " } else { t });
+                }
+            }
+            whole.push('\n');
+        }
+        if whole.contains("UNIQUEMARKER99") {
+            found = true;
+        }
+        dump("after clean marker", &snap, 40, 120);
+        eprintln!("VERDICT marker_present={found} (grid diverged if false)");
+    }
+
     #[test]
     #[ignore]
     fn manual_reconnect_at_smaller_size_keeps_the_transcript() {
