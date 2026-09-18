@@ -133,6 +133,17 @@ impl AgentAdapter for ClaudeAdapter {
         // TERM/COLORTERM are owned by the daemon's PTY layer (it advertises a screen-family
         // terminal so apps fill backgrounds), so they're deliberately not set here.
         let mut env: Vec<(String, String)> = Vec::new();
+        // Disable Claude Code's in-place auto-updater for agents amux launches. Captured evidence
+        // (blank-pane grid traces, 2026-09-17): a periodic update check that ends in "Auto-update
+        // failed" is immediately followed by ink clearing the whole screen line-by-line with no
+        // redraw, leaving the pane blank with only the cursor — the long-standing blank-on-reconnect
+        // bug, reproduced on two independent panes at once. amux owns the agent's binary and
+        // lifecycle (the user updates `claude` out of band; new sessions pick it up), so an in-place
+        // re-exec of a daemon-managed PTY process is never wanted and is exactly what corrupts the
+        // render. `DISABLE_AUTOUPDATER=1` is the knob the binary honors (confirmed in 2.1.276).
+        if is_claude {
+            env.push(("DISABLE_AUTOUPDATER".to_string(), "1".to_string()));
+        }
         // Export the mailbox wiring so the CLI's hooks (see `prepare_worktree`) can reach the
         // daemon and tag their reports with this agent.
         if let Some(hooks) = ctx.hooks {
@@ -319,6 +330,16 @@ mod tests {
         assert!(!spec.env.iter().any(|(k, _)| k == "TERM"));
         // No hook wiring without a HookSetup.
         assert!(!spec.env.iter().any(|(k, _)| k == "AMUX_HOOK_SOCK"));
+        // Claude's in-place auto-updater is disabled: its failed-update UI teardown clears the
+        // grid with no redraw, and amux owns the agent binary/lifecycle. (Regression for the
+        // blank-on-reconnect bug traced to the auto-update check.)
+        assert_eq!(
+            spec.env
+                .iter()
+                .find(|(k, _)| k == "DISABLE_AUTOUPDATER")
+                .map(|(_, v)| v.as_str()),
+            Some("1"),
+        );
     }
 
     #[test]
