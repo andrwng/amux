@@ -782,6 +782,18 @@ impl Session {
             "sid={} RESIZE {cur_cols}x{cur_rows}->{}x{} nb {nb_before}->{nb_after}",
             self.sid, size.cols, size.rows
         ));
+        // A resize that empties the grid is the reconnect-blank smoking gun: keep-bottom `set_size`
+        // dropped the content rows, and unless the app fully repaints they are gone. Distinguishes a
+        // resize-caused blank (this line) from an app-output-caused one (`BLANKED-BY` in the reader).
+        if grid_trace_path().is_some() && nb_before >= 4 && nb_after <= 1 {
+            gtrace(&format!(
+                "sid={} RESIZE-BLANKED {cur_cols}x{cur_rows}->{}x{} dropped {} nonblank rows",
+                self.sid,
+                size.cols,
+                size.rows,
+                nb_before - nb_after
+            ));
+        }
         let io = self.io.lock().unwrap();
         io.master
             .resize(PtySize {
@@ -1833,6 +1845,72 @@ mod resize_experiment {
     /// (baseline_nb == after_storm_nb == forced_nb). So resize storms are not the trigger; the
     /// real blank is captured by the reader's ring dump (`AMUX_GRID_TRACE` → `blanked-*.bin`) and
     /// replayed with `manual_replay_blank_capture`.
+    /// Reproduce the user's actual trigger: reconnecting an SSH session at a DIFFERENT terminal
+    /// size. On reconnect a fresh client attaches at its own size; if that differs from the grid the
+    /// daemon `resize`s, and keep-bottom `set_size` drops transcript rows. Does Claude, on that one
+    /// SIGWINCH, redraw the whole transcript — or only its input box, leaving the dropped rows
+    /// permanently blank? Build a TALL transcript first (the throwaway UIs that "recovered" in the
+    /// storm test had almost none), then shrink once (reconnect smaller), settle, grow back.
+    #[test]
+    #[ignore]
+    fn manual_reconnect_at_smaller_size_keeps_the_transcript() {
+        let dir = tempfile::tempdir().unwrap();
+        let s = Session::spawn(
+            &["claude".to_string()],
+            dir.path(),
+            &[],
+            Size {
+                cols: 120,
+                rows: 45,
+            },
+        )
+        .unwrap();
+        let mut rx = s.subscribe();
+        std::thread::sleep(std::time::Duration::from_secs(6));
+        while rx.try_recv().is_ok() {}
+        s.write_input(b"\x1b[B").unwrap(); // trust: "Yes"
+        std::thread::sleep(std::time::Duration::from_millis(400));
+        s.write_input(b"\r").unwrap();
+        std::thread::sleep(std::time::Duration::from_secs(10));
+        while rx.try_recv().is_ok() {}
+        // A tall transcript: ask for many lines of plain output, no tools.
+        s.write_input(b"print the numbers 1 through 30, each on its own line, and nothing else")
+            .unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(500));
+        s.write_input(b"\r").unwrap();
+        std::thread::sleep(std::time::Duration::from_secs(20)); // let it answer
+        while rx.try_recv().is_ok() {}
+        let before = census(&s.snapshot(), 45, 120);
+        eprintln!("[transcript @45] census={before:?}");
+        dump("transcript @45", &s.snapshot(), 45, 120);
+
+        // Reconnect smaller: one client attaches at 30 rows. Daemon resizes; Claude gets one SIGWINCH.
+        s.resize(Size {
+            cols: 120,
+            rows: 30,
+        })
+        .unwrap();
+        std::thread::sleep(std::time::Duration::from_secs(3));
+        while rx.try_recv().is_ok() {}
+        dump("after reconnect @30", &s.snapshot(), 30, 120);
+
+        // Then the client settles at its real size (or you resize the window). Grow back to 45.
+        s.resize(Size {
+            cols: 120,
+            rows: 45,
+        })
+        .unwrap();
+        std::thread::sleep(std::time::Duration::from_secs(3));
+        while rx.try_recv().is_ok() {}
+        let after = census(&s.snapshot(), 45, 120);
+        eprintln!("[back @45] census={after:?}");
+        dump("back @45", &s.snapshot(), 45, 120);
+        eprintln!(
+            "VERDICT before_nb={} after_nb={} (transcript lost if after << before)",
+            before.0, after.0
+        );
+    }
+
     #[test]
     #[ignore]
     fn manual_storm_does_not_diverge_the_grid() {
