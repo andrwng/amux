@@ -62,17 +62,30 @@ async fn handle(stream: UnixStream, registry: &Registry) -> Result<()> {
 
 /// `amux hook`: read Claude's hook JSON from stdin, tag it with `$AMUX_AGENT_ID`, and deliver it.
 pub fn run_hook() -> Result<()> {
-    swallow("hook", deliver_hook())
+    // Bound the entire hook — the stdin read included — on wall-clock time. Claude runs the hook
+    // synchronously and blocks the turn (and the pane's render) until this process exits, so any
+    // blocking step (a stdin that never EOFs, a connect/write to a wedged or backlogged daemon)
+    // freezes the agent. Observed: `amux hook` alive for 3+ minutes (Claude's own status read
+    // "running Stop hook · 3m 20s"), the pane cleared with no redraw — the long-standing blank.
+    // Status is best-effort: abandon a hook that overruns rather than let it hang the agent.
+    swallow("hook", run_bounded(HOOK_DELIVER_TIMEOUT, deliver_hook))
 }
 
 /// `amux nav <dir>`: the in-pane navigator hit its edge — hand navigation back to amux.
 pub fn run_nav(dir: &str) -> Result<()> {
-    swallow("nav", deliver_nav(dir))
+    let dir = dir.to_string();
+    swallow(
+        "nav",
+        run_bounded(HOOK_DELIVER_TIMEOUT, move || deliver_nav(&dir)),
+    )
 }
 
 /// `amux passthrough <on|off>`: announce that a vim-like app is (or is no longer) foreground here.
 pub fn run_passthrough(on: bool) -> Result<()> {
-    swallow("passthrough", deliver_passthrough(on))
+    swallow(
+        "passthrough",
+        run_bounded(HOOK_DELIVER_TIMEOUT, move || deliver_passthrough(on)),
+    )
 }
 
 fn swallow(what: &str, result: Result<()>) -> Result<()> {
@@ -82,13 +95,46 @@ fn swallow(what: &str, result: Result<()>) -> Result<()> {
     Ok(())
 }
 
+/// Hard ceiling on delivering one hook report. Claude runs its hooks synchronously and blocks the
+/// turn — and the render — until the hook process exits, so a hook that blocks freezes the agent's
+/// pane (observed: `amux hook` stuck for minutes, the agent's screen cleared with no redraw, the
+/// long-standing blank). Status is best-effort, so a delivery that can't complete quickly is
+/// abandoned rather than allowed to hang: better a dropped status line than a frozen agent.
+const HOOK_DELIVER_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(3);
+
 fn deliver(msg: &PaneMessage) -> Result<()> {
-    use std::io::Write;
+    // Callers wrap this in `run_bounded`, so the connect/write below cannot hang the process past
+    // the deadline; the `set_write_timeout` in `deliver_blocking` is a second, in-band bound.
     let sock = std::env::var("AMUX_HOOK_SOCK").context("AMUX_HOOK_SOCK not set")?;
     let bytes = postcard::to_stdvec(msg).context("encode pane message")?;
-    let mut stream =
-        std::os::unix::net::UnixStream::connect(&sock).context("connect to mailbox")?;
-    stream.write_all(&bytes).context("send pane message")?;
+    deliver_blocking(&sock, &bytes)
+}
+
+/// Run a blocking `f` on a throwaway thread and give up on it after `dur`. Returns `f`'s result, or
+/// a timeout error if it overran. The thread is detached on timeout — fine here because the caller
+/// (`amux hook`) is a short-lived process that exits right after, so nothing outlives it.
+fn run_bounded<F>(dur: std::time::Duration, f: F) -> Result<()>
+where
+    F: FnOnce() -> Result<()> + Send + 'static,
+{
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let _ = tx.send(f());
+    });
+    match rx.recv_timeout(dur) {
+        Ok(result) => result,
+        Err(_) => anyhow::bail!("timed out after {dur:?}"),
+    }
+}
+
+fn deliver_blocking(sock: &str, bytes: &[u8]) -> Result<()> {
+    use std::io::Write;
+    let mut stream = std::os::unix::net::UnixStream::connect(sock).context("connect to mailbox")?;
+    // A write timeout in case the socket buffer is full (daemon not reading): bounded like connect.
+    stream
+        .set_write_timeout(Some(HOOK_DELIVER_TIMEOUT))
+        .context("set write timeout")?;
+    stream.write_all(bytes).context("send pane message")?;
     // Half-close so the daemon's read-to-EOF completes promptly.
     stream.shutdown(std::net::Shutdown::Write).ok();
     Ok(())
@@ -123,4 +169,48 @@ fn deliver_passthrough(on: bool) -> Result<()> {
 fn terminal_from_env() -> Result<amux_core::agent::TerminalId> {
     let s = std::env::var("AMUX_TERMINAL_ID").context("AMUX_TERMINAL_ID not set")?;
     amux_core::agent::TerminalId::parse(&s).context("AMUX_TERMINAL_ID is not a valid id")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::time::{Duration, Instant};
+
+    /// A fast delivery returns its own result promptly.
+    #[test]
+    fn run_bounded_returns_a_fast_result() {
+        let started = Instant::now();
+        let r = run_bounded(Duration::from_secs(5), || Ok(()));
+        assert!(r.is_ok());
+        assert!(
+            started.elapsed() < Duration::from_secs(1),
+            "should not wait the full budget"
+        );
+    }
+
+    /// A blocking delivery is abandoned at the deadline rather than hanging the caller — the whole
+    /// point: `amux hook` runs synchronously inside Claude's turn, so an unbounded hang freezes the
+    /// agent's pane (the blank bug). Here the closure sleeps far past the budget; the bound must
+    /// return an error close to the deadline, not after the sleep.
+    #[test]
+    fn run_bounded_gives_up_on_a_hanging_delivery() {
+        let started = Instant::now();
+        let r = run_bounded(Duration::from_millis(200), || {
+            std::thread::sleep(Duration::from_secs(30));
+            Ok(())
+        });
+        assert!(
+            r.is_err(),
+            "a delivery past the deadline must fail, not block"
+        );
+        let waited = started.elapsed();
+        assert!(
+            waited >= Duration::from_millis(200),
+            "returned before the deadline: {waited:?}"
+        );
+        assert!(
+            waited < Duration::from_secs(5),
+            "waited for the sleep instead of the deadline: {waited:?}"
+        );
+    }
 }
