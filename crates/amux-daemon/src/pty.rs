@@ -107,6 +107,33 @@ fn gtrace(msg: &str) {
     let _ = append_bounded(path, &line, GRID_TRACE_CAP);
 }
 
+/// Bytes of recent raw PTY output kept per session while tracing, so that when a grid blanks we can
+/// dump the *stream that led to it* — the only way to root-cause a divergence, since the daemon's
+/// vt100 is the source of truth and a diff-only app never resends what was lost. Bounded (§2).
+const BLANK_CAPTURE_CAP: usize = 512 * 1024;
+
+/// Dump a session's recent raw output to a file beside the grid trace, so the bytes that blanked a
+/// grid can be replayed byte-for-byte through a fresh parser. Named by pid/sid/time; best-effort.
+fn dump_blank_capture(sid: u64, ring: &std::collections::VecDeque<u8>) {
+    let Some(trace) = grid_trace_path() else {
+        return;
+    };
+    let ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis())
+        .unwrap_or(0);
+    let name = format!("blanked-pid{}-sid{sid}-{ms}.bin", std::process::id());
+    let path = trace.with_file_name(name);
+    let bytes: Vec<u8> = ring.iter().copied().collect();
+    if std::fs::write(&path, &bytes).is_ok() {
+        gtrace(&format!(
+            "sid={sid} BLANK-CAPTURE {} bytes -> {}",
+            bytes.len(),
+            path.display()
+        ));
+    }
+}
+
 /// Append `line` to `path`, rotating the file to `<path>.1` first when it has grown past `cap` —
 /// so the trace can stay on forever without growing without bound. One previous generation is kept
 /// so the events leading up to a rotation are not lost.
@@ -507,6 +534,10 @@ impl Session {
             let mut buf = [0u8; 8192];
             let mut prev_nb: usize = 0; // for grid-trace transition detection
             let mut carry: Vec<u8> = Vec::new(); // a trailing partial escape held for the next read
+                                                 // Recent raw output, kept only while tracing, to dump when a grid blanks (root-cause
+                                                 // evidence). Holds the bytes fed to the parser, so a replay reconstructs the divergence.
+            let tracing = grid_trace_path().is_some();
+            let mut ring: std::collections::VecDeque<u8> = std::collections::VecDeque::new();
             loop {
                 match reader.read(&mut buf) {
                     Ok(0) => break,
@@ -526,6 +557,12 @@ impl Session {
                         let chunk = &data[..keep];
                         if chunk.is_empty() {
                             continue; // the whole read was an unfinished escape — wait for the rest
+                        }
+                        if tracing {
+                            ring.extend(chunk.iter().copied());
+                            while ring.len() > BLANK_CAPTURE_CAP {
+                                ring.pop_front();
+                            }
                         }
                         // Answer any terminal query in this chunk, but only *after* dropping the
                         // parser lock — see `Queries` — and only by enqueuing: a blocking write here
@@ -552,9 +589,12 @@ impl Session {
                                     "sid={sid} OUTPUT grid {prev_nb}->{nb} {cols}x{rows} 2J={c2j} J={cj} len={}",
                                     chunk.len()
                                 ));
-                                // The bytes that blanked it are the evidence; keep them.
+                                // The bytes that blanked it are the evidence; keep them — the
+                                // culprit chunk inline, and the whole recent stream as a file to
+                                // replay through a fresh parser.
                                 if blanked {
                                     gtrace(&format!("sid={sid} BLANKED-BY {}", chunk_head(chunk)));
+                                    dump_blank_capture(sid, &ring);
                                 }
                             }
                             prev_nb = nb;
@@ -1781,6 +1821,134 @@ mod resize_experiment {
             }
         }
     }
+    /// Reproduce the divergence the user hits: after a rapid resize storm (a fast divider drag),
+    /// does the daemon grid still match what Claude is showing? We can't read Claude's own screen,
+    /// but a genuine resize to a fresh size forces its full repaint — so compare the grid right
+    /// after the storm against the grid after a forced repaint. If the storm left the grid with far
+    /// less content, amux dropped content Claude still believes is there, and (diff-only) Claude
+    /// never restores it: the permanent blank.
+    ///
+    /// Result 2026-09-17, Claude Code 2.1.276: a wild storm ([31,47,22,53,40] rows ~15ms apart)
+    /// did NOT diverge — Claude full-repaints after the SIGWINCH burst, content identical
+    /// (baseline_nb == after_storm_nb == forced_nb). So resize storms are not the trigger; the
+    /// real blank is captured by the reader's ring dump (`AMUX_GRID_TRACE` → `blanked-*.bin`) and
+    /// replayed with `manual_replay_blank_capture`.
+    #[test]
+    #[ignore]
+    fn manual_storm_does_not_diverge_the_grid() {
+        let dir = tempfile::tempdir().unwrap();
+        let s = Session::spawn(
+            &["claude".to_string()],
+            dir.path(),
+            &[],
+            Size {
+                cols: 120,
+                rows: 40,
+            },
+        )
+        .unwrap();
+        let mut rx = s.subscribe();
+        std::thread::sleep(std::time::Duration::from_secs(6));
+        while rx.try_recv().is_ok() {}
+        s.write_input(b"\x1b[B").unwrap(); // select "Yes, trust"
+        std::thread::sleep(std::time::Duration::from_millis(400));
+        s.write_input(b"\r").unwrap();
+        std::thread::sleep(std::time::Duration::from_secs(10));
+        while rx.try_recv().is_ok() {}
+        // Type a few visible characters into the prompt so the content area is non-trivial.
+        s.write_input(b"hello world this is a test line").unwrap();
+        std::thread::sleep(std::time::Duration::from_secs(2));
+        while rx.try_recv().is_ok() {}
+        let baseline = census(&s.snapshot(), 40, 120);
+        eprintln!("[baseline @40] census={baseline:?}");
+        dump("baseline @40", &s.snapshot(), 40, 120);
+
+        // A fast wild storm: sizes a real drag sweeps through, ~15ms apart, no settle. The last
+        // size is 40 again, so any content loss is amux's, not a pending repaint at a smaller size.
+        for &r in &[31u16, 47, 22, 53, 40] {
+            s.resize(Size { cols: 120, rows: r }).unwrap();
+            std::thread::sleep(std::time::Duration::from_millis(15));
+        }
+        // Give Claude a beat to answer the SIGWINCH burst however it will.
+        std::thread::sleep(std::time::Duration::from_secs(3));
+        while rx.try_recv().is_ok() {}
+        let after_storm = census(&s.snapshot(), 40, 120);
+        eprintln!("[after storm @40] census={after_storm:?}");
+        dump("after storm @40", &s.snapshot(), 40, 120);
+
+        // Force a guaranteed full repaint: resize to a size not seen in the storm, wait, come back.
+        s.resize(Size {
+            cols: 118,
+            rows: 39,
+        })
+        .unwrap();
+        std::thread::sleep(std::time::Duration::from_secs(2));
+        s.resize(Size {
+            cols: 120,
+            rows: 40,
+        })
+        .unwrap();
+        std::thread::sleep(std::time::Duration::from_secs(2));
+        while rx.try_recv().is_ok() {}
+        let forced = census(&s.snapshot(), 40, 120);
+        eprintln!("[after forced repaint @40] census={forced:?}");
+        dump("after forced repaint @40", &s.snapshot(), 40, 120);
+
+        eprintln!(
+            "VERDICT: baseline_nb={} after_storm_nb={} forced_nb={}",
+            baseline.0, after_storm.0, forced.0
+        );
+    }
+
+    /// Replay a `blanked-*.bin` capture (raw PTY output the daemon kept before a grid blanked) and
+    /// find the byte offset where the grid went blank — the divergence, reproduced offline.
+    /// `AMUX_BLANK_CAPTURE=<path> AMUX_BLANK_COLS=.. AMUX_BLANK_ROWS=..`, then read the dumps.
+    #[test]
+    #[ignore]
+    fn manual_replay_blank_capture() {
+        let path = std::env::var("AMUX_BLANK_CAPTURE").expect("set AMUX_BLANK_CAPTURE");
+        let cols: u16 = std::env::var("AMUX_BLANK_COLS")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(332);
+        let rows: u16 = std::env::var("AMUX_BLANK_ROWS")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(65);
+        let bytes = std::fs::read(&path).unwrap();
+        eprintln!("replaying {} bytes at {cols}x{rows}", bytes.len());
+        // Feed in 2KB steps; report each step's glyph-row count and the escapes in a step that
+        // drops it, so the blanking sequence is pinpointed.
+        let mut p = vt100::Parser::new(rows, cols, 0);
+        let glyph_rows = |sc: &vt100::Screen| {
+            (0..rows)
+                .filter(|&y| {
+                    (0..cols).any(|x| {
+                        sc.cell(y, x)
+                            .map(|c| !c.contents().trim().is_empty())
+                            .unwrap_or(false)
+                    })
+                })
+                .count()
+        };
+        let mut prev = 0usize;
+        let step = 2048;
+        for (i, ch) in bytes.chunks(step).enumerate() {
+            p.process(ch);
+            let nb = glyph_rows(p.screen());
+            if prev >= 4 && nb <= 1 {
+                eprintln!(
+                    "BLANKED at step {i} (byte ~{}): {}",
+                    i * step,
+                    chunk_head(ch)
+                );
+            }
+            prev = nb;
+        }
+        dump("final replayed grid", &bytes, rows, cols);
+        eprintln!("final glyph_rows={}", glyph_rows(p.screen()));
+    }
+
     #[test]
     #[ignore]
     fn manual_claude_repaints_after_resizes() {

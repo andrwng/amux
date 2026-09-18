@@ -152,7 +152,13 @@ amux. Keep it that way; it drifts fast, and a stale shortcut table is worse than
   pid, every resize, attach, and app-output chunk that flipped a grid content↔blank, plus a `BLANKED-BY`
   line with the first 512 bytes (escapes visible) of the chunk that blanked it — read it first when a
   pane blanks, then the client tap for the rest (`AMUX_GRID_TRACE=<path>` relocates it). "Blank"
-  means no glyph: a grid of styled spaces is blank.
+  means no glyph: a grid of styled spaces is blank. When a grid blanks, the daemon also writes
+  `blanked-pid<pid>-sid<sid>-<ms>.bin` beside the trace — the recent raw PTY stream that led to it
+  (bounded ring) — and replaying it offline pinpoints the divergence: `AMUX_BLANK_CAPTURE=<file>
+  AMUX_BLANK_COLS=.. AMUX_BLANK_ROWS=.. cargo test -p amux-daemon manual_replay_blank_capture --
+  --ignored --nocapture`. This is the tool for the long-standing blank: the daemon's vt100 is the
+  source of truth, so a blank daemon grid while the app is alive is a parser divergence, and the
+  captured bytes are what reproduce it.
 - **Dependencies.** Do not add an external crate without first declaring it in
   `[workspace.dependencies]` (root `Cargo.toml`) and consuming it with `{ workspace = true }`. The
   pinned set in `DESIGN.md` §11 is mutually verified and load-bearing — prefer it, and justify any
