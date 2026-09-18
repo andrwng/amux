@@ -149,8 +149,10 @@ amux. Keep it that way; it drifts fast, and a stale shortcut table is worse than
   (optionally `AMUX_REPLAY_TERM`/`_COLS`/`_ROWS`) to reconstruct exactly what a pane's parser saw and
   find the frame where it went blank or condensed. See `crates/amux-tui/src/record.rs`. The daemon
   side is always recorded: `<amux_home>/grid-trace.log` logs, per session and tagged with the daemon
-  pid, every resize, attach, and app-output chunk that flipped a grid content↔blank — read it first
-  when a pane blanks, then the client tap for the bytes (`AMUX_GRID_TRACE=<path>` relocates it).
+  pid, every resize, attach, and app-output chunk that flipped a grid content↔blank, plus a `BLANKED-BY`
+  line with the first 512 bytes (escapes visible) of the chunk that blanked it — read it first when a
+  pane blanks, then the client tap for the rest (`AMUX_GRID_TRACE=<path>` relocates it). "Blank"
+  means no glyph: a grid of styled spaces is blank.
 - **Dependencies.** Do not add an external crate without first declaring it in
   `[workspace.dependencies]` (root `Cargo.toml`) and consuming it with `{ workspace = true }`. The
   pinned set in `DESIGN.md` §11 is mutually verified and load-bearing — prefer it, and justify any

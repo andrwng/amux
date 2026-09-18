@@ -126,12 +126,43 @@ fn append_bounded(path: &Path, line: &str, cap: u64) -> std::io::Result<()> {
     f.write_all(line.as_bytes())
 }
 
-/// Number of visible rows that hold any text — the "is the screen blank?" signal for tracing.
+/// Number of visible rows that hold a **glyph** — the "is the screen blank?" signal for tracing.
+///
+/// A cell an app wrote a space into has non-empty `contents()` (" "), so counting non-empty cells
+/// calls a screen of styled spaces "content". That is exactly the blank-pane signature — a
+/// diff-renderer whose model went blank overwrites its old text with spaces — and it went unlogged
+/// for that reason: 49 space-only rows read as `nb=49`. Only a non-whitespace glyph counts.
 fn nonblank_rows(screen: &vt100::Screen) -> usize {
     let (rows, cols) = screen.size();
     (0..rows)
-        .filter(|&y| (0..cols).any(|x| screen.cell(y, x).is_some_and(|c| !c.contents().is_empty())))
+        .filter(|&y| {
+            (0..cols).any(|x| {
+                screen
+                    .cell(y, x)
+                    .is_some_and(|c| !c.contents().trim().is_empty())
+            })
+        })
         .count()
+}
+
+/// The first bytes of an output chunk, escape-visible and bounded, for the trace: when a chunk
+/// blanks a grid, *what the app wrote* is the evidence, and it is not otherwise recorded anywhere
+/// unless a client happened to be attached with `AMUX_RECORD`.
+fn chunk_head(chunk: &[u8]) -> String {
+    const HEAD: usize = 512;
+    let shown = &chunk[..chunk.len().min(HEAD)];
+    let mut out = String::with_capacity(shown.len() * 2);
+    for &b in shown {
+        match b {
+            0x1b => out.push_str("\\e"),
+            0x20..=0x7e => out.push(b as char),
+            _ => out.push_str(&format!("\\x{b:02x}")),
+        }
+    }
+    if chunk.len() > HEAD {
+        out.push_str(&format!("…(+{} bytes)", chunk.len() - HEAD));
+    }
+    out
 }
 
 /// Cap on a held partial escape: past this, flush rather than stall on a malformed unterminated
@@ -521,6 +552,10 @@ impl Session {
                                     "sid={sid} OUTPUT grid {prev_nb}->{nb} {cols}x{rows} 2J={c2j} J={cj} len={}",
                                     chunk.len()
                                 ));
+                                // The bytes that blanked it are the evidence; keep them.
+                                if blanked {
+                                    gtrace(&format!("sid={sid} BLANKED-BY {}", chunk_head(chunk)));
+                                }
                             }
                             prev_nb = nb;
                         }
@@ -788,6 +823,26 @@ impl Drop for Session {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A screen an app has overwritten with styled spaces is blank. The trace once counted such
+    /// rows as content (`nb=49` for a glyph-less grid), so the chunk that blanked a pane was never
+    /// logged and the failure was diagnosed from a client tap instead — when one happened to be on.
+    #[test]
+    fn rows_of_styled_spaces_count_as_blank() {
+        let mut p = vt100::Parser::new(5, 20, 0);
+        p.process(b"\x1b[48;2;38;38;38m                    \r\n                    \r\n");
+        assert_eq!(
+            nonblank_rows(p.screen()),
+            0,
+            "styled spaces are not content"
+        );
+        p.process(b"\x1b[3;1Hhello");
+        assert_eq!(nonblank_rows(p.screen()), 1);
+        // And the evidence line shows the escapes readably, bounded.
+        let head = chunk_head(b"\x1b[2J\x1b[H  text");
+        assert_eq!(head, "\\e[2J\\e[H  text");
+        assert!(chunk_head(&[b'a'; 600]).ends_with("…(+88 bytes)"));
+    }
 
     /// The grid trace is always on, so it must be bounded: past the cap the file rotates to `.1`
     /// (one generation kept) and appending continues in a fresh file.
