@@ -513,8 +513,21 @@ impl Session {
         // draining its stdin) blocks nothing but this thread — reading and parsing continue. It
         // exits when the last sender drops (Session gone) or the PTY dies (write error).
         let (input_tx, input_rx) = std::sync::mpsc::sync_channel::<Vec<u8>>(INPUT_QUEUE);
+        let writer_sid = sid;
         let writer_thread = thread::spawn(move || {
             while let Ok(bytes) = input_rx.recv() {
+                // Everything amux sends the child passes through here — user keystrokes and the
+                // query replies the reader enqueues. Trace it (bounded, escapes visible) so a
+                // spontaneous clear can be correlated with whatever amux wrote just before: the
+                // blank captures showed Claude clearing with no amux resize/hook, and the one thing
+                // left unlogged was what amux writes to the PTY. Off unless `AMUX_GRID_TRACE`.
+                if grid_trace_path().is_some() {
+                    gtrace(&format!(
+                        "sid={writer_sid} WRITE len={} {}",
+                        bytes.len(),
+                        chunk_head(&bytes)
+                    ));
+                }
                 if writer
                     .write_all(&bytes)
                     .and_then(|()| writer.flush())
@@ -826,6 +839,7 @@ impl Session {
     /// Terminate the child by PID (SIGKILL). The waiter thread then reaps and flips the watch.
     pub fn kill(&self) {
         if let Some(pid) = self.pid {
+            gtrace(&format!("sid={} SIGNAL SIGKILL pid={pid}", self.sid));
             let _ = kill(Pid::from_raw(pid as i32), Signal::SIGKILL);
         }
     }
@@ -844,6 +858,7 @@ impl Session {
         if self.is_exited() {
             return;
         }
+        gtrace(&format!("sid={} SIGNAL SIGTERM pid={pid}", self.sid));
         if kill(Pid::from_raw(pid as i32), Signal::SIGTERM).is_err() {
             return; // already gone
         }
@@ -851,6 +866,7 @@ impl Session {
         // `changed()` resolves on the waiter thread's flip; a closed channel also means exited.
         let _ = tokio::time::timeout(grace, exit_rx.changed()).await;
         if !self.is_exited() {
+            gtrace(&format!("sid={} SIGNAL SIGKILL pid={pid}", self.sid));
             let _ = kill(Pid::from_raw(pid as i32), Signal::SIGKILL);
         }
     }

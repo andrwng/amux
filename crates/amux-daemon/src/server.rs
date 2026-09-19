@@ -321,7 +321,13 @@ async fn handle_client(stream: UnixStream, registry: Arc<Registry>) -> Result<()
         }
     }
 
-    for (_, forwarder) in attached {
+    for (terminal, forwarder) in attached {
+        // Mark the disconnect against each terminal this client was viewing, so a blank that
+        // appears while no client is attached can be correlated with the reconnect window (the
+        // spontaneous clears were all seen around SSH disconnect/reconnect). No-op without a trace.
+        if let Some(session) = registry.session(terminal) {
+            session.trace_event("CLIENT-DISCONNECT");
+        }
         forwarder.abort();
     }
     // The viewer is gone, so nothing is being watched — a later notable event should mark unread.
