@@ -1994,11 +1994,75 @@ mod resize_experiment {
         eprintln!("VERDICT marker_present={found} (grid diverged if false)");
     }
 
+    /// Result 2026-09-21, Claude 2.1.276: does NOT wedge — full recovery (content intact across
+    /// the storm and the recovery resize). Resize is not the trigger.
+    ///
     /// The real reconnect pattern (from grid-trace): a rapid RESIZE STORM through many sizes
     /// including a pathological tiny height (a mini at 3 rows), with no settle, then back up. tmux
     /// sends ONE resize on attach; amux sends this burst. Does it wedge ink into rendering empty
     /// and not recovering — the blank that a later resize can't repaint? Reproduce with the actual
     /// shape, faster and nastier than the earlier (too-gentle) storm test.
+    /// Result 2026-09-21: child mode renders the SAME full UI as normal, idle and after 20s. The
+    /// child-session marker is a red herring for the blank (the env scrub is hygiene, not the fix).
+    ///
+    /// Does Claude Code in child-session mode (CLAUDE_CODE_CHILD_SESSION=1) render its idle UI
+    /// differently from a normal session? If child mode renders empty/degraded when idle, it is the
+    /// blank; if it renders the same full UI, the child marker is a red herring for the blank.
+    #[test]
+    #[ignore]
+    fn manual_child_session_idle_render() {
+        for child in [false, true] {
+            let dir = tempfile::tempdir().unwrap();
+            if child {
+                unsafe { std::env::set_var("CLAUDE_CODE_CHILD_SESSION", "1") };
+            } else {
+                unsafe { std::env::remove_var("CLAUDE_CODE_CHILD_SESSION") };
+            }
+            // Spawn WITHOUT the scrub by calling CommandBuilder directly? No — Session::spawn scrubs.
+            // Temporarily bypass by spawning claude with the var re-set via a wrapper sh.
+            let cmd = if child {
+                vec![
+                    "/bin/sh".to_string(),
+                    "-c".to_string(),
+                    "export CLAUDE_CODE_CHILD_SESSION=1; exec claude".to_string(),
+                ]
+            } else {
+                vec!["claude".to_string()]
+            };
+            let s = Session::spawn(
+                &cmd,
+                dir.path(),
+                &[],
+                Size {
+                    cols: 120,
+                    rows: 40,
+                },
+            )
+            .unwrap();
+            let mut rx = s.subscribe();
+            std::thread::sleep(std::time::Duration::from_secs(6));
+            while rx.try_recv().is_ok() {}
+            s.write_input(b"\x1b[B").unwrap();
+            std::thread::sleep(std::time::Duration::from_millis(400));
+            s.write_input(b"\r").unwrap();
+            std::thread::sleep(std::time::Duration::from_secs(10));
+            while rx.try_recv().is_ok() {}
+            eprintln!(
+                "[child={child}] after-startup census={:?}",
+                census(&s.snapshot(), 40, 120)
+            );
+            // Sit idle 20s and re-census — does an idle child session clear itself?
+            std::thread::sleep(std::time::Duration::from_secs(20));
+            while rx.try_recv().is_ok() {}
+            eprintln!(
+                "[child={child}] after-20s-idle census={:?}",
+                census(&s.snapshot(), 40, 120)
+            );
+            dump(&format!("child={child} idle"), &s.snapshot(), 40, 120);
+        }
+        unsafe { std::env::remove_var("CLAUDE_CODE_CHILD_SESSION") };
+    }
+
     #[test]
     #[ignore]
     fn manual_reconnect_resize_storm_with_tiny_size() {
