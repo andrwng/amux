@@ -2010,6 +2010,45 @@ mod resize_experiment {
     /// blank; if it renders the same full UI, the child marker is a red herring for the blank.
     /// Does CLAUDE_CODE_DEBUG_LOGS_DIR make Claude write debug logs WITHOUT disturbing the pane
     /// (so amux can turn it on for agents and read the next wedge's cause from Claude's own logs)?
+    /// End-to-end: a Claude launched with `tui: default` (amux's fix) renders content in the
+    /// classic renderer — confirming the fix does not itself produce a blank.
+    #[test]
+    #[ignore]
+    fn manual_classic_renderer_renders_content() {
+        let dir = tempfile::tempdir().unwrap();
+        let sf = dir.path().join("amux-settings.json");
+        std::fs::write(&sf, br#"{"tui":"default"}"#).unwrap();
+        let s = Session::spawn(
+            &[
+                "claude".to_string(),
+                "--settings".to_string(),
+                sf.to_string_lossy().into_owned(),
+            ],
+            dir.path(),
+            &[],
+            Size {
+                cols: 120,
+                rows: 40,
+            },
+        )
+        .unwrap();
+        let mut rx = s.subscribe();
+        std::thread::sleep(std::time::Duration::from_secs(6));
+        while rx.try_recv().is_ok() {}
+        s.write_input(b"\x1b[B").unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(400));
+        s.write_input(b"\r").unwrap();
+        std::thread::sleep(std::time::Duration::from_secs(8));
+        while rx.try_recv().is_ok() {}
+        let c = census(&s.snapshot(), 40, 120);
+        eprintln!("[classic] census={c:?}");
+        dump("classic renderer", &s.snapshot(), 40, 120);
+        assert!(
+            c.0 >= 3,
+            "classic renderer should render content, got {c:?}"
+        );
+    }
+
     #[test]
     #[ignore]
     fn manual_claude_debug_logs_dir_is_clean() {
