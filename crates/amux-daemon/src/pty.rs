@@ -67,6 +67,18 @@ fn terminfo_exists(name: &str) -> bool {
 /// conversation; a session that never scrolls costs nothing.
 const SCROLLBACK: usize = 5000;
 
+/// Claude Code environment markers that flag a session as a nested/child run. Inherited from
+/// amux's own launch context (if amux was started from within a `claude` session) and scrubbed
+/// from every PTY child so agents always run as clean top-level sessions. See `Session::spawn`.
+/// `CLAUDECODE`/`CLAUDE_CODE_ENTRYPOINT` are Claude Code's own "running inside Claude" markers;
+/// `CLAUDE_CODE_CHILD_SESSION` is the one whose banner ("Transcript saving is off") was observed.
+const CHILD_SESSION_ENV_SCRUB: &[&str] = &[
+    "CLAUDE_CODE_CHILD_SESSION",
+    "CLAUDE_CODE_ENTRYPOINT",
+    "CLAUDECODE",
+    "CLAUDE_CODE_SSE_PORT",
+];
+
 /// Continuous, per-session grid tracing: the record of what turned a grid content→blank.
 ///
 /// The client-side `AMUX_RECORD` tap resets on every TUI reattach, so it always *starts* after the
@@ -485,6 +497,17 @@ impl Session {
             cmd.arg(arg);
         }
         cmd.cwd(cwd);
+        // Scrub Claude Code's "I am a nested/child session" markers from the inherited environment
+        // before they reach the child. If amux itself was ever launched from inside a Claude Code
+        // session (a terminal running `claude`), these vars are set in the daemon's environment and
+        // would propagate into every agent amux spawns — putting each agent into Claude's degraded
+        // *child-session* mode ("inherited CLAUDE_CODE_CHILD_SESSION marker · Transcript saving is
+        // off"), which was found active on exactly the panes that go blank. amux owns each agent's
+        // top-level session, so a child-session marker inherited from amux's own launch context is
+        // never correct here. Applied to every PTY child (agents and shells) as environment hygiene.
+        for key in CHILD_SESSION_ENV_SCRUB {
+            cmd.env_remove(key);
+        }
         for (key, value) in env {
             cmd.env(key, value);
         }
@@ -891,6 +914,41 @@ impl Drop for Session {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A spawned child must NOT inherit Claude Code's child-session marker from amux's own launch
+    /// environment — that marker puts an agent into the degraded child mode ("Transcript saving is
+    /// off") seen on the blank panes. Set the marker in this process, spawn a shell through the
+    /// real spawn path, and require the child to see it empty.
+    #[test]
+    fn spawn_scrubs_the_inherited_child_session_marker() {
+        // SAFETY: single-threaded test process; we set then read our own env for the child to
+        // inherit, and the value is inconsequential.
+        unsafe { std::env::set_var("CLAUDE_CODE_CHILD_SESSION", "1") };
+        let dir = std::env::temp_dir();
+        let session = Session::spawn(
+            &[
+                "/bin/sh".to_string(),
+                "-c".to_string(),
+                "printf 'MARK=[%s]\\n' \"$CLAUDE_CODE_CHILD_SESSION\"; sleep 0.2".to_string(),
+            ],
+            &dir,
+            &[],
+            Size { cols: 80, rows: 24 },
+        )
+        .expect("spawn");
+        let mut rx = session.subscribe();
+        std::thread::sleep(std::time::Duration::from_millis(400));
+        let mut out = Vec::new();
+        while let Ok(b) = rx.try_recv() {
+            out.extend_from_slice(&b);
+        }
+        unsafe { std::env::remove_var("CLAUDE_CODE_CHILD_SESSION") };
+        let text = String::from_utf8_lossy(&out);
+        assert!(
+            text.contains("MARK=[]"),
+            "child inherited the scrubbed marker, got: {text:?}"
+        );
+    }
 
     /// A screen an app has overwritten with styled spaces is blank. The trace once counted such
     /// rows as content (`nb=49` for a glyph-less grid), so the chunk that blanked a pane was never
@@ -1934,6 +1992,74 @@ mod resize_experiment {
         }
         dump("after clean marker", &snap, 40, 120);
         eprintln!("VERDICT marker_present={found} (grid diverged if false)");
+    }
+
+    /// The real reconnect pattern (from grid-trace): a rapid RESIZE STORM through many sizes
+    /// including a pathological tiny height (a mini at 3 rows), with no settle, then back up. tmux
+    /// sends ONE resize on attach; amux sends this burst. Does it wedge ink into rendering empty
+    /// and not recovering — the blank that a later resize can't repaint? Reproduce with the actual
+    /// shape, faster and nastier than the earlier (too-gentle) storm test.
+    #[test]
+    #[ignore]
+    fn manual_reconnect_resize_storm_with_tiny_size() {
+        let dir = tempfile::tempdir().unwrap();
+        let s = Session::spawn(
+            &["claude".to_string()],
+            dir.path(),
+            &[],
+            Size {
+                cols: 332,
+                rows: 78,
+            },
+        )
+        .unwrap();
+        let mut rx = s.subscribe();
+        std::thread::sleep(std::time::Duration::from_secs(6));
+        while rx.try_recv().is_ok() {}
+        s.write_input(b"\x1b[B").unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(400));
+        s.write_input(b"\r").unwrap();
+        std::thread::sleep(std::time::Duration::from_secs(10));
+        while rx.try_recv().is_ok() {}
+        // Type a marker so there is content to lose.
+        s.write_input(b"hello from the storm test").unwrap();
+        std::thread::sleep(std::time::Duration::from_secs(2));
+        while rx.try_recv().is_ok() {}
+        eprintln!("[before storm] census={:?}", census(&s.snapshot(), 78, 332));
+
+        // The actual reconnect sweep, tight (a few ms apart), including a 3-row height.
+        for &(cols, rows) in &[
+            (176u16, 44u16),
+            (176, 3),
+            (332, 7),
+            (176, 3),
+            (332, 65),
+            (332, 57),
+            (332, 43),
+            (332, 28),
+            (332, 43),
+            (327, 43),
+            (332, 78),
+        ] {
+            s.resize(Size { cols, rows }).unwrap();
+            std::thread::sleep(std::time::Duration::from_millis(6));
+        }
+        std::thread::sleep(std::time::Duration::from_secs(3));
+        while rx.try_recv().is_ok() {}
+        let after = census(&s.snapshot(), 78, 332);
+        eprintln!("[after storm @332x78] census={after:?}");
+        dump("after storm", &s.snapshot(), 78, 332);
+        // Now a single clean resize (like a later user resize) — does it recover?
+        s.resize(Size {
+            cols: 332,
+            rows: 77,
+        })
+        .unwrap();
+        std::thread::sleep(std::time::Duration::from_secs(2));
+        while rx.try_recv().is_ok() {}
+        let recov = census(&s.snapshot(), 77, 332);
+        eprintln!("[after recovery resize @332x77] census={recov:?}");
+        eprintln!("VERDICT before={} after_storm={} after_recover={} (WEDGED if after_storm/recover are ~0 with content before)", census(&s.snapshot(),78,332).0, after.0, recov.0);
     }
 
     #[test]
