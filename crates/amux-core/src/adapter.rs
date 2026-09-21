@@ -212,7 +212,15 @@ fn claude_hook_settings(amux_exe: &Path) -> serde_json::Value {
             }]),
         );
     }
-    serde_json::json!({ "hooks": hooks })
+    // Pin agents to Claude Code's *classic* renderer. Claude's newer "fullscreen" renderer records
+    // a per-machine strike whenever a launch is killed before it finishes starting
+    // (`fullscreenBootStrikes` in ~/.claude.json), and then leaves the pane blank in that boot —
+    // and amux routinely kills agents mid-startup (daemon restart, reconnect resume, close/reopen),
+    // so a user whose `tui` preference is `fullscreen` gets agents that boot to a blank screen and
+    // never repaint. amux owns the agent's terminal lifecycle, so the classic renderer (robust to
+    // being started and killed repeatedly) is the correct choice here; this settings file overrides
+    // the user's global `tui` for amux agents only, leaving their interactive Claude untouched.
+    serde_json::json!({ "hooks": hooks, "tui": "default" })
 }
 
 #[cfg(test)]
@@ -407,6 +415,14 @@ mod tests {
                 .unwrap();
             assert!(cmd.contains("amux") && cmd.ends_with("hook"), "cmd: {cmd}");
         }
+        // Agents are pinned to the classic renderer: Claude's fullscreen renderer boots to a blank
+        // pane when killed mid-startup (which amux does on restart/resume), tracked as a per-machine
+        // strike. This overrides a user's global `tui: fullscreen` for amux agents only.
+        assert_eq!(
+            v["tui"].as_str(),
+            Some("default"),
+            "agents pin the classic renderer"
+        );
     }
 
     #[test]

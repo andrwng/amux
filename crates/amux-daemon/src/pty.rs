@@ -2008,6 +2008,66 @@ mod resize_experiment {
     /// Does Claude Code in child-session mode (CLAUDE_CODE_CHILD_SESSION=1) render its idle UI
     /// differently from a normal session? If child mode renders empty/degraded when idle, it is the
     /// blank; if it renders the same full UI, the child marker is a red herring for the blank.
+    /// Does CLAUDE_CODE_DEBUG_LOGS_DIR make Claude write debug logs WITHOUT disturbing the pane
+    /// (so amux can turn it on for agents and read the next wedge's cause from Claude's own logs)?
+    #[test]
+    #[ignore]
+    fn manual_claude_debug_logs_dir_is_clean() {
+        let dir = tempfile::tempdir().unwrap();
+        let logs = tempfile::tempdir().unwrap();
+        let s = Session::spawn(
+            &["claude".to_string()],
+            dir.path(),
+            &[
+                (
+                    "CLAUDE_CODE_DEBUG_LOGS_DIR".to_string(),
+                    logs.path().to_string_lossy().into_owned(),
+                ),
+                ("CLAUDE_CODE_DEBUG".to_string(), "1".to_string()),
+            ],
+            Size {
+                cols: 120,
+                rows: 40,
+            },
+        )
+        .unwrap();
+        let mut rx = s.subscribe();
+        std::thread::sleep(std::time::Duration::from_secs(6));
+        while rx.try_recv().is_ok() {}
+        s.write_input(b"\x1b[B").unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(400));
+        s.write_input(b"\r").unwrap();
+        std::thread::sleep(std::time::Duration::from_secs(8));
+        while rx.try_recv().is_ok() {}
+        eprintln!(
+            "[debug-logs] UI census={:?}",
+            census(&s.snapshot(), 40, 120)
+        );
+        dump("debug-logs UI", &s.snapshot(), 40, 120);
+        let mut files = Vec::new();
+        fn walk(d: &std::path::Path, out: &mut Vec<std::path::PathBuf>) {
+            if let Ok(rd) = std::fs::read_dir(d) {
+                for e in rd.flatten() {
+                    let p = e.path();
+                    if p.is_dir() {
+                        walk(&p, out);
+                    } else {
+                        out.push(p);
+                    }
+                }
+            }
+        }
+        walk(logs.path(), &mut files);
+        eprintln!("[debug-logs] {} log files written:", files.len());
+        for f in files.iter().take(5) {
+            eprintln!(
+                "   {} ({} bytes)",
+                f.display(),
+                std::fs::metadata(f).map(|m| m.len()).unwrap_or(0)
+            );
+        }
+    }
+
     #[test]
     #[ignore]
     fn manual_child_session_idle_render() {
