@@ -83,7 +83,8 @@ impl Grid {
         // does when its window shrinks. `Vec::resize` (upstream) instead truncates the tail, i.e.
         // drops the *bottom* rows and keeps the top, which for a full-screen app blanks the visible
         // area (its recent output and prompt live at the bottom) and cannot be recovered, since the
-        // app re-renders only diffs. On a grow, append blank rows at the bottom (upstream behavior).
+        // app re-renders only diffs. On a grow, pull rows back DOWN out of scrollback onto the top
+        // (as tmux does), and only pad with blank rows at the bottom once history runs out.
         let cur = self.rows.len();
         let want = usize::from(size.rows);
         if want < cur {
@@ -102,6 +103,24 @@ impl Grid {
             self.pos.row = self.pos.row.saturating_sub(drop);
             self.saved_pos.row = self.saved_pos.row.saturating_sub(drop);
         } else if want > cur {
+            // The mirror of the shrink. Upstream only appended blank rows, so rows a shrink had
+            // pushed into scrollback stayed there while the app — which never saw them leave the
+            // screen — repainted them: every shrink/grow cycle left one more copy in history.
+            let restore = (want - cur).min(self.scrollback.len());
+            for _ in 0..restore {
+                if let Some(mut row) = self.scrollback.pop_back() {
+                    // Saved at whatever width it scrolled off at; bring it to this grid's width,
+                    // as the visible rows were above.
+                    row.resize(size.cols, crate::Cell::new());
+                    self.rows.insert(0, row);
+                }
+            }
+            self.scrollback_offset =
+                self.scrollback_offset.min(self.scrollback.len());
+            // Visible content moved down by `restore` rows; move the cursor (and saved cursor) too.
+            let restore = restore as u16;
+            self.pos.row += restore;
+            self.saved_pos.row += restore;
             self.rows.resize(want, self.new_row());
         }
 

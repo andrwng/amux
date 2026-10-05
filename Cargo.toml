@@ -63,7 +63,7 @@ amux-tui = { workspace = true }
 anyhow = { workspace = true }
 clap = { workspace = true }
 
-# amux vendors vt100 0.16.2 with two changes vs. crates.io (diff against 0.16.2 shows both):
+# amux vendors vt100 0.16.2 with three changes vs. crates.io (diff against 0.16.2 shows all):
 #  1. Added getters `Screen`/`Grid::scroll_region()` and `origin_mode()`. The reattach snapshot must
 #     restore the terminal's DECSTBM scroll region and DECOM origin mode; upstream exposes no way to
 #     read them, so a client rebuilding its parser from a snapshot defaulted to a full-screen region
@@ -74,6 +74,11 @@ clap = { workspace = true }
 #     keep-top left the visible area blank (a full-screen app's recent output + prompt live at the
 #     bottom) and an idle diff-renderer never repainted it — a permanent blank. Keep-bottom matches
 #     real terminals. Guard: `pty::tests::shrinking_the_grid_keeps_the_most_recent_rows`.
+#  3. `Grid::set_size` pulls rows back out of scrollback on a row-grow (as tmux does), where
+#     upstream appends blank rows. With (2) alone, rows a shrink pushed into history stayed there
+#     while the app repainted them on screen, so every shrink/grow cycle (a mini pane resizing)
+#     left another copy of the screen in scrollback — duplicated lines when scrolling back.
+#     Guard: `pty::tests::growing_the_grid_restores_rows_from_scrollback`.
 # Drop each change if upstream adds the equivalent.
 [patch.crates-io]
 vt100 = { path = "vendor/vt100" }

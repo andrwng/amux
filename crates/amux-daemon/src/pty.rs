@@ -1552,6 +1552,92 @@ mod tests {
             "the oldest rows scroll off the top, not the recent ones, got:\n{c}"
         );
     }
+
+    /// Every line a parser holds, oldest first: scrollback, then the visible screen.
+    fn history_and_screen(p: &mut vt100::Parser<Queries>) -> Vec<String> {
+        let (rows, cols) = p.screen().size();
+        p.screen_mut().set_scrollback(usize::MAX);
+        let mut back = p.screen().scrollback();
+        let mut out = Vec::new();
+        while back > 0 {
+            // At offset `back` the window's first rows are history lines `depth-back..`.
+            p.screen_mut().set_scrollback(back);
+            let take = back.min(usize::from(rows));
+            out.extend(
+                p.screen()
+                    .rows(0, cols)
+                    .take(take)
+                    .map(|r| r.trim_end().to_string()),
+            );
+            back -= take;
+        }
+        p.screen_mut().set_scrollback(0);
+        out.extend(p.screen().rows(0, cols).map(|r| r.trim_end().to_string()));
+        out
+    }
+
+    /// Growing the grid must pull back the rows a shrink pushed into scrollback, as tmux does —
+    /// the duplicated-history bug. Upstream `set_size` appended blank rows on a grow, so the pushed
+    /// rows stayed in history while the app (which never saw them leave the screen) repainted them:
+    /// Claude in a mini pane cycling 20 -> 3 -> 20 rows gained one full copy of its screen in
+    /// scrollback per cycle. tmux 3.4, same sequence on a 10-row pane: the screen comes back
+    /// `L07..BOTTOM` and history goes 6 -> 13 -> 6. This asserts exactly that.
+    #[test]
+    fn growing_the_grid_restores_rows_from_scrollback() {
+        let mut p = vt100::Parser::new_with_callbacks(10, 40, SCROLLBACK, Queries::default());
+        let out: String = (1..=15).map(|i| format!("L{i:02}\r\n")).collect();
+        p.process(out.as_bytes());
+        p.process(b"BOTTOM");
+        let before = history_and_screen(&mut p);
+
+        p.screen_mut().set_size(3, 40);
+        p.screen_mut().set_size(10, 40);
+
+        let screen: Vec<String> = p
+            .screen()
+            .rows(0, 40)
+            .map(|r| r.trim_end().to_string())
+            .collect();
+        assert_eq!(
+            screen[0],
+            "L07",
+            "rows must come back from history, got:\n{}",
+            screen.join("\n")
+        );
+        assert_eq!(screen[9], "BOTTOM");
+        assert_eq!(
+            p.screen().cursor_position(),
+            (9, 6),
+            "the cursor rides its row back down"
+        );
+        assert_eq!(
+            history_and_screen(&mut p),
+            before,
+            "a shrink/grow round trip changes nothing"
+        );
+    }
+
+    /// With less history than the grow needs, what history there is comes back and the rest is
+    /// blank rows at the bottom — and nothing is pulled from an empty scrollback.
+    #[test]
+    fn growing_past_available_history_pads_with_blank_rows() {
+        let mut p = vt100::Parser::new_with_callbacks(3, 40, SCROLLBACK, Queries::default());
+        p.process(b"A\r\nB\r\nC\r\nD"); // A scrolls off: one row of history
+        p.screen_mut().set_size(6, 40);
+        let screen: Vec<String> = p
+            .screen()
+            .rows(0, 40)
+            .map(|r| r.trim_end().to_string())
+            .collect();
+        assert_eq!(screen, ["A", "B", "C", "D", "", ""]);
+        assert_eq!(p.screen().cursor_position(), (3, 1));
+        p.screen_mut().set_scrollback(usize::MAX);
+        assert_eq!(
+            p.screen().scrollback(),
+            0,
+            "history is now on screen, not in both places"
+        );
+    }
 }
 
 /// Minimal repros for snapshot-fidelity gaps. The client rebuilds its parser from `snapshot_bytes`
@@ -2399,6 +2485,69 @@ mod resize_experiment {
         }
         dump("final replayed grid", &bytes, rows, cols);
         eprintln!("final glyph_rows={}", glyph_rows(p.screen()));
+    }
+
+    /// End-to-end guard for the duplicated-history bug: a real Claude (classic renderer, as amux
+    /// runs agents) in a pane cycling 20 -> 3 -> 20 rows — the mini-pane pattern grid-trace shows.
+    /// Before the vendored grow fix every cycle appended a full copy of the screen to scrollback
+    /// (`ROW025` x6 after 5 cycles); tmux 3.4 under the same Claude and resizes keeps one copy.
+    #[test]
+    #[ignore]
+    fn manual_resize_cycles_do_not_duplicate_history() {
+        let dir = tempfile::tempdir().unwrap();
+        let sf = dir.path().join("amux-settings.json");
+        std::fs::write(&sf, br#"{"tui":"default"}"#).unwrap();
+        let s = Session::spawn(
+            &[
+                "claude".to_string(),
+                "--settings".to_string(),
+                sf.to_string_lossy().into_owned(),
+            ],
+            dir.path(),
+            &[],
+            Size {
+                cols: 100,
+                rows: 20,
+            },
+        )
+        .unwrap();
+        std::thread::sleep(std::time::Duration::from_secs(6));
+        s.write_input(b"\x1b[B").unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(400));
+        s.write_input(b"\r").unwrap();
+        std::thread::sleep(std::time::Duration::from_secs(6));
+        // Bash mode puts known lines in the transcript.
+        s.write_input(b"!").unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(300));
+        s.write_input(b"seq -f ROW%03g 1 30").unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(300));
+        s.write_input(b"\r").unwrap();
+        std::thread::sleep(std::time::Duration::from_secs(12));
+        for _ in 0..5 {
+            s.resize(Size { cols: 100, rows: 3 }).unwrap();
+            std::thread::sleep(std::time::Duration::from_millis(500));
+            s.resize(Size {
+                cols: 100,
+                rows: 20,
+            })
+            .unwrap();
+            std::thread::sleep(std::time::Duration::from_millis(500));
+        }
+        let mut parser = s.parser.lock().unwrap();
+        let (rows, cols) = parser.screen().size();
+        parser.screen_mut().set_scrollback(usize::MAX);
+        let mut back = parser.screen().scrollback();
+        let mut lines = Vec::new();
+        while back > 0 {
+            parser.screen_mut().set_scrollback(back);
+            let take = back.min(usize::from(rows));
+            lines.extend(parser.screen().rows(0, cols).take(take));
+            back -= take;
+        }
+        parser.screen_mut().set_scrollback(0);
+        lines.extend(parser.screen().rows(0, cols));
+        let n = lines.iter().filter(|l| l.contains("ROW025")).count();
+        assert_eq!(n, 1, "ROW025 appears {n} times:\n{}", lines.join("\n"));
     }
 
     #[test]
