@@ -36,6 +36,7 @@ use tui_term::widget::PseudoTerminal;
 use amux_core::agent::{sort_for_sidebar, AgentId, AgentState, RepoId, RosterItem, TerminalId};
 use amux_proto::{AgentInfo, ClientCodec, ClientMsg, DaemonMsg, ProtoError, RepoInfo, Size};
 
+use crate::fuzzy;
 use crate::input::{encode_paste, key_to_bytes};
 use crate::pane::{Axis, Dir, Nav, PaneTree};
 use crate::record::{Kind, Recorder};
@@ -213,13 +214,20 @@ enum Row {
     Attention(AgentId),
     /// The "no repos yet…" placeholder, the only row of a sidebar with nothing in it.
     NoRepos,
+    /// An agent matching the `/` search — while searching, the sidebar is only these, best first.
+    Match(AgentId),
+    /// The "no matches" placeholder, the only row of a search that matched nothing.
+    NoMatches,
 }
 
 impl Row {
     /// Whether the cursor can land here. The trailer rows are context for the row above, so `j`/`k`
     /// step over them.
     fn selectable(&self) -> bool {
-        matches!(self, Row::Repo(_) | Row::Agent(_) | Row::Recent(_))
+        matches!(
+            self,
+            Row::Repo(_) | Row::Agent(_) | Row::Recent(_) | Row::Match(_)
+        )
     }
 }
 
@@ -272,6 +280,8 @@ enum InputMode {
     /// session has no branch and takes no task, so the directory is the whole prompt.
     CreatingHead,
     Confirming,
+    /// `/` — fuzzy search over the sidebar's agents (`search_buf`); the sidebar shows only matches.
+    Searching,
 }
 
 enum Flow {
@@ -567,6 +577,11 @@ struct App {
     create_field: Field,
     /// Target repo for the `n` flow (resolved from the cursor at prompt time).
     create_repo: Option<RepoId>,
+    /// The `/` search query, and the cursor to put back if the search is cancelled: the row, and
+    /// whether it had been placed by the user (`sidebar_placed`) — searching moves the cursor, which
+    /// would otherwise count as placing it.
+    search_buf: String,
+    search_return: (Option<Row>, bool),
     confirm_id: Option<AgentId>,
     confirm_msg: String,
     /// Transient banners: `status` is an error (red), `info` a notice (green). Both dismiss on
@@ -613,6 +628,8 @@ impl App {
             selection: None,
             last_click: None,
             create_buf: String::new(),
+            search_buf: String::new(),
+            search_return: (None, false),
             dir_buf: String::new(),
             task_buf: String::new(),
             create_field: Field::Dir,
@@ -851,6 +868,11 @@ impl App {
                 self.reconcile(sink).await?;
             }
             DaemonMsg::DeleteNeedsConfirm { id, message } => {
+                // The confirm replaces whatever prompt is up; a search can't linger beneath it.
+                if self.input == InputMode::Searching {
+                    self.end_search();
+                    self.restore_search_sel();
+                }
                 self.confirm_id = Some(id);
                 self.confirm_msg = message;
                 self.input = InputMode::Confirming;
@@ -962,6 +984,7 @@ impl App {
             InputMode::CreatingRepo => return self.key_creating_repo(key, sink).await,
             InputMode::CreatingHead => return self.key_creating_head(key, sink).await,
             InputMode::Confirming => return self.key_confirm(key, sink).await,
+            InputMode::Searching => return self.key_searching(key, sink).await,
             InputMode::Normal => {}
         }
         if let Some(terminal) = self.scroll.as_ref().map(|s| s.terminal) {
@@ -1040,6 +1063,11 @@ impl App {
             InputMode::CreatingRepo | InputMode::CreatingHead => {
                 let buf = self.active_buf();
                 buf.extend(text.chars().filter(|c| !c.is_control()));
+            }
+            InputMode::Searching => {
+                self.search_buf
+                    .extend(text.chars().filter(|c| !c.is_control()));
+                self.select_best_match();
             }
             // A y/n confirm takes no free text.
             InputMode::Confirming => {}
@@ -1224,6 +1252,13 @@ impl App {
                 }
             }
             KeyCode::Enter | KeyCode::Char('l') => self.open_selected(sink).await?,
+            // `/`: fuzzy-find an agent by `repo/name`; the sidebar narrows to the matches.
+            KeyCode::Char('/') => {
+                self.search_return = (self.sidebar_sel, self.sidebar_placed);
+                self.search_buf.clear();
+                self.input = InputMode::Searching;
+                self.select_best_match();
+            }
             // `m`: open the selected agent as a mini (a small live window below the main panes).
             KeyCode::Char('m') => {
                 if let Some(id) = self.selected_agent() {
@@ -1784,6 +1819,86 @@ impl App {
             _ => {}
         }
         Ok(Flow::Continue)
+    }
+
+    /// The `/` search prompt: typing edits the query, `↑`/`↓` or `Ctrl+k`/`Ctrl+j` move among the
+    /// matches (plain `j`/`k` are query text), `Enter` opens the selected match and `Esc` cancels.
+    async fn key_searching(&mut self, key: KeyEvent, sink: &mut Sink) -> Result<Flow> {
+        let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
+        match key.code {
+            KeyCode::Down => self.move_sidebar_sel(1),
+            KeyCode::Up => self.move_sidebar_sel(-1),
+            KeyCode::Char('j') if ctrl => self.move_sidebar_sel(1),
+            KeyCode::Char('k') if ctrl => self.move_sidebar_sel(-1),
+            KeyCode::Enter => {
+                let picked = self.selected_agent();
+                self.end_search();
+                match picked {
+                    Some(id) => {
+                        // Land on the agent's grouped row — the `Match` row is gone with the search.
+                        self.place_sidebar_sel(Row::Agent(id));
+                        self.activate(id, sink).await?;
+                    }
+                    None => self.restore_search_sel(),
+                }
+            }
+            KeyCode::Esc => {
+                self.end_search();
+                self.restore_search_sel();
+            }
+            KeyCode::Backspace => {
+                self.search_buf.pop();
+                self.select_best_match();
+            }
+            // Only plain (or shifted) chars are query text — not a stray Cmd/Alt chord.
+            KeyCode::Char(c) if (key.modifiers - KeyModifiers::SHIFT).is_empty() => {
+                self.search_buf.push(c);
+                self.select_best_match();
+            }
+            _ => {}
+        }
+        Ok(Flow::Continue)
+    }
+
+    fn end_search(&mut self) {
+        self.input = InputMode::Normal;
+        self.search_buf.clear();
+    }
+
+    fn restore_search_sel(&mut self) {
+        (self.sidebar_sel, self.sidebar_placed) = std::mem::take(&mut self.search_return);
+        self.ensure_sidebar_sel();
+    }
+
+    /// Every edit to the query re-ranks, so the cursor goes back to the top — the best match.
+    fn select_best_match(&mut self) {
+        self.sidebar_sel = None;
+        self.move_sidebar_sel(i32::MIN);
+    }
+
+    /// The `/` search's rows: agents whose `repo/name` fuzzy-matches the query, best first, ties
+    /// in the usual sidebar order. `NoMatches` when there are none, so the list is never empty.
+    fn search_rows(&self) -> Vec<Row> {
+        let mut repos: Vec<&RepoInfo> = self.repos.iter().collect();
+        repos.sort_by(|a, b| a.name.cmp(&b.name).then(a.id.cmp(&b.id)));
+        let mut scored: Vec<(i32, AgentId)> = Vec::new();
+        for repo in repos {
+            for id in self.agent_ids_for(repo.id) {
+                let Some(agent) = self.agents.iter().find(|a| a.id == id) else {
+                    continue;
+                };
+                let name = format!("{}/{}", repo.name, agent.name);
+                if let Some(score) = fuzzy::score(&self.search_buf, &name) {
+                    scored.push((score, id));
+                }
+            }
+        }
+        // Stable, so equal scores keep sidebar order.
+        scored.sort_by_key(|&(score, _)| std::cmp::Reverse(score));
+        if scored.is_empty() {
+            return vec![Row::NoMatches];
+        }
+        scored.into_iter().map(|(_, id)| Row::Match(id)).collect()
     }
 
     fn active_buf(&mut self) -> &mut String {
@@ -2447,6 +2562,9 @@ impl App {
     /// not rows there either — `minimized` is a parameter so render can pass what it measured and
     /// keep rows and lines in lockstep.
     fn sidebar_rows_for(&self, minimized: bool) -> Vec<Row> {
+        if self.input == InputMode::Searching {
+            return self.search_rows();
+        }
         if self.repos.is_empty() {
             return vec![Row::NoRepos];
         }
@@ -2499,17 +2617,17 @@ impl App {
     fn selected_repo(&self) -> Option<RepoId> {
         match self.sidebar_sel? {
             Row::Repo(id) | Row::EmptyRepo(id) => Some(id),
-            Row::Agent(id) | Row::Attention(id) | Row::Recent(id) => {
+            Row::Agent(id) | Row::Attention(id) | Row::Recent(id) | Row::Match(id) => {
                 self.agents.iter().find(|a| a.id == id).map(|a| a.repo)
             }
-            Row::RecentHeader | Row::Divider | Row::NoRepos => None,
+            Row::RecentHeader | Row::Divider | Row::NoRepos | Row::NoMatches => None,
         }
     }
 
     /// The selected agent, if the cursor is on an agent row (not a repo header).
     fn selected_agent(&self) -> Option<AgentId> {
         match self.sidebar_sel? {
-            Row::Agent(id) | Row::Recent(id) => Some(id),
+            Row::Agent(id) | Row::Recent(id) | Row::Match(id) => Some(id),
             _ => None,
         }
     }
@@ -2521,7 +2639,7 @@ impl App {
         self.sidebar_rows()
             .into_iter()
             .filter_map(|row| match row {
-                Row::Agent(id) | Row::Recent(id) => Some(id),
+                Row::Agent(id) | Row::Recent(id) | Row::Match(id) => Some(id),
                 _ => None,
             })
             // An agent in the recent block also has a row under its repo. Numbering it once — at its
@@ -2532,8 +2650,10 @@ impl App {
 
     /// Whether the numeric overlay should be drawn: Cmd/Super is held, or the `Ctrl+B` prefix is
     /// armed (so the labels are visible while you decide which agent to jump to with a digit).
+    /// Not while searching: the prompt takes the keys, so the digits would promise shortcuts that
+    /// can't be pressed.
     fn numeric_overlay_active(&self) -> bool {
-        self.super_held || self.prefix
+        (self.super_held || self.prefix) && self.input != InputMode::Searching
     }
 
     /// The agent the numeric overlay labels with digit `c`, if any. Read from the *current* sidebar
@@ -2642,7 +2762,7 @@ impl App {
         let rows = self.sidebar_rows();
         // The recent block counts: it is where a cross-repo unread agent is easiest to reach.
         let agent_of = |r: &Row| match r {
-            Row::Agent(id) | Row::Recent(id) => Some(*id),
+            Row::Agent(id) | Row::Recent(id) | Row::Match(id) => Some(*id),
             _ => None,
         };
         let here = self.sidebar_sel.as_ref().and_then(agent_of);
@@ -3826,6 +3946,11 @@ fn render_sidebar(frame: &mut Frame, area: Rect, app: &App) {
     for row in rows {
         let selected = app.sidebar_sel == Some(row);
         let marker = if selected { "\u{25b8}" } else { " " };
+        // On the rail a match draws as a plain agent row: `repo/name` plus an age can't fit there.
+        let row = match row {
+            Row::Match(id) if minimized => Row::Agent(id),
+            row => row,
+        };
         match row {
             Row::Repo(id) => {
                 let name = repo_names.get(&id).copied().unwrap_or("repo");
@@ -3882,7 +4007,9 @@ fn render_sidebar(frame: &mut Frame, area: Rect, app: &App) {
                 ),
                 Style::default().fg(Color::DarkGray),
             ))),
-            Row::Recent(id) => {
+            // A search match draws like a recent row: both lists span repos, so both need the
+            // qualified name.
+            Row::Recent(id) | Row::Match(id) => {
                 let Some(agent) = by_id.get(&id) else {
                     lines.push(Line::default());
                     continue;
@@ -3934,6 +4061,10 @@ fn render_sidebar(frame: &mut Frame, area: Rect, app: &App) {
             ))),
             Row::NoRepos => lines.push(Line::from(Span::styled(
                 " no repos yet…",
+                Style::default().fg(Color::DarkGray),
+            ))),
+            Row::NoMatches => lines.push(Line::from(Span::styled(
+                " no matches",
                 Style::default().fg(Color::DarkGray),
             ))),
             Row::Agent(id) => {
@@ -4233,6 +4364,14 @@ fn render_status(frame: &mut Frame, area: Rect, app: &App) {
             format!(
                 " new HEAD session \u{2014} dir: {}\u{2588}  (enter create \u{b7} esc cancel)",
                 app.dir_buf,
+            ),
+            Style::default().fg(Color::Black).bg(app.theme.focus),
+        )
+    } else if app.input == InputMode::Searching {
+        (
+            format!(
+                " / {}\u{2588}  (\u{2191}\u{2193} ^j/^k move \u{b7} enter open \u{b7} esc cancel)",
+                app.search_buf,
             ),
             Style::default().fg(Color::Black).bg(app.theme.focus),
         )
@@ -8367,5 +8506,211 @@ mod tests {
             on.matches('1').count() > off.matches('1').count(),
             "the shortcut digit renders in the overlay"
         );
+    }
+
+    /// Two repos whose agents have distinct names, for `/` search: `r` holds `fix-blank` and
+    /// `mini-row`, `z` holds `search` and `fix-mouse`. The cursor sits on the first grouped row.
+    fn app_for_search() -> (App, HashMap<&'static str, AgentId>) {
+        let (mut app, _) = app_with_two_repos(2, 2);
+        let names = ["fix-blank", "mini-row", "search", "fix-mouse"];
+        let mut ids = HashMap::new();
+        for (agent, name) in app.agents.iter_mut().zip(names) {
+            agent.name = name.into();
+            ids.insert(name, agent.id);
+        }
+        app.focus = Focus::Sidebar;
+        app.place_sidebar_sel(Row::Agent(ids["mini-row"]));
+        (app, ids)
+    }
+
+    async fn type_keys(app: &mut App, sink: &mut Sink, keys: &[KeyEvent]) {
+        for k in keys {
+            app.on_key(*k, sink).await.unwrap();
+        }
+    }
+
+    fn typed(s: &str) -> Vec<KeyEvent> {
+        s.chars().map(|c| key(KeyCode::Char(c))).collect()
+    }
+
+    /// `/` narrows the sidebar to the agents whose `repo/name` fuzzy-matches, best first, with the
+    /// cursor on the best — and nothing else (no recent block, no repo headers).
+    #[tokio::test]
+    async fn slash_filters_the_sidebar_to_fuzzy_matches() {
+        let (mut app, ids) = app_for_search();
+        let (mut sink, _server) = test_sink();
+        type_keys(&mut app, &mut sink, &typed("/fix")).await;
+        assert_eq!(app.input, InputMode::Searching);
+        let rows = app.sidebar_rows();
+        assert_eq!(rows.len(), 2, "only the two fix-* agents, got {rows:?}");
+        assert!(rows.contains(&Row::Match(ids["fix-blank"])));
+        assert!(rows.contains(&Row::Match(ids["fix-mouse"])));
+        assert_eq!(
+            app.sidebar_sel,
+            Some(rows[0]),
+            "the cursor is on the best match"
+        );
+
+        // Qualifying by repo picks one; a query matching nothing leaves a single placeholder row.
+        type_keys(&mut app, &mut sink, &[key(KeyCode::Backspace); 3]).await;
+        type_keys(&mut app, &mut sink, &typed("z/fm")).await;
+        assert_eq!(app.sidebar_rows(), vec![Row::Match(ids["fix-mouse"])]);
+        type_keys(&mut app, &mut sink, &typed("qqq")).await;
+        assert_eq!(app.sidebar_rows(), vec![Row::NoMatches]);
+        assert_eq!(app.selected_agent(), None);
+    }
+
+    /// An empty query lists every agent; `↓`/`↑` and `Ctrl+j`/`Ctrl+k` walk the list (the letters
+    /// themselves go into the query).
+    #[tokio::test]
+    async fn search_moves_with_arrows_and_ctrl_jk() {
+        let (mut app, _ids) = app_for_search();
+        let (mut sink, _server) = test_sink();
+        type_keys(&mut app, &mut sink, &typed("/")).await;
+        let rows = app.sidebar_rows();
+        assert_eq!(rows.len(), 4, "empty query: every agent, got {rows:?}");
+        assert_eq!(app.sidebar_sel, Some(rows[0]));
+        type_keys(&mut app, &mut sink, &[ctrl('j'), key(KeyCode::Down)]).await;
+        assert_eq!(app.sidebar_sel, Some(rows[2]));
+        type_keys(&mut app, &mut sink, &[ctrl('k')]).await;
+        assert_eq!(app.sidebar_sel, Some(rows[1]));
+        type_keys(&mut app, &mut sink, &[key(KeyCode::Up)]).await;
+        assert_eq!(app.sidebar_sel, Some(rows[0]));
+        type_keys(&mut app, &mut sink, &typed("jk")).await;
+        assert_eq!(app.search_buf, "jk", "plain j/k are query text");
+    }
+
+    /// `Enter` opens the match and leaves the cursor on its grouped row; `Esc` puts everything back.
+    #[tokio::test]
+    async fn search_enter_opens_and_esc_restores() {
+        let (mut app, ids) = app_for_search();
+        let (mut sink, _server) = test_sink();
+        type_keys(&mut app, &mut sink, &typed("/srch")).await;
+        type_keys(&mut app, &mut sink, &[key(KeyCode::Enter)]).await;
+        assert_eq!(app.input, InputMode::Normal);
+        assert_eq!(app.active_agent, Some(ids["search"]));
+        assert_eq!(app.sidebar_sel, Some(Row::Agent(ids["search"])));
+        assert!(app.search_buf.is_empty());
+
+        let (mut app, ids) = app_for_search();
+        let before = app.sidebar_rows();
+        type_keys(&mut app, &mut sink, &typed("/fix")).await;
+        type_keys(&mut app, &mut sink, &[key(KeyCode::Esc)]).await;
+        assert_eq!(app.input, InputMode::Normal);
+        assert_eq!(app.active_agent, None, "Esc opens nothing");
+        assert_eq!(app.sidebar_rows(), before);
+        assert_eq!(app.sidebar_sel, Some(Row::Agent(ids["mini-row"])));
+
+        // Enter with nothing matched is a cancel, not an error.
+        let (mut app, ids) = app_for_search();
+        type_keys(&mut app, &mut sink, &typed("/qqq")).await;
+        type_keys(&mut app, &mut sink, &[key(KeyCode::Enter)]).await;
+        assert_eq!(app.input, InputMode::Normal);
+        assert_eq!(app.active_agent, None);
+        assert_eq!(app.sidebar_sel, Some(Row::Agent(ids["mini-row"])));
+    }
+
+    /// What the user sees while searching: qualified names in the sidebar, the query in the footer.
+    #[tokio::test]
+    async fn search_renders_matches_and_the_query() {
+        use ratatui::{backend::TestBackend, Terminal};
+        let (mut app, _ids) = app_for_search();
+        let (mut sink, _server) = test_sink();
+        type_keys(&mut app, &mut sink, &typed("/fix")).await;
+        let text = |term: &Terminal<TestBackend>| -> String {
+            term.backend()
+                .buffer()
+                .content()
+                .iter()
+                .map(|c| c.symbol())
+                .collect()
+        };
+        let mut term = Terminal::new(TestBackend::new(SIDEBAR_W_FULL, 12)).unwrap();
+        term.draw(|f| render_sidebar(f, f.area(), &app)).unwrap();
+        let sidebar = text(&term);
+        assert!(
+            sidebar.contains("r/fix-blank") && sidebar.contains("z/fix-mouse"),
+            "matches name their repo, got: {sidebar}"
+        );
+        assert!(
+            !sidebar.contains("mini-row") && !sidebar.contains("recent"),
+            "non-matches and the recent block are hidden, got: {sidebar}"
+        );
+        let mut term = Terminal::new(TestBackend::new(90, 1)).unwrap();
+        term.draw(|f| render_status(f, f.area(), &app)).unwrap();
+        let status = text(&term);
+        assert!(
+            status.contains("/ fix"),
+            "the footer shows the query, got: {status}"
+        );
+
+        type_keys(&mut app, &mut sink, &typed("qqq")).await;
+        let mut term = Terminal::new(TestBackend::new(SIDEBAR_W_FULL, 12)).unwrap();
+        term.draw(|f| render_sidebar(f, f.area(), &app)).unwrap();
+        let sidebar = text(&term);
+        assert!(sidebar.contains("no matches"), "got: {sidebar}");
+    }
+
+    /// Regression: on the narrow rail a match used the full-width `repo/name  age` layout, which
+    /// left about one cell for the name — every match read ` r`. It must show the agent's name.
+    #[tokio::test]
+    async fn search_on_the_rail_shows_agent_names() {
+        use ratatui::{backend::TestBackend, Terminal};
+        let (mut app, _ids) = app_for_search();
+        let (mut sink, _server) = test_sink();
+        type_keys(&mut app, &mut sink, &typed("/blank")).await;
+        let mut term = Terminal::new(TestBackend::new(SIDEBAR_W_MIN, 8)).unwrap();
+        term.draw(|f| render_sidebar(f, f.area(), &app)).unwrap();
+        let content: String = term
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|c| c.symbol())
+            .collect();
+        assert!(content.contains("fix-b"), "got: {content}");
+    }
+
+    /// Regression: holding Cmd mid-search drew shortcut digits that the search prompt then ignored.
+    #[tokio::test]
+    async fn no_digit_overlay_while_searching() {
+        let (mut app, _ids) = app_for_search();
+        let (mut sink, _server) = test_sink();
+        type_keys(&mut app, &mut sink, &typed("/fix")).await;
+        app.super_held = true;
+        assert!(!app.numeric_overlay_active());
+    }
+
+    /// Regression: a delete confirmation arriving mid-search swapped the prompt out from under the
+    /// search, stranding the cursor on a `Match` row that normal mode doesn't have.
+    #[tokio::test]
+    async fn a_delete_confirm_mid_search_ends_the_search() {
+        let (mut app, ids) = app_for_search();
+        let (mut sink, _server) = test_sink();
+        type_keys(&mut app, &mut sink, &typed("/fix")).await;
+        app.on_daemon(
+            DaemonMsg::DeleteNeedsConfirm {
+                id: ids["search"],
+                message: "dirty".into(),
+            },
+            &mut sink,
+        )
+        .await
+        .unwrap();
+        assert_eq!(app.input, InputMode::Confirming);
+        assert!(app.search_buf.is_empty());
+        assert_eq!(app.sidebar_sel, Some(Row::Agent(ids["mini-row"])));
+    }
+
+    /// Regression: `/` then `Esc` before the roster arrived marked the cursor as user-placed, so it
+    /// stopped homing to the newest recent agent at startup.
+    #[tokio::test]
+    async fn cancelling_a_search_keeps_the_cursor_unplaced() {
+        let (mut app, _ids) = app_for_search();
+        let (mut sink, _server) = test_sink();
+        app.sidebar_placed = false;
+        type_keys(&mut app, &mut sink, &typed("/x")).await;
+        type_keys(&mut app, &mut sink, &[key(KeyCode::Esc)]).await;
+        assert!(!app.sidebar_placed);
     }
 }

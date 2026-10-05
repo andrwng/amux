@@ -123,6 +123,7 @@ Everywhere: `Ctrl+Q` quit · `Ctrl+h/j/k/l` move focus · `Ctrl+B` command prefi
 | `g`/`G` | first/last row |
 | `Enter` or `l` | open the agent in the main area |
 | `m` | open the agent as a mini |
+| `/` | fuzzy-find an agent by `repo/name` (arrows or `Ctrl+j`/`Ctrl+k` move, `Enter` opens, `Esc` cancels) |
 | `n` | new agent in the selected repo (prompts for a branch, and an optional task to start it on) |
 | `N` | new agent in a repo by path (prompts for directory + branch; `Tab` switches fields) |
 | `h` | new HEAD session in the selected repo (no worktree, no branch) |

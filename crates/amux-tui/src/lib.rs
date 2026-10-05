@@ -5,6 +5,7 @@
 mod app;
 mod client;
 mod doctor;
+mod fuzzy;
 mod input;
 mod pane;
 mod record;
