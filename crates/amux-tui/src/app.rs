@@ -61,9 +61,9 @@ const RECENT_MIN: usize = 5;
 /// …and anything opened inside this window is recent, so a busy day is represented rather than cut
 /// off at the floor.
 const RECENT_WINDOW: chrono::Duration = chrono::Duration::hours(24);
-/// …but never more than this, whatever the window says. A shortcut you have to scan is not a
-/// shortcut, and ten is also where the numeric shortcuts run out (`1`..`9`, `0`).
-const RECENT_MAX: usize = 10;
+/// …but never more than this, whatever the window says. The numeric shortcuts run out at ten
+/// (`1`..`9`, `0`); rows past that are reached with the cursor like any other.
+const RECENT_MAX: usize = 20;
 /// Rows of repo-grouped roster the block must leave visible: a repo header plus a few agents.
 const ROSTER_MIN_ROWS: usize = 5;
 
@@ -6541,10 +6541,25 @@ mod tests {
             (&[1, 2, 3, 4, 5, 90], RECENT_MIN),
             // The window boundary is exclusive of older-than-24h.
             (&[1, 23, 25, 30, 40, 50, 60], RECENT_MIN),
-            // The ceiling caps a busy day: fourteen inside the window, ten listed.
-            (&[1, 1, 2, 2, 3, 3, 4, 4, 5, 5, 6, 6, 7, 7], RECENT_MAX),
-            (&[1, 2, 3, 4, 5, 6, 7, 8, 9, 10], RECENT_MAX),
-            (&[1, 2, 3, 4, 5, 6, 7, 8, 9], 9),
+            // The ceiling caps a busy day: twenty-two inside the window, twenty listed.
+            (
+                &[
+                    1, 1, 2, 2, 3, 3, 4, 4, 5, 5, 6, 6, 7, 7, 8, 8, 9, 9, 10, 10, 11, 11,
+                ],
+                RECENT_MAX,
+            ),
+            (
+                &[
+                    1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20,
+                ],
+                RECENT_MAX,
+            ),
+            (
+                &[
+                    1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19,
+                ],
+                19,
+            ),
             (&[] as &[i64], 0),
         ];
         for (ages, want) in cases {
@@ -7725,8 +7740,8 @@ mod tests {
             (2, 8, 5, 12, false, true),
             // A bigger block needs a taller sidebar for the same roster allowance. `recent` never
             // exceeds RECENT_MAX, so a full block is the tallest this gets.
-            (2, 30, RECENT_MAX, 16, false, false),
-            (2, 30, RECENT_MAX, 17, false, true),
+            (2, 30, RECENT_MAX, RECENT_MAX + 6, false, false),
+            (2, 30, RECENT_MAX, RECENT_MAX + 7, false, true),
             (2, 8, 5, 20, true, false), // the rail
         ];
         for (repos, agents, recent, height, minimized, want) in cases {

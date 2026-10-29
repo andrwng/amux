@@ -96,7 +96,7 @@ Two deliberate exceptions:
 - With more than one repo in play, a **recent** group tops the sidebar — styled like a repo of that
   name — holding the agents you last opened, named `repo/branch`, with the first numeric shortcuts.
   An agent is recent if it is one of the last five you opened or you opened it in the past 24 hours,
-  up to ten agents.
+  up to twenty agents.
   Rows behave like any other agent row (`Enter` opens, `d` deletes, `Ctrl+j`/`Ctrl+k` reach them);
   each agent still appears under its own repo below. The group is hidden when it would hold every
   agent you have (it would just be the list twice) or when the sidebar is too short to show both.
