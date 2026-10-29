@@ -2074,11 +2074,12 @@ impl App {
         Ok(())
     }
 
-    /// The selected text, read from the pane's visible screen (reading order, trailing space
-    /// trimmed, newline between rows). `None` if there's no selection.
+    /// The selected text, read from what the pane shows — the served history window while it is
+    /// scrolled back, else the live screen (reading order, trailing space trimmed, newline between
+    /// rows). `None` if there's no selection.
     fn selection_text(&self) -> Option<String> {
         let sel = self.selection?;
-        let screen = self.parsers.get(&sel.terminal)?.screen();
+        let screen = self.screen_for(sel.terminal)?;
         // A split pane shows the grid's bottom rows (see `render_screen`), so a visible frame row
         // maps to a grid row `row_off` lower. Zero for the full-size main pane, so this is a no-op
         // there and reads the exact visible text in a cropped split.
@@ -2167,7 +2168,8 @@ impl App {
         col: u16,
         row: u16,
     ) -> Option<Selection> {
-        let screen = self.parsers.get(&terminal)?.screen();
+        // What's shown: the served history window while scrolled back, else the live screen.
+        let screen = self.screen_for(terminal)?;
         // Work in grid rows: a split pane shows the grid's bottom rows (see `render_screen`), so the
         // clicked frame row maps `row_off` lower in the grid, and only rows within the visible window
         // `[row_off, row_off + inner.height)` are selectable.
@@ -5294,6 +5296,38 @@ mod tests {
             active: true,
         });
         assert_eq!(app.selection_text().unwrap(), "alpha\nbravo");
+    }
+
+    /// Regression: while a pane is scrolled back it *shows* the served history window, but copy read
+    /// the live screen — you highlighted history and pasted whatever live output sat in those cells.
+    /// Both a drag selection and a double-click token must read the window on screen.
+    #[test]
+    fn selection_while_scrolled_back_copies_the_history_shown() {
+        let mut app = App::new(100, 40);
+        let t = TerminalId::new();
+        app.tree.open(t);
+        let mut live = new_client_parser(4, 30, CLIENT_SCROLLBACK);
+        live.process(b"live one\r\nlive two");
+        app.parsers.insert(t, live);
+        app.attached.insert(t, Size { cols: 30, rows: 4 });
+        app.on_scroll_view(t, 10, 50, b"\x1b[H\x1b[Jold alpha\r\nold /tmp/x.rs");
+        assert!(app.scroll.is_some(), "precondition: scrolled back");
+
+        let inner = Rect::new(1, 1, 30, 4);
+        app.selection = Some(Selection {
+            terminal: t,
+            inner,
+            anchor: (1, 1),
+            head: (1 + 12, 2),
+            active: true,
+        });
+        assert_eq!(app.selection_text().unwrap(), "old alpha\nold /tmp/x.rs");
+
+        let sel = app
+            .token_selection(t, inner, 1 + 6, 2) // inside `/tmp/x.rs`
+            .expect("a token in the history window");
+        app.selection = Some(sel);
+        assert_eq!(app.selection_text().unwrap(), "/tmp/x.rs");
     }
 
     #[test]
