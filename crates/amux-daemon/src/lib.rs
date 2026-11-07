@@ -76,7 +76,14 @@ pub fn run_blocking(repo: PathBuf) -> Result<()> {
         Ok(c) if !c.trim().is_empty() => c.split_whitespace().map(String::from).collect(),
         _ => vec!["claude".to_string()],
     };
-    let adapter = Box::new(ClaudeAdapter::with_command(command));
+    let mut adapter = ClaudeAdapter::with_command(command);
+    // Check resumes against Claude's transcript store, so a conversation Claude has since deleted
+    // starts fresh instead of failing. Without a home to find it in, trust the stored id.
+    match amux_core::adapter::claude_projects_dir() {
+        Ok(dir) => adapter = adapter.with_transcripts(dir),
+        Err(e) => tracing::warn!("claude transcript store unknown, not checking resumes: {e:#}"),
+    }
+    let adapter = Box::new(adapter);
     // The bridge Claude's hooks invoke (absolute path — hooks run with cwd = the worktree).
     let amux_exe = std::env::current_exe().context("locate the amux executable")?;
 

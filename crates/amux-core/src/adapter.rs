@@ -75,20 +75,56 @@ pub trait AgentAdapter: Send + Sync {
 /// on `PATH`) can substitute `$SHELL`/`cat`.
 pub struct ClaudeAdapter {
     pub command: Vec<String>,
+    /// Claude's transcript store (`<config>/projects`), checked before a `--resume`. `None` skips
+    /// the check and trusts the id, as tests and substituted commands want.
+    pub transcripts: Option<PathBuf>,
 }
 
 impl Default for ClaudeAdapter {
     fn default() -> Self {
-        Self {
-            command: vec!["claude".to_string()],
-        }
+        Self::with_command(vec!["claude".to_string()])
     }
 }
 
 impl ClaudeAdapter {
     pub fn with_command(command: Vec<String>) -> Self {
-        Self { command }
+        Self {
+            command,
+            transcripts: None,
+        }
     }
+
+    /// Check resumes against the transcripts under `dir` (see [`claude_projects_dir`]).
+    pub fn with_transcripts(mut self, dir: PathBuf) -> Self {
+        self.transcripts = Some(dir);
+        self
+    }
+
+    /// Whether Claude still holds the transcript for session `id`. Claude files it under a
+    /// directory named for the realpath of the cwd, so search every project for `<id>.jsonl`
+    /// rather than reproduce that encoding; session ids are UUIDs, so a match is the one.
+    fn transcript_exists(&self, id: &str) -> bool {
+        let Some(dir) = &self.transcripts else {
+            return true;
+        };
+        let file = format!("{id}.jsonl");
+        // An unreadable store is not proof the transcript is gone: let `--resume` decide.
+        let Ok(projects) = std::fs::read_dir(dir) else {
+            return true;
+        };
+        projects
+            .flatten()
+            .any(|project| project.path().join(&file).is_file())
+    }
+}
+
+/// Claude Code's transcript store: `$CLAUDE_CONFIG_DIR/projects`, else `~/.claude/projects`.
+pub fn claude_projects_dir() -> Result<PathBuf> {
+    let config = match std::env::var_os("CLAUDE_CONFIG_DIR") {
+        Some(dir) if !dir.is_empty() => PathBuf::from(dir),
+        _ => crate::paths::home()?.join(".claude"),
+    };
+    Ok(config.join("projects"))
 }
 
 impl AgentAdapter for ClaudeAdapter {
@@ -107,8 +143,11 @@ impl AgentAdapter for ClaudeAdapter {
         let mut command = self.command.clone();
         let is_claude =
             self.kind() == "claude-code" && command.first().map(String::as_str) == Some("claude");
-        // `claude --resume <id>` when resuming a known session.
-        if let Some(id) = ctx.resume {
+        // `claude --resume <id>` when resuming a known session — unless Claude has since deleted
+        // its transcript (`cleanupPeriodDays`), when `--resume` would only print "No conversation
+        // found" and exit. Then start fresh; the new session's id reaches us on its first hook.
+        let resume = ctx.resume.filter(|id| self.transcript_exists(id));
+        if let Some(id) = resume {
             if is_claude {
                 command.push("--resume".to_string());
                 command.push(id.to_string());
@@ -124,7 +163,8 @@ impl AgentAdapter for ClaudeAdapter {
         // The task to start on — `claude [flags] <prompt>` (interactive; `-p` would make it
         // one-shot). Last, after every flag, since a value-taking flag like `--settings` would
         // otherwise swallow it. Never alongside `--resume`: that conversation already contains the
-        // task, so re-sending would inject it as a fresh turn.
+        // task, so re-sending would inject it as a fresh turn. Keyed on the *requested* resume, not
+        // the checked one: an agent whose transcript expired did that task long ago.
         if let (Some(task), None) = (ctx.prompt, ctx.resume) {
             if is_claude {
                 command.push(task.to_string());
@@ -353,6 +393,42 @@ mod tests {
     #[test]
     fn resume_appends_the_flag() {
         let adapter = ClaudeAdapter::default();
+        let spec = adapter.spawn_spec(&ctx(Path::new("/tmp/wt/x"), "x", Some("sess-123")));
+        assert_eq!(
+            spec.command,
+            vec![
+                "claude".to_string(),
+                "--resume".to_string(),
+                "sess-123".to_string()
+            ]
+        );
+    }
+
+    /// Regression: Claude deletes a transcript after `cleanupPeriodDays`, but amux kept the id, so
+    /// every resume ran `claude --resume <dead-id>` — "No conversation found", exit, a blank pane,
+    /// forever. A missing transcript must launch a fresh, idle `claude` instead, and still never
+    /// replay the original task (that work is long done).
+    #[test]
+    fn resume_of_a_deleted_transcript_starts_fresh_without_the_task() {
+        let projects = tempfile::tempdir().unwrap();
+        let adapter = ClaudeAdapter::default().with_transcripts(projects.path().to_path_buf());
+        let spec = adapter.spawn_spec(&ctx_with_prompt(
+            Path::new("/tmp/wt/x"),
+            Some("sess-gone"),
+            "fix the flaky test",
+        ));
+        assert_eq!(spec.command, vec!["claude".to_string()]);
+    }
+
+    /// A live transcript still resumes, wherever Claude filed it: it keys the project dir on the
+    /// realpath cwd (a symlinked worktree lands elsewhere), so the lookup is by id across projects.
+    #[test]
+    fn resume_of_a_live_transcript_in_any_project_dir_keeps_the_flag() {
+        let projects = tempfile::tempdir().unwrap();
+        let dir = projects.path().join("-data-xfs2--amux-worktrees-repo-x");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("sess-123.jsonl"), "{}\n").unwrap();
+        let adapter = ClaudeAdapter::default().with_transcripts(projects.path().to_path_buf());
         let spec = adapter.spawn_spec(&ctx(Path::new("/tmp/wt/x"), "x", Some("sess-123")));
         assert_eq!(
             spec.command,
