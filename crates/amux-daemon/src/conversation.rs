@@ -103,7 +103,9 @@ impl ConversationLog {
             Err(e) => return Err(e).with_context(|| format!("open {}", path.display())),
         };
         let mut reader = BufReader::new(file);
-        let mut line = String::new();
+        // Bytes, decoded per line: a crash can tear the last line inside a multi-byte character,
+        // and that must cost the line, not the log.
+        let mut line = Vec::new();
         let mut whole_bytes: u64 = 0;
         let mut first_seq = None;
         let mut last = None;
@@ -111,16 +113,16 @@ impl ConversationLog {
         loop {
             line.clear();
             let n = reader
-                .read_line(&mut line)
+                .read_until(b'\n', &mut line)
                 .with_context(|| format!("read {}", path.display()))?;
             if n == 0 {
                 break;
             }
-            if !line.ends_with('\n') {
+            if !line.ends_with(b"\n") {
                 break; // torn: the append never finished
             }
             whole_bytes += n as u64;
-            if let Ok(entry) = serde_json::from_str::<Entry>(&line) {
+            if let Ok(entry) = serde_json::from_slice::<Entry>(&line) {
                 first_seq.get_or_insert(entry.seq);
                 last = Some(head(&entry));
                 entries += 1;
@@ -277,7 +279,8 @@ fn open_private(path: &Path, options: &mut OpenOptions) -> Result<File> {
         .with_context(|| format!("open {}", path.display()))
 }
 
-/// Every whole, decodable entry in the file at `path`. A torn or damaged line is skipped.
+/// Every whole, decodable entry in the file at `path`. A torn or damaged line — one that is not
+/// UTF-8 included — is skipped.
 fn read_entries(path: &Path) -> Result<Vec<Entry>> {
     let file = match File::open(path) {
         Ok(f) => f,
@@ -285,9 +288,9 @@ fn read_entries(path: &Path) -> Result<Vec<Entry>> {
         Err(e) => return Err(e).with_context(|| format!("open {}", path.display())),
     };
     let mut out = Vec::new();
-    for line in BufReader::new(file).lines() {
+    for line in BufReader::new(file).split(b'\n') {
         let line = line.with_context(|| format!("read {}", path.display()))?;
-        if let Ok(entry) = serde_json::from_str::<Entry>(&line) {
+        if let Ok(entry) = serde_json::from_slice::<Entry>(&line) {
             out.push(entry);
         }
     }
@@ -433,6 +436,40 @@ mod tests {
         );
         let all = log.read_after(agent, 0, 200, usize::MAX).unwrap();
         assert_eq!(seqs(&all), [1, 2], "the new entry is a line of its own");
+    }
+
+    /// A crash mid-append can tear the last line inside a multi-byte character, leaving bytes that
+    /// are not UTF-8. The log stays readable: the torn line is cut, the next entry is numbered
+    /// after the last good one and reads back, and a damaged line in the middle is skipped.
+    #[test]
+    fn a_line_torn_inside_a_multi_byte_character_is_cut_and_the_log_goes_on() {
+        let tmp = tempfile::tempdir().unwrap();
+        let agent = AgentId::new();
+        let path = {
+            let mut log = ConversationLog::open(tmp.path()).unwrap();
+            log.append(agent, turn(Speaker::User, "q"), at(0)).unwrap();
+            log.path(agent)
+        };
+        let mut f = OpenOptions::new().append(true).open(&path).unwrap();
+        // A whole line that is not UTF-8, then a line torn after two bytes of a four-byte 🦀.
+        f.write_all(b"{\"seq\":2,\"text\":\"\xff\xfe\"}\n").unwrap();
+        f.write_all(b"{\"seq\":3,\"by\":\"agent\",\"text\":\"crab \xf0\x9f")
+            .unwrap();
+        drop(f);
+        let mut log = ConversationLog::open(tmp.path()).unwrap();
+        log.load(agent).expect("the log loads");
+        assert_eq!(log.summary(agent).unwrap().last.seq, 1);
+        assert_eq!(
+            log.append(agent, turn(Speaker::Agent, "🦀 after"), at(1))
+                .unwrap(),
+            2,
+            "numbered after the last good entry"
+        );
+        let all = log.read_after(agent, 0, 200, usize::MAX).expect("readable");
+        assert_eq!(seqs(&all), [1, 2]);
+        assert_eq!(all[1].text, "🦀 after");
+        let bytes = std::fs::read(&path).unwrap();
+        assert!(bytes.ends_with(b"\n"), "the file ends on a whole line");
     }
 
     #[test]
