@@ -19,6 +19,7 @@ tui-term = { workspace = true }
 vt100 = { workspace = true }
 tracing = { workspace = true }
 directories = { workspace = true }
+thiserror = { workspace = true }
 
 [dev-dependencies]
 amux-daemon = { workspace = true }

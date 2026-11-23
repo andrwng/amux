@@ -594,6 +594,15 @@ by hand outside amux are simply not recorded.
   orphaned the previous daemon, which then kept its PTYs and agent processes alive and unreachable
   forever. Eviction sanity-checks that the pid is an amux process first, because ungraceful
   teardown (an SSH drop, a reboot) leaves stale pidfiles and pids get reused.
+- **Commands connect without arbitrating.** The terminal client's connect path spawns a daemon
+  when none answers or the versions differ, and that new daemon evicts the old one with its
+  agents — right for the client you opened to work in, wrong for a command asking a question. So
+  commands (`amux worktree …`) use `connect_to_running_daemon`, which only attempts the
+  handshake: it never spawns, never unlinks the socket, and returns a typed reason decided from
+  what answered — `NoDaemon` when nothing accepts, `VersionDiffers` for a `Hello` of another
+  version, an unexpected frame (an older daemon rejects our `Hello` with an `Error`) or one that
+  does not decode (the same classification as the daemon's `Probe`). A daemon that is there and
+  silent is neither. It needs no git repository.
 - **Deliberate shutdown is graceful**: `shutdown_all` sends every agent `SIGTERM`, waits out a
   shared 2s grace concurrently, then `SIGKILL`s the holdouts — so an agent can checkpoint on an
   upgrade instead of being shot mid-write. Ungraceful teardown skips this by definition, which is

@@ -13,6 +13,8 @@ mod theme;
 
 use anyhow::Result;
 
+pub use client::{connect_to_running_daemon, ConnectError};
+
 /// Entry point for the `amux` TUI client: discover the repo, connect to (or auto-spawn) its
 /// daemon, and drive the sidebar until you quit.
 pub fn run(profile: Option<amux_core::config::Profile>) -> Result<()> {
