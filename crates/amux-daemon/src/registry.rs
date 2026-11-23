@@ -20,10 +20,12 @@ use amux_core::adapter::{AgentAdapter, HookSetup, LaunchContext};
 use amux_core::agent::{
     is_notable_transition, next_state, AgentEvent, AgentId, AgentState, RepoId, TerminalId,
 };
-use amux_core::hook::{classify, HookReport};
+use amux_core::clock::{Clock, SystemClock};
+use amux_core::hook::{classify, HookReport, TurnReport};
 use amux_core::worktree::{WorktreeLocation, WorktreeService};
 use amux_proto::{AgentInfo, DaemonMsg, RepoInfo, Size};
 
+use crate::conversation::{ConversationLog, Entry, Summary};
 use crate::pty::Session;
 
 const EVENT_BACKLOG: usize = 256;
@@ -215,8 +217,46 @@ struct HookIntegration {
     amux_exe: PathBuf,
 }
 
+/// How a [`Registry`] is built. `Default` is what tests want: no hooks, no persistence, no
+/// conversation log, the real clock.
+pub struct RegistryOptions {
+    /// The hook mailbox socket and the `amux` executable its hooks invoke; `None` disables hooks.
+    pub hooks: Option<(PathBuf, PathBuf)>,
+    /// PTY-silence window after which the heartbeat settles a `Working` agent to `Idle`.
+    pub idle_timeout: Duration,
+    /// Where durable state is written; `None` disables persistence.
+    pub state_path: Option<PathBuf>,
+    /// The directory of per-worktree conversation logs; `None` records no conversation.
+    pub conversation_dir: Option<PathBuf>,
+    /// The clock conversation entries are stamped with.
+    pub clock: Arc<dyn Clock>,
+}
+
+impl Default for RegistryOptions {
+    fn default() -> Self {
+        Self {
+            hooks: None,
+            idle_timeout: DEFAULT_IDLE_TIMEOUT,
+            state_path: None,
+            conversation_dir: None,
+            clock: Arc::new(SystemClock),
+        }
+    }
+}
+
+/// A page of a worktree's conversation, answering [`Registry::turns`].
+pub struct TurnsPage {
+    /// Where the log starts and its newest entry; `None` when nothing has been recorded.
+    pub summary: Option<Summary>,
+    pub turns: Vec<Entry>,
+}
+
 pub struct Registry {
     state: Mutex<State>,
+    /// Each worktree's conversation log. Its own lock, never taken while `state` is held, so a
+    /// slow disk on a turn never stalls the state machine. `None` when recording is off.
+    conversation: Option<Mutex<ConversationLog>>,
+    clock: Arc<dyn Clock>,
     adapter: Box<dyn AgentAdapter>,
     events: broadcast::Sender<DaemonMsg>,
     hooks: Option<HookIntegration>,
@@ -229,50 +269,57 @@ pub struct Registry {
 
 impl Registry {
     pub fn new(adapter: Box<dyn AgentAdapter>) -> Arc<Self> {
-        Self::build(adapter, None, DEFAULT_IDLE_TIMEOUT, None)
-    }
-
-    /// Build a registry that wires launched agents' hooks to `socket`, invoking `amux_exe hook`,
-    /// and persists durable state to `state_path`.
-    pub fn with_hooks(
-        adapter: Box<dyn AgentAdapter>,
-        socket: PathBuf,
-        amux_exe: PathBuf,
-        state_path: PathBuf,
-    ) -> Arc<Self> {
-        Self::build(
-            adapter,
-            Some(HookIntegration { socket, amux_exe }),
-            DEFAULT_IDLE_TIMEOUT,
-            Some(state_path),
-        )
+        Self::with_options(adapter, RegistryOptions::default())
     }
 
     /// Build a registry with a custom heartbeat idle timeout — used by tests to exercise the
     /// backstop on a human timescale.
     pub fn with_idle_timeout(adapter: Box<dyn AgentAdapter>, idle_timeout: Duration) -> Arc<Self> {
-        Self::build(adapter, None, idle_timeout, None)
+        Self::with_options(
+            adapter,
+            RegistryOptions {
+                idle_timeout,
+                ..RegistryOptions::default()
+            },
+        )
     }
 
     /// Build a registry that persists durable state to `state_path` (for persistence tests).
     pub fn with_state(adapter: Box<dyn AgentAdapter>, state_path: PathBuf) -> Arc<Self> {
-        Self::build(adapter, None, DEFAULT_IDLE_TIMEOUT, Some(state_path))
+        Self::with_options(
+            adapter,
+            RegistryOptions {
+                state_path: Some(state_path),
+                ..RegistryOptions::default()
+            },
+        )
     }
 
-    fn build(
-        adapter: Box<dyn AgentAdapter>,
-        hooks: Option<HookIntegration>,
-        idle_timeout: Duration,
-        state_path: Option<PathBuf>,
-    ) -> Arc<Self> {
+    /// Build a registry from `options`. A conversation directory that cannot be created leaves
+    /// recording off (logged), rather than keeping the daemon from starting.
+    pub fn with_options(adapter: Box<dyn AgentAdapter>, options: RegistryOptions) -> Arc<Self> {
         let (events, _) = broadcast::channel(EVENT_BACKLOG);
+        let conversation =
+            options
+                .conversation_dir
+                .and_then(|dir| match ConversationLog::open(&dir) {
+                    Ok(log) => Some(Mutex::new(log)),
+                    Err(e) => {
+                        tracing::warn!("not recording conversations: {e:#}");
+                        None
+                    }
+                });
         Arc::new(Self {
             state: Mutex::new(State::default()),
+            conversation,
+            clock: options.clock,
             adapter,
             events,
-            hooks,
-            idle_timeout,
-            state_path,
+            hooks: options
+                .hooks
+                .map(|(socket, amux_exe)| HookIntegration { socket, amux_exe }),
+            idle_timeout: options.idle_timeout,
+            state_path: options.state_path,
         })
     }
 
@@ -580,6 +627,16 @@ impl Registry {
             })
             .collect();
         state.layouts = layouts;
+        let agents: Vec<AgentId> = state.agents.keys().copied().collect();
+        drop(state);
+        if let Some(log) = &self.conversation {
+            let mut log = log.lock().unwrap();
+            for agent in agents {
+                if let Err(e) = log.load(agent) {
+                    tracing::warn!("could not load the conversation log of {agent}: {e:#}");
+                }
+            }
+        }
     }
 
     /// Ensure `terminal`'s agent is live, resuming a suspended primary if needed. Called when a
@@ -878,6 +935,56 @@ impl Registry {
         }
     }
 
+    /// Record a conversation turn `amux hook` forwarded: the next entry in the worktree's log,
+    /// stamped with the daemon's clock. A turn for an agent the daemon does not know is dropped.
+    /// The text is never logged, at any level.
+    pub fn on_turn(&self, report: TurnReport) {
+        let Some(log) = &self.conversation else {
+            return;
+        };
+        if !self
+            .state
+            .lock()
+            .unwrap()
+            .agents
+            .contains_key(&report.agent)
+        {
+            return;
+        }
+        let at = self.clock.now();
+        if let Err(e) = log.lock().unwrap().append(report.agent, report.turn, at) {
+            tracing::warn!("could not record a turn for {}: {e:#}", report.agent);
+        }
+    }
+
+    /// A page of `agent`'s conversation: entries after `after`, oldest first, at most `limit`
+    /// and at most about `max_bytes` of text. `None` for an agent the daemon does not know.
+    pub fn turns(
+        &self,
+        agent: AgentId,
+        after: u64,
+        limit: usize,
+        max_bytes: usize,
+    ) -> Option<Result<TurnsPage>> {
+        if !self.state.lock().unwrap().agents.contains_key(&agent) {
+            return None;
+        }
+        let Some(log) = &self.conversation else {
+            return Some(Ok(TurnsPage {
+                summary: None,
+                turns: Vec::new(),
+            }));
+        };
+        let log = log.lock().unwrap();
+        Some(
+            log.read_after(agent, after, limit, max_bytes)
+                .map(|turns| TurnsPage {
+                    summary: log.summary(agent).cloned(),
+                    turns,
+                }),
+        )
+    }
+
     /// Fold an [`AgentEvent`] into an agent's state via the pure state machine, flag unread on a
     /// notable transition, and broadcast what changed. Shared by hooks and the idle heartbeat.
     fn apply_event(&self, agent: AgentId, event: AgentEvent) {
@@ -1105,6 +1212,10 @@ impl Registry {
         };
         for session in sessions {
             session.kill();
+        }
+        // The conversation goes with the worktree.
+        if let Some(log) = &self.conversation {
+            log.lock().unwrap().remove(id);
         }
         // Remove the managed worktree/branch only for a worktree session; a HEAD session has none
         // and must never prune anything in the user's live tree. Clean up its out-of-tree hook

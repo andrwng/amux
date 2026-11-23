@@ -10,6 +10,7 @@
 use serde::{Deserialize, Serialize};
 
 use crate::agent::{AgentEvent, AttentionKind, TerminalId};
+use crate::conversation::{Speaker, Turn};
 use crate::nav::Dir;
 
 /// A message from inside a pane to the daemon over the mailbox socket — the channel `amux hook`,
@@ -24,6 +25,21 @@ pub enum PaneMessage {
     Passthrough { terminal: TerminalId, on: bool },
     /// The in-pane program hit its own edge and is handing navigation back to amux.
     Nav { terminal: TerminalId, dir: Dir },
+    /// One turn of the agent's conversation (a prompt, or the reply it stopped on), sent by
+    /// `amux hook` on a connection of its own *after* the `Hook` report for the same event.
+    ///
+    /// Appended last on purpose: postcard encodes the variant as its index, so the three kinds
+    /// above keep their bytes exactly, and a daemon that predates this kind fails to decode it and
+    /// drops that one connection, as it drops any bad report — the status report, on its own
+    /// connection, has already been applied.
+    Turn(TurnReport),
+}
+
+/// What `amux hook` sends for a conversation turn: which agent, and the turn itself.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TurnReport {
+    pub agent: crate::agent::AgentId,
+    pub turn: Turn,
 }
 
 /// A Claude Code hook payload, as delivered to the hook command on stdin. Only the fields we act
@@ -47,6 +63,19 @@ pub struct HookEvent {
     /// The tool involved (present on `PreToolUse` / `PostToolUse`).
     #[serde(default)]
     pub tool_name: Option<String>,
+}
+
+/// The conversation fields of a Claude Code hook payload: the prompt on `UserPromptSubmit`, the
+/// final reply on `Stop`. Parsed from the same stdin JSON as [`HookEvent`] but kept apart from it,
+/// because `HookEvent` is encoded into the status report and that message must not change.
+/// `last_assistant_message` is Claude Code's documented way to get the closing reply; its
+/// transcript file is internal and is never read.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize)]
+pub struct HookTurnFields {
+    #[serde(default)]
+    pub prompt: Option<String>,
+    #[serde(default)]
+    pub last_assistant_message: Option<String>,
 }
 
 /// What `amux hook` sends to the daemon mailbox: which agent, and the event that fired.
@@ -85,6 +114,30 @@ pub fn classify(h: &HookEvent) -> Classified {
         _ => None,
     };
     Classified { event, session_id }
+}
+
+/// The conversation turn a hook event carries, if any — the CLI-agnostic entry that leaves this
+/// seam, with its text already clipped.
+///
+/// - `UserPromptSubmit` with a `prompt` → the user spoke.
+/// - **Every** `Stop` with a `last_assistant_message` → the agent spoke. When another `Stop` hook
+///   blocks the stop, Claude continues and stops again; that later `Stop` (with
+///   `stop_hook_active` true) carries the real closing reply, so none is skipped and several
+///   replies in a row are all kept — the last is the closing word. (Observed on Claude Code
+///   2.1.330: the first `Stop` carried the reply the block rejected, the second the reply that
+///   followed it.)
+/// - Anything else, or empty text, → no entry. `/clear` itself fires no `UserPromptSubmit`.
+pub fn turn_from_hook(h: &HookEvent, fields: &HookTurnFields) -> Option<Turn> {
+    let (by, text) = match h.hook_event_name.as_str() {
+        "UserPromptSubmit" => (Speaker::User, fields.prompt.as_deref()?),
+        "Stop" => (Speaker::Agent, fields.last_assistant_message.as_deref()?),
+        _ => return None,
+    };
+    if text.trim().is_empty() {
+        return None;
+    }
+    let session = h.session_id.clone().filter(|s| !s.is_empty());
+    Some(Turn::new(by, text, session))
 }
 
 /// Interpret a `Notification`. Prefer the structured `notification_type` (exact); fall back to
@@ -244,6 +297,125 @@ mod tests {
         let mut h = ev("Stop");
         h.session_id = Some(String::new());
         assert_eq!(classify(&h).session_id, None);
+    }
+
+    fn fields(prompt: Option<&str>, reply: Option<&str>) -> HookTurnFields {
+        HookTurnFields {
+            prompt: prompt.map(Into::into),
+            last_assistant_message: reply.map(Into::into),
+        }
+    }
+
+    /// The table: (event, prompt, reply) → the entry it yields, if any.
+    #[test]
+    fn hook_payloads_map_to_turns() {
+        let user = |t: &str| Some((Speaker::User, t.to_string()));
+        let agent = |t: &str| Some((Speaker::Agent, t.to_string()));
+        type Case<'a> = (
+            &'a str,
+            Option<&'a str>,
+            Option<&'a str>,
+            Option<(Speaker, String)>,
+        );
+        let cases: &[Case] = &[
+            (
+                "UserPromptSubmit",
+                Some("synthetic prompt"),
+                None,
+                user("synthetic prompt"),
+            ),
+            (
+                "Stop",
+                None,
+                Some("synthetic reply"),
+                agent("synthetic reply"),
+            ),
+            // A Stop with no reply in it is no entry.
+            ("Stop", None, None, None),
+            // Empty or blank text is no entry.
+            ("UserPromptSubmit", Some(""), None, None),
+            ("Stop", None, Some("  \n"), None),
+            // A prompt field on a Stop is not a prompt, and vice versa.
+            ("Stop", Some("stray prompt"), None, None),
+            ("UserPromptSubmit", None, Some("stray reply"), None),
+            // The events that never carry a turn.
+            ("Notification", Some("p"), Some("r"), None),
+            ("PreToolUse", Some("p"), Some("r"), None),
+            ("PostToolUse", Some("p"), Some("r"), None),
+            ("SessionStart", Some("p"), Some("r"), None),
+        ];
+        for (name, prompt, reply, want) in cases {
+            let got = turn_from_hook(&ev(name), &fields(*prompt, *reply)).map(|t| (t.by, t.text));
+            assert_eq!(&got, want, "{name} prompt={prompt:?} reply={reply:?}");
+        }
+    }
+
+    #[test]
+    fn a_turn_carries_the_session() {
+        let t = turn_from_hook(&ev("Stop"), &fields(None, Some("r"))).unwrap();
+        assert_eq!(t.session.as_deref(), Some("sess-abc"));
+        let mut h = ev("Stop");
+        h.session_id = Some(String::new());
+        assert_eq!(
+            turn_from_hook(&h, &fields(None, Some("r")))
+                .unwrap()
+                .session,
+            None
+        );
+    }
+
+    /// `stop_hook_active` true is the Stop that follows a blocked one, and carries the real closing
+    /// reply: it is an entry like any other, and two Stops with no prompt between are two entries.
+    #[test]
+    fn a_stop_after_a_blocked_stop_is_an_entry_too() {
+        let first = r#"{"hook_event_name":"Stop","session_id":"s","stop_hook_active":false,
+                        "last_assistant_message":"first reply"}"#;
+        let second = r#"{"hook_event_name":"Stop","session_id":"s","stop_hook_active":true,
+                         "last_assistant_message":"closing reply"}"#;
+        let turns: Vec<Turn> = [first, second]
+            .iter()
+            .filter_map(|json| {
+                let h: HookEvent = serde_json::from_str(json).unwrap();
+                let f: HookTurnFields = serde_json::from_str(json).unwrap();
+                turn_from_hook(&h, &f)
+            })
+            .collect();
+        let texts: Vec<&str> = turns.iter().map(|t| t.text.as_str()).collect();
+        assert_eq!(texts, ["first reply", "closing reply"]);
+        assert!(turns.iter().all(|t| t.by == Speaker::Agent));
+    }
+
+    #[test]
+    fn a_long_turn_is_clipped() {
+        let long = "y".repeat(crate::conversation::MAX_TURN_TEXT_BYTES * 3);
+        let t = turn_from_hook(&ev("UserPromptSubmit"), &fields(Some(&long), None)).unwrap();
+        assert!(t.clipped);
+        assert!(t.text.len() <= crate::conversation::MAX_TURN_TEXT_BYTES);
+    }
+
+    /// The real shapes, as Claude Code 2.1.330 delivered them (synthetic text), with the fields
+    /// amux ignores left in.
+    #[test]
+    fn real_turn_payloads_deserialize() {
+        let prompt = r#"{"session_id":"s1","transcript_path":"/x.jsonl","cwd":"/w",
+            "prompt_id":"p1","permission_mode":"auto","hook_event_name":"UserPromptSubmit",
+            "prompt":"Reply with one word."}"#;
+        let stop = r#"{"session_id":"s1","transcript_path":"/x.jsonl","cwd":"/w",
+            "prompt_id":"p1","permission_mode":"auto","effort":{"level":"medium"},
+            "hook_event_name":"Stop","stop_hook_active":false,"last_assistant_message":"word",
+            "background_tasks":[],"session_crons":[]}"#;
+        for (json, by, text) in [
+            (prompt, Speaker::User, "Reply with one word."),
+            (stop, Speaker::Agent, "word"),
+        ] {
+            let h: HookEvent = serde_json::from_str(json).unwrap();
+            let f: HookTurnFields = serde_json::from_str(json).unwrap();
+            let t = turn_from_hook(&h, &f).unwrap();
+            assert_eq!(
+                (t.by, t.text.as_str(), t.session.as_deref()),
+                (by, text, Some("s1"))
+            );
+        }
     }
 
     #[test]

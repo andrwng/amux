@@ -6,15 +6,19 @@
 //! repositories (clients register their cwd on connect); a session exiting suspends its agent
 //! (resumable), and only an explicit delete removes a worktree.
 
+mod conversation;
 mod daemonize;
 mod mailbox;
 mod pty;
 mod registry;
 mod server;
 
+pub use conversation::{Entry as ConversationEntry, Summary as ConversationSummary};
 pub use daemonize::daemonize;
-pub use mailbox::{bind_mailbox, run_hook, run_nav, run_passthrough, serve_mailbox};
-pub use registry::Registry;
+pub use mailbox::{
+    bind_mailbox, deliver_hook_input, run_hook, run_nav, run_passthrough, serve_mailbox,
+};
+pub use registry::{Registry, RegistryOptions, TurnsPage};
 pub use server::{acquire_and_bind, serve, Singleton};
 
 use std::os::unix::fs::PermissionsExt;
@@ -109,7 +113,16 @@ pub fn run_blocking(repo: PathBuf) -> Result<()> {
         );
 
         let state_path = amux_core::paths::state_file()?;
-        let registry = Registry::with_hooks(adapter, mailbox.clone(), amux_exe, state_path);
+        let conversation_dir = amux_core::paths::conversation_dir()?;
+        let registry = Registry::with_options(
+            adapter,
+            RegistryOptions {
+                hooks: Some((mailbox.clone(), amux_exe)),
+                state_path: Some(state_path),
+                conversation_dir: Some(conversation_dir),
+                ..RegistryOptions::default()
+            },
+        );
         // Reinstate agents/repos/minis from a previous run (suspended until a client opens them).
         registry.load_state();
         // Pre-register the launching repo so `amux` in a repo dir works out of the box; clients

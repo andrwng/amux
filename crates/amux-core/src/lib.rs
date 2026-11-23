@@ -8,6 +8,7 @@ pub mod adapter;
 pub mod agent;
 pub mod clock;
 pub mod config;
+pub mod conversation;
 pub mod hook;
 pub mod nav;
 pub mod paths;

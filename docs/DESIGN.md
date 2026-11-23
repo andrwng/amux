@@ -502,7 +502,8 @@ gap, shared with tmux: vt100 has no DECOM, so CPR is absolute even under origin 
 The elegant part, and the payoff of the whole status thread:
 
 1. On `prepare_worktree`, `ClaudeAdapter` writes `.claude/settings.local.json` (gitignored)
-   with `Notification` + `Stop` hooks whose command is simply **`amux hook`**.
+   with `Notification`, `Stop`, `UserPromptSubmit`, `PreToolUse` and `PostToolUse` hooks whose
+   command is simply **`amux hook`**.
 2. At spawn, the daemon injects two env vars into the agent process:
    `AMUX_HOOK_SOCK` (the mailbox path) and `AMUX_AGENT_ID`.
 3. When Claude fires a hook, `amux hook` reads the hook JSON from stdin, tags it with the
@@ -517,6 +518,43 @@ Why this is good:
   concern (the daemon controls the full spawn env; agents are launched through a login shell
   so `PATH`, keys, direnv all match a normal terminal).
 - Reference plumbing exists: `disler/claude-code-hooks-multi-agent-observability`.
+
+**The conversation rides the same hooks.** amux hears every turn, so it keeps the two that
+explain an idle agent: the prompt (`prompt` on `UserPromptSubmit`) and the reply the agent
+stopped on (`last_assistant_message` on **every** `Stop` that carries one — when another `Stop`
+hook blocks, Claude continues and stops again, and that later `Stop`, with `stop_hook_active`
+true, carries the real closing reply; observed on Claude Code 2.1.330). Claude's field names are
+read in `amux-core/src/hook.rs` (`turn_from_hook`), and what leaves that seam is a CLI-agnostic
+`Turn` (who spoke, the text, the session). The transcript file is internal to Claude and is never
+read, so turns from before this feature, from a hook that did not arrive, or from a `claude` run
+by hand outside amux are simply not recorded.
+
+- **Its own message, on its own connection.** `amux hook` sends the status report first — the
+  same `PaneMessage::Hook`, byte for byte — and then a `PaneMessage::Turn` on a second
+  connection, inside the hook's one time bound. The mailbox decodes one message per connection,
+  so the two cannot affect each other: a daemon from before turns existed applies the status and
+  drops the turn (a variant index it does not know), and a daemon with an old `amux hook` simply
+  records nothing for that agent.
+- **Clipped before encoding.** The mailbox reads at most `MAX_REPORT_BYTES` (64 KiB); a larger
+  message would be cut short, fail to decode and be dropped whole. So `amux hook` clips the text
+  to `MAX_TURN_TEXT_BYTES` (24 KiB), keeping head and tail with a marker between, and sets
+  `clipped`. (In a week of real use the largest prompt was ~36 KB, the largest reply ~9 KB.)
+- **A bounded file per worktree, owned by the daemon** (`daemon/src/conversation.rs`):
+  `<amux_home>/conversations/<agent-id>.jsonl`, JSON lines of `{seq, by, at, text, clipped,
+  session}`. Never in `state.json`, which is rewritten whole on every save. `seq` starts at 1, rises
+  by one and is never reused; `at` is the daemon's `Clock` when the hook arrived. Past 2,000
+  entries (plus a slack of 200, so a full log is not copied on every turn) the file is rewritten
+  without the oldest — beside and renamed over, so a crash leaves one whole file — and its first
+  entry says where the log now starts. At start the daemon rebuilds, per worktree, only where the
+  log starts and its newest entry; a torn last line (a crash mid-append) is cut off. Deleting a
+  worktree deletes its log.
+- **Private.** The text is what the user typed, which can include a pasted secret: files are mode
+  `0600` in a `0700` directory, and turn text is never logged at any level, by `amux hook` or the
+  daemon (`turn_text_reaches_the_log_and_nowhere_else`).
+- **What a hook cannot tell us.** `/clear` fires no `UserPromptSubmit`; Claude ends the session
+  and starts a new one (`SessionEnd` then `SessionStart`, a new `session_id`), neither of which
+  amux registers, so amux first sees the new session id on the next prompt. A prompt Claude Code
+  starts itself is indistinguishable from one typed, and an interrupted turn fires no `Stop`.
 
 > Spike required (Phase 2): confirm exact hook event names, matchers
 > (`permission_prompt` vs `idle_prompt`), and payload keys against the live CLI before

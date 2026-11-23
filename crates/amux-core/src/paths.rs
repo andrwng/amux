@@ -67,6 +67,13 @@ pub fn state_file() -> Result<PathBuf> {
     Ok(amux_home()?.join("state.json"))
 }
 
+/// Where the daemon keeps each worktree's conversation log (`<amux_home>/conversations/`, one
+/// file per worktree, mode `0600` in a `0700` directory). Not `state.json`: the logs hold what the
+/// user typed, and `state.json` is rewritten whole on every save.
+pub fn conversation_dir() -> Result<PathBuf> {
+    Ok(amux_home()?.join("conversations"))
+}
+
 /// Where a branchless HEAD session's Claude hook settings live
 /// (`<amux_home>/head-settings/<agent-id>.json`) — deliberately outside any repo, so a HEAD
 /// session running in the user's live tree never has settings written into that tree.
