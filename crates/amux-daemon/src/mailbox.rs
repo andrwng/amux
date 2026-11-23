@@ -112,7 +112,38 @@ fn deliver(msg: &PaneMessage) -> Result<()> {
 
 fn deliver_to(sock: &Path, msg: &PaneMessage) -> Result<()> {
     let bytes = postcard::to_stdvec(msg).context("encode pane message")?;
-    deliver_blocking(sock, &bytes)
+    deliver_blocking(sock, &bytes, HOOK_DELIVER_TIMEOUT)
+}
+
+/// How long `amux hook` gives a conversation turn, connect and write together, after the status
+/// report has gone. Much shorter than [`HOOK_DELIVER_TIMEOUT`]: the hook runs inside the agent's
+/// turn, and a turn is a record, not a signal anything waits on — one the daemon is not reading
+/// right now is dropped rather than allowed to hold the agent.
+const TURN_DELIVER_TIMEOUT: std::time::Duration = std::time::Duration::from_millis(250);
+
+/// The send buffer asked for on a turn's connection: room for the largest turn message with
+/// plenty to spare, so a turn lands in the kernel at once even while the daemon is not reading.
+/// macOS gives a unix stream socket 8 KiB by default, and a clipped turn is about 24 KiB.
+const TURN_SEND_BUFFER: usize = MAX_REPORT_BYTES;
+
+/// Deliver a conversation turn within [`TURN_DELIVER_TIMEOUT`], on a connection with a send
+/// buffer of [`TURN_SEND_BUFFER`]. A turn that cannot be delivered in that time is dropped.
+fn deliver_turn(sock: &Path, msg: &PaneMessage) -> Result<()> {
+    let bytes = postcard::to_stdvec(msg).context("encode pane message")?;
+    let sock = sock.to_path_buf();
+    // `run_bounded` bounds the connect too, which has no timeout of its own: a daemon whose
+    // listen backlog is full can block it.
+    run_bounded(TURN_DELIVER_TIMEOUT, move || {
+        let stream = connect_mailbox(&sock)?;
+        // Best effort: if the kernel refuses a larger buffer, the deadline still bounds the write.
+        let _ = nix::sys::socket::setsockopt(
+            &stream,
+            nix::sys::socket::sockopt::SndBuf,
+            &TURN_SEND_BUFFER,
+        );
+        write_message(stream, &bytes, TURN_DELIVER_TIMEOUT)
+    })
+    .context("turn dropped")
 }
 
 /// Run a blocking `f` on a throwaway thread and give up on it after `dur`. Returns `f`'s result, or
@@ -132,12 +163,25 @@ where
     }
 }
 
-fn deliver_blocking(sock: &Path, bytes: &[u8]) -> Result<()> {
+fn deliver_blocking(sock: &Path, bytes: &[u8], timeout: std::time::Duration) -> Result<()> {
+    write_message(connect_mailbox(sock)?, bytes, timeout)
+}
+
+fn connect_mailbox(sock: &Path) -> Result<std::os::unix::net::UnixStream> {
+    std::os::unix::net::UnixStream::connect(sock).context("connect to mailbox")
+}
+
+/// Write one message and half-close. The write timeout guards against a full socket buffer (the
+/// daemon not reading); it applies per `write` call, so callers that need a hard bound on the whole
+/// write also wrap this in [`run_bounded`].
+fn write_message(
+    mut stream: std::os::unix::net::UnixStream,
+    bytes: &[u8],
+    timeout: std::time::Duration,
+) -> Result<()> {
     use std::io::Write;
-    let mut stream = std::os::unix::net::UnixStream::connect(sock).context("connect to mailbox")?;
-    // A write timeout in case the socket buffer is full (daemon not reading): bounded like connect.
     stream
-        .set_write_timeout(Some(HOOK_DELIVER_TIMEOUT))
+        .set_write_timeout(Some(timeout))
         .context("set write timeout")?;
     stream.write_all(bytes).context("send pane message")?;
     // Half-close so the daemon's read-to-EOF completes promptly.
@@ -167,6 +211,10 @@ fn deliver_hook() -> Result<()> {
 /// it cannot decode). The turn's text was clipped by [`turn_from_hook`] before it is encoded here,
 /// so the message always fits the mailbox's read limit. Nothing here logs the text.
 ///
+/// The turn has a deadline of its own, [`TURN_DELIVER_TIMEOUT`], far shorter than the status
+/// report's: past it the turn is dropped (an error saying so is returned), so a daemon that is not
+/// reading costs the agent's turn at most that long beyond the status report.
+///
 /// [`turn_from_hook`]: amux_core::hook::turn_from_hook
 pub fn deliver_hook_input(
     sock: &Path,
@@ -180,7 +228,7 @@ pub fn deliver_hook_input(
     let turn = amux_core::hook::turn_from_hook(&event, &fields);
     deliver_to(sock, &PaneMessage::Hook(HookReport { agent, event }))?;
     if let Some(turn) = turn {
-        deliver_to(sock, &PaneMessage::Turn(TurnReport { agent, turn }))?;
+        deliver_turn(sock, &PaneMessage::Turn(TurnReport { agent, turn }))?;
     }
     Ok(())
 }
@@ -289,6 +337,114 @@ mod tests {
         });
         let bytes = postcard::to_stdvec(&msg).unwrap();
         assert!(bytes.len() < MAX_REPORT_BYTES / 2, "{} bytes", bytes.len());
+    }
+
+    /// A mailbox that accepts connections and never reads them (a daemon that is wedged or busy):
+    /// the accepted streams are handed back, unread, for the test to read afterwards.
+    fn unread_mailbox(sock: &Path) -> std::sync::mpsc::Receiver<std::os::unix::net::UnixStream> {
+        let listener = std::os::unix::net::UnixListener::bind(sock).unwrap();
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            for stream in listener.incoming().flatten() {
+                if tx.send(stream).is_err() {
+                    return;
+                }
+            }
+        });
+        rx
+    }
+
+    fn read_message(mut stream: std::os::unix::net::UnixStream) -> PaneMessage {
+        use std::io::Read;
+        // The sender has closed (or abandoned) its end by now, so this ends at EOF. (No read
+        // timeout: macOS refuses `setsockopt` on a socket whose peer has gone.)
+        let mut buf = Vec::new();
+        stream.read_to_end(&mut buf).unwrap();
+        postcard::from_bytes(&buf).unwrap()
+    }
+
+    fn prompt_payload(bytes: usize) -> String {
+        serde_json::json!({"hook_event_name": "UserPromptSubmit", "session_id": "s1",
+                           "prompt": "p".repeat(bytes)})
+        .to_string()
+    }
+
+    /// `amux hook` runs inside the agent's turn, so a turn the daemon is not reading must not hold
+    /// it for the status report's 3 s bound: on macOS a unix stream socket buffers only 8 KiB, and
+    /// a clipped turn is three times that. The turn has its own short deadline, and the status
+    /// report sent before it was received.
+    #[test]
+    fn a_large_turn_to_a_mailbox_that_is_not_read_returns_within_the_turn_deadline() {
+        let tmp = tempfile::tempdir().unwrap();
+        let sock = tmp.path().join("hooks.sock");
+        let accepted = unread_mailbox(&sock);
+        let agent = AgentId::new();
+        // Far past the clip, so the turn is as large as a turn can be.
+        let input = prompt_payload(4 * MAX_TURN_TEXT_BYTES);
+        let started = Instant::now();
+        let _ = deliver_hook_input(&sock, agent, &input);
+        let waited = started.elapsed();
+        assert!(
+            waited < Duration::from_millis(1000),
+            "the hook waited {waited:?} on a turn nobody reads"
+        );
+        let status = accepted.recv_timeout(Duration::from_secs(1)).unwrap();
+        match read_message(status) {
+            PaneMessage::Hook(r) => {
+                assert_eq!(r.agent, agent);
+                assert_eq!(r.event.hook_event_name, "UserPromptSubmit");
+            }
+            other => panic!("expected the status report first, got {other:?}"),
+        }
+    }
+
+    /// A turn that cannot be written in time — larger than any send buffer, to a mailbox nobody
+    /// reads — is dropped at the turn's deadline, not the status report's.
+    #[test]
+    fn a_turn_that_cannot_be_written_in_time_is_dropped_at_the_turn_deadline() {
+        let tmp = tempfile::tempdir().unwrap();
+        let sock = tmp.path().join("hooks.sock");
+        let _accepted = unread_mailbox(&sock);
+        // Built by hand, past the clip, so no buffer holds it.
+        let msg = PaneMessage::Turn(TurnReport {
+            agent: AgentId::new(),
+            turn: Turn {
+                by: Speaker::User,
+                text: "x".repeat(8 * 1024 * 1024),
+                clipped: false,
+                session: None,
+            },
+        });
+        let started = Instant::now();
+        let result = deliver_turn(&sock, &msg);
+        let waited = started.elapsed();
+        assert!(result.is_err(), "the turn is dropped");
+        assert!(
+            waited < TURN_DELIVER_TIMEOUT + Duration::from_millis(500),
+            "waited {waited:?}"
+        );
+    }
+
+    /// The turn's socket gets a send buffer large enough for the largest turn, so against a daemon
+    /// that is not reading right now the turn still lands whole instead of waiting.
+    #[test]
+    fn the_largest_turn_fits_the_send_buffer_of_a_mailbox_that_is_not_read() {
+        let tmp = tempfile::tempdir().unwrap();
+        let sock = tmp.path().join("hooks.sock");
+        let accepted = unread_mailbox(&sock);
+        let agent = AgentId::new();
+        let input = prompt_payload(4 * MAX_TURN_TEXT_BYTES);
+        deliver_hook_input(&sock, agent, &input).expect("the turn is delivered, not dropped");
+        let _status = accepted.recv_timeout(Duration::from_secs(1)).unwrap();
+        let turn = accepted.recv_timeout(Duration::from_secs(1)).unwrap();
+        match read_message(turn) {
+            PaneMessage::Turn(t) => {
+                assert_eq!(t.agent, agent);
+                assert!(t.turn.clipped);
+                assert!(t.turn.text.len() <= MAX_TURN_TEXT_BYTES);
+            }
+            other => panic!("expected the turn, got {other:?}"),
+        }
     }
 
     /// A fast delivery returns its own result promptly.

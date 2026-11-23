@@ -38,7 +38,7 @@ git2 = { version = "0.21", default-features = false, features = ["vendored-libgi
 uuid = { version = "1", features = ["v4", "serde"] }
 clap = { version = "4", features = ["derive"] }
 directories = "6"
-nix = { version = "0.30", features = ["process", "fs", "signal"] }
+nix = { version = "0.30", features = ["process", "fs", "signal", "socket"] }
 chrono = { version = "0.4", features = ["serde"] }
 proptest = "1"
 futures = "0.3"

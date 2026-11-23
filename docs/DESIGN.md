@@ -531,10 +531,16 @@ by hand outside amux are simply not recorded.
 
 - **Its own message, on its own connection.** `amux hook` sends the status report first — the
   same `PaneMessage::Hook`, byte for byte — and then a `PaneMessage::Turn` on a second
-  connection, inside the hook's one time bound. The mailbox decodes one message per connection,
-  so the two cannot affect each other: a daemon from before turns existed applies the status and
-  drops the turn (a variant index it does not know), and a daemon with an old `amux hook` simply
-  records nothing for that agent.
+  connection. The mailbox decodes one message per connection, so the two cannot affect each
+  other: a daemon from before turns existed applies the status and drops the turn (a variant
+  index it does not know), and a daemon with an old `amux hook` simply records nothing for that
+  agent.
+- **The turn may not hold the agent.** The hook runs inside the agent's turn, and a clipped turn
+  (~24 KiB) is three times what a macOS unix stream socket buffers by default (8 KiB), so against
+  a daemon that is not reading it would wait out the status report's 3 s bound. The turn's
+  connection therefore asks for a 64 KiB send buffer, so a turn normally lands in the kernel at
+  once, and has its own deadline of 250 ms for connect and write together; a turn not delivered
+  by then is dropped (the status report has already gone).
 - **Clipped before encoding.** The mailbox reads at most `MAX_REPORT_BYTES` (64 KiB); a larger
   message would be cut short, fail to decode and be dropped whole. So `amux hook` clips the text
   to `MAX_TURN_TEXT_BYTES` (24 KiB), keeping head and tail with a marker between, and sets
