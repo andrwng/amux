@@ -1,0 +1,2 @@
+ID                                    WORKTREE                                                                              AGENT            UNREAD  LAST TURN
+00000000-0000-4000-8000-000000000001  demo␊a␛[2Jb␇c␛]52;c;c2VjcmV0␇d�31me�f�g␡h␁/autha␛[2Jb␇c␛]52;c;c2VjcmV0␇d�31me�f�g␡h␁  needs_attention  yes     #42 agent 2026-11-22 10:15

@@ -649,7 +649,12 @@ both sides refuse mismatches.
 > once and kept in `<amux_home>/instance-id`, plus when this daemon started, so a reader can tell
 > one amux, or one daemon run, from another. The commands print JSON from types they own
 > (`amux-tui/src/worktree.rs`, `schema: 1`), never a serialised protocol type, so the wire can
-> change without changing what a script reads.
+> change without changing what a script reads. Their text output (without `--json`) goes to a
+> terminal, and an agent's reply can carry escape sequences — a clipboard write (OSC 52), a title
+> change, a clear screen — so every field it prints (turn text, session ids, names, branches,
+> paths, messages) has its C0 controls, DEL, C1 controls and text-reordering characters replaced
+> by visible stand-ins (`safe_text` keeps newlines and tabs; `safe_line` replaces them too). JSON
+> needs nothing: it escapes control characters itself.
 >
 > **Showing a worktree from outside (v22).** `OpenWorktree { worktree }` asks the daemon to send
 > `ShowWorktree` to **one** terminal client — the one the user acted in most recently (`Input`,

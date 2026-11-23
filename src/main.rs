@@ -131,7 +131,8 @@ fn finish_command(result: Result<String, amux_tui::CommandError>) -> ! {
             std::process::exit(0)
         }
         Err(e) => {
-            eprintln!("amux: {e}");
+            // The line can quote the daemon's own error text; show it, never obey it.
+            eprintln!("amux: {}", amux_tui::safe_line(&e.to_string()));
             std::process::exit(e.exit_code())
         }
     }

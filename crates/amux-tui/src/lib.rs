@@ -15,7 +15,7 @@ mod worktree;
 use anyhow::Result;
 
 pub use client::{connect_to_running_daemon, ConnectError};
-pub use worktree::{CommandError, MAX_TURNS_LIMIT};
+pub use worktree::{safe_line, CommandError, MAX_TURNS_LIMIT};
 
 /// Entry point for the `amux` TUI client: discover the repo, connect to (or auto-spawn) its
 /// daemon, and drive the sidebar until you quit.

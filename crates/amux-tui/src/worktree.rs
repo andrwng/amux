@@ -434,6 +434,40 @@ pub(crate) fn render_turns_json(page: &TurnsPage) -> String {
 }
 
 // --- Human-readable output. ---
+//
+// Everything in these renderers that did not come from amux itself — turn text, but also session
+// ids, names, branches, paths and messages — is passed through [`safe_text`] or [`safe_line`]
+// first: an agent's reply can carry escape sequences (a clipboard write, a title change, a clear
+// screen) that would otherwise reach the user's terminal. JSON output needs none of this: it
+// escapes every control character.
+
+/// `s` with everything a terminal would act on replaced by a visible stand-in, keeping its
+/// newlines and tabs: for multi-line text.
+pub fn safe_text(s: &str) -> String {
+    replace_controls(s, true)
+}
+
+/// [`safe_text`] for a value that must stay on one line (a table cell, a heading, an error
+/// message): newlines and tabs are replaced too.
+pub fn safe_line(s: &str) -> String {
+    replace_controls(s, false)
+}
+
+/// Replace C0 controls (keeping newline and tab when `keep_layout`), DEL and C1 controls, and
+/// the characters that reorder text (the bidi embeddings, overrides and isolates). A C0 control
+/// or DEL becomes its Unicode control picture (ESC is `␛`), so what was there stays readable; a C1
+/// control or a reordering character becomes `�`.
+fn replace_controls(s: &str, keep_layout: bool) -> String {
+    s.chars()
+        .map(|c| match c {
+            '\n' | '\t' if keep_layout => c,
+            '\0'..='\x1f' => char::from_u32(0x2400 + c as u32).unwrap_or('\u{fffd}'),
+            '\x7f' => '\u{2421}',
+            '\u{80}'..='\u{9f}' | '\u{202a}'..='\u{202e}' | '\u{2066}'..='\u{2069}' => '\u{fffd}',
+            _ => c,
+        })
+        .collect()
+}
 
 /// One row per worktree: id, repo/name, the agent's state, unread, and the last recorded turn.
 pub(crate) fn render_list_table(worktrees: &[WorktreeInfo]) -> String {
@@ -457,11 +491,11 @@ pub(crate) fn render_list_table(worktrees: &[WorktreeInfo]) -> String {
                 None => "-".to_string(),
             };
             [
-                w.id.to_full_string(),
-                format!("{}/{}", w.repo.name, w.name),
-                state,
+                safe_line(&w.id.to_full_string()),
+                safe_line(&format!("{}/{}", w.repo.name, w.name)),
+                safe_line(&state),
                 if w.unread { "yes" } else { "" }.to_string(),
-                last,
+                safe_line(&last),
             ]
         })
         .collect();
@@ -503,7 +537,7 @@ pub(crate) fn render_turns_text(page: &TurnsPage) -> String {
         if session.is_some_and(|s| *s != t.session) {
             out.push_str(&format!(
                 "-- new session {} --\n\n",
-                t.session.as_deref().unwrap_or("(none)")
+                safe_line(t.session.as_deref().unwrap_or("(none)"))
             ));
         }
         session = Some(&t.session);
@@ -513,7 +547,7 @@ pub(crate) fn render_turns_text(page: &TurnsPage) -> String {
             t.seq,
             speaker(t.by),
             time(t.at),
-            t.text.trim_end()
+            safe_text(t.text.trim_end())
         ));
     }
     out
@@ -698,6 +732,33 @@ mod tests {
     #[test]
     fn turns_text_matches_its_golden_file() {
         golden("worktree-turns.txt", &render_turns_text(&page()));
+    }
+
+    /// Text that would drive the terminal — ESC (a colour, a clear screen), BEL, an OSC 52
+    /// clipboard write, a C1 CSI, a bidi override that reorders what follows — arrives as visible
+    /// stand-ins in every field the text renderers print, while newlines and tabs in a turn keep
+    /// their layout.
+    #[test]
+    fn text_output_shows_control_characters_instead_of_obeying_them() {
+        const HOSTILE: &str =
+            "a\x1b[2Jb\x07c\x1b]52;c;c2VjcmV0\x07d\u{9b}31me\u{202e}f\u{2066}g\x7fh\u{1}";
+        let mut list = worktrees();
+        list[0].name = format!("auth{HOSTILE}");
+        list[0].repo.name = format!("demo\n{HOSTILE}");
+        golden("worktree-list-hostile.txt", &render_list_table(&list[..1]));
+        let mut p = page();
+        p.turns[0].text = format!("line one\n\tindented {HOSTILE}\nline three");
+        p.turns[1].session = Some(format!("session\n{HOSTILE}"));
+        let out = render_turns_text(&p);
+        golden("worktree-turns-hostile.txt", &out);
+        for bad in [
+            '\x1b', '\x07', '\u{9b}', '\u{202e}', '\u{2066}', '\x7f', '\u{1}',
+        ] {
+            assert!(!out.contains(bad), "{bad:?} reached the terminal");
+            assert!(!render_list_table(&list).contains(bad));
+        }
+        assert!(out.contains("line one\n\tindented"), "layout is kept");
+        assert_eq!(safe_line("a\tb\nc"), "a\u{2409}b\u{240a}c");
     }
 
     #[test]
