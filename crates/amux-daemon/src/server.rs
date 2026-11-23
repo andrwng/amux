@@ -26,7 +26,7 @@ use amux_proto::{
 };
 
 use crate::pty::ScrollPos;
-use crate::registry::{DeleteOutcome, Registry};
+use crate::registry::{ConnectionId, DeleteOutcome, Registry};
 
 /// How long to wait for a daemon to answer the probe handshake. It only has to serialize a
 /// `Hello` it has already built, so anything slower is wedged, not busy.
@@ -300,11 +300,12 @@ async fn handle_client(stream: UnixStream, registry: Arc<Registry>) -> Result<()
     let mut events = registry.subscribe_events();
     let mut attached: Attachments = HashMap::new();
     let mut scroll: ScrollPositions = HashMap::new();
+    let connection = registry.connect();
 
     loop {
         tokio::select! {
             command = stream.next() => match command {
-                Some(Ok(msg)) => handle_command(msg, &registry, &out_tx, &mut attached, &mut scroll),
+                Some(Ok(msg)) => handle_command(msg, connection, &registry, &out_tx, &mut attached, &mut scroll),
                 _ => break,
             },
             outbound = out_rx.recv() => match outbound {
@@ -330,13 +331,15 @@ async fn handle_client(stream: UnixStream, registry: Arc<Registry>) -> Result<()
         }
         forwarder.abort();
     }
-    // The viewer is gone, so nothing is being watched — a later notable event should mark unread.
-    registry.focus(None);
+    // This viewer is gone, so what *it* was watching no longer is — a later notable event there
+    // marks unread unless another connection is watching too. Other connections' focus stands.
+    registry.disconnect(connection);
     Ok(())
 }
 
 fn handle_command(
     msg: ClientMsg,
+    connection: ConnectionId,
     registry: &Arc<Registry>,
     out_tx: &mpsc::UnboundedSender<DaemonMsg>,
     attached: &mut Attachments,
@@ -394,7 +397,7 @@ fn handle_command(
             scroll.remove(&terminal);
             registry.close_terminal(terminal);
         }
-        ClientMsg::Focus { agent } => registry.focus(agent),
+        ClientMsg::Focus { agent } => registry.focus(connection, agent),
         ClientMsg::SetLayout { agent, layout } => registry.set_layout(agent, layout),
         ClientMsg::SetMinis(minis) => registry.set_minis(minis),
         ClientMsg::SetActive(agent) => registry.set_active(agent),

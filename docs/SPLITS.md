@@ -128,7 +128,7 @@ shared via `amux_core::nav`.
 Alongside the layouts, the daemon also persists **which agent is in the main area** (`SetActive`/
 `Active`, proto v12) and the **minis** (`SetMinis`/`Minis`), so a re-attaching client restores its
 whole workspace — the main pane *and* the minis — not just the minis. `Active` is distinct from
-`Focus` (a transient viewed-cell signal cleared on disconnect); it's the durable "what's open in
+`Focus` (a transient viewed-cell signal, per connection, cleared when that connection goes); it's the durable "what's open in
 the main workspace", replayed on connect after `Layouts` so the client can rebuild the tree.
 
 ## S.5 — Daemon-restart persistence (DONE, `~/.amux/state.json`)

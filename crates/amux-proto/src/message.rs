@@ -115,9 +115,10 @@ pub enum ClientMsg {
     /// Prune orphaned worktrees in `repo` (git-tracked worktrees no live agent holds) to reclaim
     /// wedged branches. The daemon replies with a `DoctorReport`.
     DoctorRepo { repo: RepoId },
-    /// The agent the user is currently viewing (`None` = focus is in the sidebar / no pane). The
-    /// daemon clears its unread bit and, while it's focused, keeps notable events from marking it
-    /// unread — so "Claude finished while you were watching" stays read.
+    /// The agent the user is currently viewing in this client (`None` = focus is in the sidebar /
+    /// no pane). The daemon clears its unread bit and, while any connection has it focused, keeps
+    /// notable events from marking it unread — so "Claude finished while you were watching" stays
+    /// read. Per connection: a client disconnecting clears only its own focus.
     Focus { agent: Option<AgentId> },
     /// Persist an agent's pane layout (`None` = it has no panes). The daemon remembers it and
     /// replays it to a re-attaching client so splits survive closing the TUI.

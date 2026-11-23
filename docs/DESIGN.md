@@ -693,6 +693,13 @@ others dimmed but live. The focused terminal receives all keystrokes verbatim (f
 focus. Keymap is config-driven and mirrors tmux/grove reflexes where sensible (muscle-memory
 reuse is a stated goal).
 
+The client tells the daemon which agent it is viewing (`Focus`), and that drives the inbox's
+unread bit: a notable event marks an agent unread **unless some connection has it focused** at
+that moment, and viewing it from any client clears the bit. Focus is kept **per connection** — a
+client disconnecting clears only what it focused — so two terminal clients cannot clear each
+other's, and a command that connects and leaves is invisible
+(`a_disconnect_clears_only_its_own_focus`).
+
 ### 7.4 Resize-to-slot
 
 When an agent enters a slot (main, or a mini expands on focus), the client sends

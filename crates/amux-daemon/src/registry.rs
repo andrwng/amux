@@ -129,6 +129,11 @@ struct Terminal {
     passthrough: bool,
 }
 
+/// One control connection, as the registry tells connections apart: what each one focused is its
+/// own. Handed out by [`Registry::connect`], given back by [`Registry::disconnect`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct ConnectionId(u64);
+
 /// A registered repository and its (cheaply cloneable) worktree service.
 struct RepoEntry {
     info: RepoInfo,
@@ -140,9 +145,12 @@ struct State {
     repos: HashMap<RepoId, RepoEntry>,
     agents: HashMap<AgentId, Agent>,
     terminals: HashMap<TerminalId, Terminal>,
-    /// The agent the user is currently viewing, if any. A notable event on this agent does not
-    /// mark it unread (you're watching it); everyone else's does.
-    focused: Option<AgentId>,
+    /// The agent each connection is viewing, if any. A notable event on an agent some connection
+    /// is viewing does not mark it unread (someone is watching it); everyone else's does. Per
+    /// connection, so a client leaving takes only its own focus with it.
+    focused: HashMap<ConnectionId, AgentId>,
+    /// The next [`ConnectionId`] to hand out.
+    next_connection: u64,
     /// Saved pane layouts per agent, replayed to a re-attaching client so splits survive the TUI
     /// closing — and, since they are part of [`PersistedState`], a daemon restart or an upgrade too.
     layouts: HashMap<AgentId, amux_proto::Layout>,
@@ -999,13 +1007,30 @@ impl Registry {
         self.broadcast_changes(agent, state_change, unread_change);
     }
 
-    /// Set (or clear) which agent the user is currently viewing. Focusing an agent clears its
-    /// unread bit and stamps its `last_opened` (the sidebar's MRU key — persisted and broadcast);
-    /// while focused, notable events on it won't re-mark it unread.
-    pub fn focus(&self, agent: Option<AgentId>) {
+    /// A control connection has completed its handshake: give it an identity for what the daemon
+    /// keeps per connection.
+    pub fn connect(&self) -> ConnectionId {
+        let mut state = self.state.lock().unwrap();
+        state.next_connection += 1;
+        ConnectionId(state.next_connection)
+    }
+
+    /// A control connection has gone: forget what it focused, and only that. Nothing is
+    /// broadcast — focus is not part of any client's view.
+    pub fn disconnect(&self, connection: ConnectionId) {
+        self.state.lock().unwrap().focused.remove(&connection);
+    }
+
+    /// Set (or clear) which agent `connection` is viewing. Focusing an agent clears its unread bit
+    /// and stamps its `last_opened` (the sidebar's MRU key — persisted and broadcast); while any
+    /// connection has it focused, notable events on it won't re-mark it unread.
+    pub fn focus(&self, connection: ConnectionId, agent: Option<AgentId>) {
         let (opened, cleared) = {
             let mut state = self.state.lock().unwrap();
-            state.focused = agent;
+            match agent {
+                Some(id) => state.focused.insert(connection, id),
+                None => state.focused.remove(&connection),
+            };
             match agent.and_then(|id| state.agents.get_mut(&id).map(|a| (id, a))) {
                 Some((id, a)) => {
                     let at = Utc::now();
@@ -1408,7 +1433,7 @@ fn write_atomic(path: &Path, state: &PersistedState) -> Result<()> {
 }
 
 /// Apply `next` to `id` inside the locked state: update the state + activity, and flag the agent
-/// unread on a notable transition — unless it's the agent the user is currently viewing. Returns
+/// unread on a notable transition — unless some connection is viewing it. Returns
 /// `(state change, unread change)` for the caller to broadcast. A no-op transition returns
 /// `(None, None)`.
 fn set_state(
@@ -1416,7 +1441,7 @@ fn set_state(
     id: AgentId,
     next: AgentState,
 ) -> (Option<AgentState>, Option<bool>) {
-    let focused = state.focused;
+    let watched = state.focused.values().any(|a| *a == id);
     let Some(agent) = state.agents.get_mut(&id) else {
         return (None, None);
     };
@@ -1427,7 +1452,7 @@ fn set_state(
     }
     let notable = is_notable_transition(&prev, &next);
     agent.state = next.clone();
-    let unread_change = if notable && focused != Some(id) && !agent.unread {
+    let unread_change = if notable && !watched && !agent.unread {
         agent.unread = true;
         Some(true)
     } else {

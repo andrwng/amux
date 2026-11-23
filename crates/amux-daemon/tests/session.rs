@@ -1470,7 +1470,7 @@ async fn durable_state_survives_a_daemon_restart() {
         let mini = registry.create(repo_id, "mini", None).unwrap();
         registry.set_minis(vec![mini.id]);
         registry.set_active(Some(info.id));
-        registry.focus(Some(info.id));
+        registry.focus(registry.connect(), Some(info.id));
         info
     };
     assert!(state_path.exists(), "state.json is written");
@@ -1866,7 +1866,7 @@ async fn a_dispatched_task_survives_a_daemon_restart() {
     let adapter = Box::new(ClaudeAdapter::with_command(vec!["cat".into()]));
     let registry = Registry::with_state(adapter, state_path.clone());
     registry.load_state();
-    registry.focus(Some(dispatched.id)); // any mutation that triggers save()
+    registry.focus(registry.connect(), Some(dispatched.id)); // any mutation that triggers save()
 
     assert_eq!(
         prompt_of(&state_path, dispatched.id).as_deref(),
@@ -2028,4 +2028,151 @@ async fn daemon_singleton_lock_prevents_a_second_daemon() {
         third.is_some(),
         "a new daemon claims the singleton after the holder exits"
     );
+}
+
+/// Drive one real turn (activity, then finish) on `agent` through the mailbox.
+async fn finish_a_turn(client: &mut Client, mailbox: &Path, agent: AgentId) {
+    send_hook(
+        mailbox,
+        HookReport {
+            agent,
+            event: hook("PreToolUse", None, None),
+        },
+    )
+    .await;
+    assert!(wait_for_state(client, agent, |s| matches!(s, AgentState::Working)).await);
+    send_hook(
+        mailbox,
+        HookReport {
+            agent,
+            event: hook("Stop", None, None),
+        },
+    )
+    .await;
+    assert!(wait_for_state(client, agent, |s| matches!(s, AgentState::Idle)).await);
+}
+
+/// The unread bit of every agent, as a fresh `ListAgents` reports it.
+async fn unread_bits(client: &mut Client) -> std::collections::HashMap<AgentId, bool> {
+    client.send(ClientMsg::ListAgents).await.unwrap();
+    tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            if let Some(Ok(DaemonMsg::Agents(list))) = client.next().await {
+                return list.into_iter().map(|a| (a.id, a.unread)).collect();
+            }
+        }
+    })
+    .await
+    .expect("Agents reply")
+}
+
+/// Focus belongs to the connection that set it. Regression: any client disconnecting cleared the
+/// focus for every client, so a second terminal client (or a command that connects and leaves)
+/// made the agent you were watching go unread on its next finish.
+#[tokio::test]
+async fn a_disconnect_clears_only_its_own_focus() {
+    let tmp = tempfile::tempdir().unwrap();
+    let repo = tmp.path().join("repo");
+    std::fs::create_dir(&repo).unwrap();
+    init_repo(&repo);
+    let worktrees = WorktreeService::with_base(&repo, tmp.path().join("wt")).unwrap();
+    let registry = Registry::new(Box::new(ClaudeAdapter::with_command(vec!["cat".into()])));
+    let repo_id = registry.register(worktrees).id;
+    let socket = tmp.path().join("amuxd.sock");
+    tokio::spawn(serve(
+        UnixListener::bind(&socket).unwrap(),
+        registry.clone(),
+    ));
+    let mailbox = tmp.path().join("hooks.sock");
+    tokio::spawn(serve_mailbox(
+        bind_mailbox(&mailbox).unwrap(),
+        registry.clone(),
+    ));
+
+    let mut watcher = handshake(&socket).await;
+    let watched = create_agent(&mut watcher, repo_id, "feat/watched").await.id;
+    let other = create_agent(&mut watcher, repo_id, "feat/other").await.id;
+    watcher
+        .send(ClientMsg::Focus {
+            agent: Some(watched),
+        })
+        .await
+        .unwrap();
+
+    // A second client focuses the other agent, then goes away.
+    let mut passer_by = handshake(&socket).await;
+    passer_by
+        .send(ClientMsg::Focus { agent: Some(other) })
+        .await
+        .unwrap();
+    // Round-trip so the daemon has applied the focus before the disconnect.
+    unread_bits(&mut passer_by).await;
+    drop(passer_by);
+    tokio::time::sleep(Duration::from_millis(100)).await;
+
+    // The watcher is still looking at `watched`: its finish stays read. Nobody is looking at
+    // `other` any more: its finish is unread.
+    finish_a_turn(&mut watcher, &mailbox, watched).await;
+    finish_a_turn(&mut watcher, &mailbox, other).await;
+    let bits = unread_bits(&mut watcher).await;
+    assert!(
+        !bits[&watched],
+        "the watcher's focus survived the other disconnect"
+    );
+    assert!(bits[&other], "the departed client's focus went with it");
+}
+
+/// Unread means "not focused by any connection": an agent either client has focused stays read.
+#[tokio::test]
+async fn an_agent_focused_by_any_client_stays_read() {
+    let tmp = tempfile::tempdir().unwrap();
+    let repo = tmp.path().join("repo");
+    std::fs::create_dir(&repo).unwrap();
+    init_repo(&repo);
+    let worktrees = WorktreeService::with_base(&repo, tmp.path().join("wt")).unwrap();
+    let registry = Registry::new(Box::new(ClaudeAdapter::with_command(vec!["cat".into()])));
+    let repo_id = registry.register(worktrees).id;
+    let socket = tmp.path().join("amuxd.sock");
+    tokio::spawn(serve(
+        UnixListener::bind(&socket).unwrap(),
+        registry.clone(),
+    ));
+    let mailbox = tmp.path().join("hooks.sock");
+    tokio::spawn(serve_mailbox(
+        bind_mailbox(&mailbox).unwrap(),
+        registry.clone(),
+    ));
+
+    let mut a = handshake(&socket).await;
+    let mut b = handshake(&socket).await;
+    let first = create_agent(&mut a, repo_id, "feat/first").await.id;
+    let second = create_agent(&mut a, repo_id, "feat/second").await.id;
+    let third = create_agent(&mut a, repo_id, "feat/third").await.id;
+    a.send(ClientMsg::Focus { agent: Some(first) })
+        .await
+        .unwrap();
+    b.send(ClientMsg::Focus {
+        agent: Some(second),
+    })
+    .await
+    .unwrap();
+    unread_bits(&mut a).await;
+    unread_bits(&mut b).await;
+
+    for agent in [first, second, third] {
+        finish_a_turn(&mut a, &mailbox, agent).await;
+    }
+    let bits = unread_bits(&mut a).await;
+    assert!(!bits[&first], "focused by a");
+    assert!(!bits[&second], "focused by b");
+    assert!(bits[&third], "focused by neither");
+
+    // b moving its focus back to the sidebar leaves a's focus alone.
+    b.send(ClientMsg::Focus { agent: None }).await.unwrap();
+    unread_bits(&mut b).await;
+    finish_a_turn(&mut a, &mailbox, first).await;
+    finish_a_turn(&mut a, &mailbox, second).await;
+    let bits = unread_bits(&mut a).await;
+    assert!(!bits[&first], "still focused by a");
+    assert!(bits[&second], "b looked away");
 }
