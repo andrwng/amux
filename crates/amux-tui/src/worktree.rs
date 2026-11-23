@@ -1042,8 +1042,8 @@ mod tests {
         );
     }
 
-    /// A terminal client in the test: handshake, then optionally a focus (which counts as the user
-    /// acting in it).
+    /// A terminal client in the test: handshake, then a focus (which makes it a terminal client,
+    /// though not one the user has acted in).
     async fn terminal_client(d: &Daemon, focus: Option<AgentId>) -> Connection {
         let mut c = Framed::new(
             UnixStream::connect(&d.socket).await.unwrap(),
@@ -1087,14 +1087,9 @@ mod tests {
         let b = d.registry.create(repo, "feat/b", None).unwrap().id;
         let mut older = terminal_client(&d, Some(a)).await;
         let mut newer = terminal_client(&d, Some(a)).await;
-        // The user goes back to the first client: it is now the most recently used.
-        older.send(ClientMsg::Focus { agent: None }).await.unwrap();
-        older.send(ClientMsg::ListWorktrees).await.unwrap();
-        loop {
-            if let Some(Ok(DaemonMsg::Worktrees { .. })) = older.next().await {
-                break;
-            }
-        }
+        // The user goes back to the first client and types: it is now the most recently used.
+        older.send(type_in()).await.unwrap();
+        round_trip(&mut older).await;
         let agents_before = d.registry.infos().len();
 
         assert_eq!(open_over(connect(&d).await, b).await.unwrap(), "");
@@ -1114,6 +1109,54 @@ mod tests {
             .unwrap_err();
         assert!(matches!(err, CommandError::NoSuchWorktree));
         assert_eq!(err.exit_code(), 1);
+    }
+
+    /// What a terminal client sends by itself on (re)connecting — its focus and active agent —
+    /// is not the user acting there: `open` still goes to the client the user typed in, though
+    /// the idle one reconnected after.
+    #[tokio::test]
+    async fn a_client_reconnecting_by_itself_does_not_become_the_one_used_last() {
+        let d = daemon().await;
+        let repo = d.registry.repos()[0].id;
+        let a = d.registry.create(repo, "feat/a", None).unwrap().id;
+        let b = d.registry.create(repo, "feat/b", None).unwrap().id;
+        let mut used = terminal_client(&d, Some(a)).await;
+        let idle = terminal_client(&d, Some(a)).await;
+        used.send(type_in()).await.unwrap();
+        round_trip(&mut used).await;
+        // The idle client's connection drops; it reconnects and restores its view by itself.
+        drop(idle);
+        let mut reconnected = terminal_client(&d, Some(a)).await;
+        reconnected
+            .send(ClientMsg::SetActive(Some(a)))
+            .await
+            .unwrap();
+        round_trip(&mut reconnected).await;
+
+        assert_eq!(open_over(connect(&d).await, b).await.unwrap(), "");
+        assert!(
+            asked_to_show(&mut used, b).await,
+            "the client typed in is asked"
+        );
+        assert!(!asked_to_show(&mut reconnected, b).await);
+    }
+
+    /// A keystroke in a pane: the user acting in this client.
+    fn type_in() -> ClientMsg {
+        ClientMsg::Input {
+            terminal: amux_core::agent::TerminalId::new(),
+            bytes: b"x".to_vec(),
+        }
+    }
+
+    /// Wait until the daemon has applied what `c` sent so far.
+    async fn round_trip(c: &mut Connection) {
+        c.send(ClientMsg::ListWorktrees).await.unwrap();
+        loop {
+            if let Some(Ok(DaemonMsg::Worktrees { .. })) = c.next().await {
+                return;
+            }
+        }
     }
 
     #[tokio::test]

@@ -345,13 +345,15 @@ async fn handle_command(
     attached: &mut Attachments,
     scroll: &mut ScrollPositions,
 ) {
-    // What the user does in a client makes it the one `amux worktree open` asks.
+    // What the user does in a client makes it the one `amux worktree open` asks: typing into a
+    // pane, or scrolling one. Focus and the active agent do not count — a terminal client also
+    // sends them by itself (restoring its view on connect, following a pane that went away), so
+    // they mark it only as a terminal client.
     match &msg {
-        ClientMsg::Input { .. }
-        | ClientMsg::Focus { .. }
-        | ClientMsg::Scroll { .. }
-        | ClientMsg::SetActive(_) => registry.note_input(connection),
-        ClientMsg::Attach { .. } => registry.note_viewer(connection),
+        ClientMsg::Input { .. } | ClientMsg::Scroll { .. } => registry.note_input(connection),
+        ClientMsg::Attach { .. } | ClientMsg::Focus { .. } | ClientMsg::SetActive(_) => {
+            registry.note_viewer(connection)
+        }
         _ => {}
     }
     let report_err = |result: Result<()>| {

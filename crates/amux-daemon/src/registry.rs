@@ -1156,8 +1156,8 @@ impl Registry {
         }
     }
 
-    /// The user acted in `connection` (typed into a pane, moved focus, scrolled): it becomes the
-    /// most recently used client.
+    /// The user acted in `connection` (typed into a pane, or scrolled one): it becomes the most
+    /// recently used client.
     pub fn note_input(&self, connection: ConnectionId) {
         let mut state = self.state.lock().unwrap();
         state.next_input += 1;

@@ -669,9 +669,11 @@ both sides refuse mismatches.
 > needs nothing: it escapes control characters itself.
 >
 > **Showing a worktree from outside (v22).** `OpenWorktree { worktree }` asks the daemon to send
-> `ShowWorktree` to **one** terminal client — the one the user acted in most recently (`Input`,
-> `Focus`, `Scroll`, `SetActive` stamp a connection; one that has attached a terminal or reported
-> focus counts as a terminal client, a command never does) — and replies `WorktreeOpened`,
+> `ShowWorktree` to **one** terminal client — the one the user acted in most recently (only
+> `Input` and `Scroll` stamp a connection: a terminal client also sends `Focus` and `SetActive`
+> by itself, restoring its view on connect, so an idle client that reconnects would otherwise
+> take over; one that has attached a terminal, reported focus or set the active agent counts as
+> a terminal client, a command never does) — and replies `WorktreeOpened`,
 > `NoClientAttached` or `NoSuchWorktree`. The client then does what choosing the worktree there
 > does (open it in the main area; focus, unread and last opened follow), with two cautious
 > exceptions: a worktree with no running agent only gets the sidebar cursor, because attaching
