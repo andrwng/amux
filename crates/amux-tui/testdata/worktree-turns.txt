@@ -1,0 +1,13 @@
+#40 agent 2026-11-22T10:40:00Z
+synthetic earlier reply
+
+-- new session session-b --
+
+#41 user 2026-11-22T10:41:00Z
+synthetic prompt
+
+#42 agent 2026-11-22T10:42:00Z (clipped)
+synthetic head
+[… clipped by amux …]
+synthetic tail
+

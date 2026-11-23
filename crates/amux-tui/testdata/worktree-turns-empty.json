@@ -1,0 +1,9 @@
+{
+  "schema": 1,
+  "instance": {
+    "id": "6f1d2c3b-4a59-4e68-9d7c-8b9a0f1e2d3c",
+    "daemon_started_at": "2026-11-22T09:00:00Z"
+  },
+  "worktree": "00000000-0000-4000-8000-000000000001",
+  "turns": []
+}

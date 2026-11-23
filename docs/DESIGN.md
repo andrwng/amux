@@ -631,6 +631,19 @@ both sides refuse mismatches.
 > the daemon holds the position and re-bases it past output that has arrived since (§5.2), so a
 > keypress means what the user saw; and because deltas compose, so a spun wheel needs no in-flight
 > bookkeeping on either side.
+>
+> **Read-only requests for commands (v22).** `ListWorktrees` → `Worktrees { instance, worktrees }`
+> and `Turns { worktree, after, limit }` → `Turns { instance, worktree, first_seq, last_seq, turns }`
+> (or `NoSuchWorktree`) serve `amux worktree list` and `amux worktree turns`. They change nothing:
+> not unread, not last opened, not focus (which is per connection, §7.3). A `WorktreeInfo` carries
+> `agent` only for a process this daemon run launched — after a restart a worktree is suspended
+> and its stored state is a placeholder, so it reads as "no agent" rather than a made-up exit.
+> A `Turns` reply holds at most 200 entries and about 1 MiB of text, well inside the 4 MiB frame
+> cap even for 200 entries of 24 KiB; the caller pages on with `after`. `instance` is an id made
+> once and kept in `<amux_home>/instance-id`, plus when this daemon started, so a reader can tell
+> one amux, or one daemon run, from another. The commands print JSON from types they own
+> (`amux-tui/src/worktree.rs`, `schema: 1`), never a serialised protocol type, so the wire can
+> change without changing what a script reads.
 
 ```rust
 enum ClientMsg {

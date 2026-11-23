@@ -63,6 +63,7 @@ dependencies = [
  "tokio-util",
  "tracing",
  "tracing-subscriber",
+ "uuid",
  "vt100",
 ]
 
@@ -92,7 +93,10 @@ dependencies = [
  "crossterm",
  "directories",
  "futures",
+ "git2",
  "ratatui",
+ "serde",
+ "serde_json",
  "tempfile",
  "thiserror 2.0.18",
  "tokio",

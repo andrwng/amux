@@ -347,3 +347,52 @@ async fn turn_text_reaches_the_log_and_nowhere_else() {
     let log = std::fs::read_to_string(file).unwrap();
     assert!(log.contains(SENTINEL_PROMPT) && log.contains(SENTINEL_REPLY));
 }
+
+/// `agent` in a worktree listing is the process of this daemon run: present while it runs and
+/// after it exits in this run (as `exited`), absent for a worktree reloaded from `state.json`.
+#[tokio::test]
+async fn a_listing_reports_an_agent_only_for_this_run() {
+    let f = fixture().await;
+    let listed = |r: &Registry| {
+        r.worktrees()
+            .into_iter()
+            .find(|w| w.id == f.agent)
+            .expect("listed")
+    };
+    assert!(matches!(
+        listed(&f.registry).agent.map(|a| a.state),
+        Some(AgentState::Idle)
+    ));
+
+    let primary = f
+        .registry
+        .infos()
+        .into_iter()
+        .find(|a| a.id == f.agent)
+        .unwrap()
+        .primary_terminal;
+    // End `cat` with an end-of-file.
+    f.registry
+        .session(primary)
+        .unwrap()
+        .write_input(b"\x04")
+        .unwrap();
+    wait_for_state(&f, |s| matches!(s, AgentState::Exited { .. })).await;
+    assert!(matches!(
+        listed(&f.registry).agent.map(|a| a.state),
+        Some(AgentState::Exited { .. })
+    ));
+
+    f.registry.save();
+    let reloaded = Registry::with_options(
+        Box::new(ClaudeAdapter::with_command(vec!["cat".into()])),
+        RegistryOptions {
+            state_path: Some(f.tmp.path().join("state.json")),
+            ..RegistryOptions::default()
+        },
+    );
+    reloaded.load_state();
+    let w = listed(&reloaded);
+    assert!(w.agent.is_none(), "no process after a restart");
+    assert_eq!(w.branch.as_deref(), Some("feat/talk"));
+}

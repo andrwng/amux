@@ -120,6 +120,7 @@ pub fn run_blocking(repo: PathBuf) -> Result<()> {
                 hooks: Some((mailbox.clone(), amux_exe)),
                 state_path: Some(state_path),
                 conversation_dir: Some(conversation_dir),
+                instance_id: Some(instance_id()?),
                 ..RegistryOptions::default()
             },
         );
@@ -147,6 +148,30 @@ pub fn run_blocking(repo: PathBuf) -> Result<()> {
         cleanup_if_owner(&pidfile, &[&socket, &mailbox], std::process::id());
         outcome
     })
+}
+
+/// This amux home's instance id: read from `<amux_home>/instance-id`, or made (a uuid) and kept
+/// there the first time. It is what lets a reader tell this amux from another one.
+fn instance_id() -> Result<String> {
+    let path = amux_core::paths::amux_home()?.join("instance-id");
+    read_or_make_instance_id(&path)
+}
+
+fn read_or_make_instance_id(path: &Path) -> Result<String> {
+    if let Ok(existing) = std::fs::read_to_string(path) {
+        let existing = existing.trim();
+        if uuid::Uuid::parse_str(existing).is_ok() {
+            return Ok(existing.to_string());
+        }
+    }
+    let id = uuid::Uuid::new_v4().to_string();
+    if let Some(dir) = path.parent() {
+        std::fs::create_dir_all(dir).with_context(|| format!("create {}", dir.display()))?;
+    }
+    let tmp = path.with_extension("tmp");
+    std::fs::write(&tmp, format!("{id}\n")).with_context(|| format!("write {}", tmp.display()))?;
+    std::fs::rename(&tmp, path).with_context(|| format!("rename into {}", path.display()))?;
+    Ok(id)
 }
 
 /// Stop a running daemon: SIGTERM the pid in the pidfile, but only after confirming it is alive
@@ -239,6 +264,20 @@ mod tests {
             "stop must refuse a dead pid, got: {err}"
         );
         assert!(!pidfile.exists(), "stop clears the stale pidfile");
+    }
+
+    #[test]
+    fn the_instance_id_is_made_once_and_kept() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("home").join("instance-id");
+        let first = read_or_make_instance_id(&path).unwrap();
+        assert!(uuid::Uuid::parse_str(&first).is_ok());
+        assert_eq!(read_or_make_instance_id(&path).unwrap(), first, "kept");
+        // A damaged file is replaced rather than served.
+        std::fs::write(&path, "not an id").unwrap();
+        let replaced = read_or_make_instance_id(&path).unwrap();
+        assert_ne!(replaced, "not an id");
+        assert_eq!(read_or_make_instance_id(&path).unwrap(), replaced);
     }
 
     #[test]

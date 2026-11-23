@@ -6,6 +6,7 @@
 use std::path::PathBuf;
 
 use amux_core::agent::{AgentId, AgentState, RepoId, TerminalId};
+use amux_core::conversation::Speaker;
 use amux_core::nav::{Axis, Dir};
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
@@ -60,6 +61,74 @@ pub struct AgentInfo {
     pub unread: bool,
     /// The terminal that shows this agent's CLI (what "open in a pane" attaches to).
     pub primary_terminal: TerminalId,
+}
+
+/// Which amux answered: an id made once for this amux home and kept there, and when this daemon
+/// started. Lets a reader tell this amux from another one, and a restarted daemon from the last.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct InstanceInfo {
+    pub id: String,
+    pub daemon_started_at: DateTime<Utc>,
+}
+
+/// One worktree as a command reads it: everything amux knows about the entry, whether or not an
+/// agent is attached. Richer than [`AgentInfo`] (the sidebar's row), and read-only.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WorktreeInfo {
+    /// The worktree's id — the agent id amux keeps for the entry.
+    pub id: AgentId,
+    pub repo: RepoInfo,
+    pub name: String,
+    /// `None` for a HEAD session (the repository's own checkout, no branch of its own).
+    pub branch: Option<String>,
+    /// The working directory the agent runs in.
+    pub path: PathBuf,
+    /// The task the agent was dispatched with, if any.
+    pub task: Option<String>,
+    pub last_opened: DateTime<Utc>,
+    pub unread: bool,
+    /// The agent session amux now holds for the worktree (what a resume continues).
+    pub session: Option<String>,
+    /// The agent's process, when one is attached in this daemon run — or was, and exited in it.
+    /// `None` after a daemon restart and for a suspended worktree.
+    pub agent: Option<AgentStatus>,
+    /// The recorded conversation; `None` when nothing has been recorded.
+    pub conversation: Option<ConversationInfo>,
+}
+
+/// An attached agent's live status.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AgentStatus {
+    pub state: AgentState,
+    pub last_activity: DateTime<Utc>,
+}
+
+/// Where a worktree's conversation log starts and ends, and its newest entry (without its text).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ConversationInfo {
+    pub first_seq: u64,
+    pub last_seq: u64,
+    pub last: TurnHead,
+}
+
+/// A conversation entry without its text.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TurnHead {
+    pub seq: u64,
+    pub by: Speaker,
+    pub at: DateTime<Utc>,
+    pub session: Option<String>,
+}
+
+/// One conversation entry, as the daemon recorded it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TurnInfo {
+    pub seq: u64,
+    pub by: Speaker,
+    pub at: DateTime<Utc>,
+    pub text: String,
+    pub clipped: bool,
+    pub session: Option<String>,
 }
 
 /// Messages the client sends to the daemon.
@@ -146,6 +215,18 @@ pub enum ClientMsg {
     },
     /// Resize a terminal's PTY.
     Resize { terminal: TerminalId, size: Size },
+    /// Read-only: every worktree amux has, with its agent's status and conversation summary. The
+    /// daemon replies with `Worktrees`. Changes nothing (not unread, not last opened, not focus).
+    ListWorktrees,
+    /// Read-only: a worktree's conversation entries with a sequence number greater than `after`,
+    /// oldest first, at most `limit` (the daemon caps it, and returns fewer if the texts would
+    /// make the reply too large — page on by `after`). Replied to with `Turns`, or
+    /// `NoSuchWorktree`.
+    Turns {
+        worktree: AgentId,
+        after: u64,
+        limit: u32,
+    },
 }
 
 /// Messages the daemon sends to the client.
@@ -229,4 +310,20 @@ pub enum DaemonMsg {
     },
     /// A daemon-side error surfaced to the client.
     Error { message: String },
+    /// Reply to `ListWorktrees`.
+    Worktrees {
+        instance: InstanceInfo,
+        worktrees: Vec<WorktreeInfo>,
+    },
+    /// Reply to `Turns`. `first_seq`/`last_seq` are where the worktree's log starts and ends
+    /// (`None` when nothing has been recorded), whatever page `turns` is.
+    Turns {
+        instance: InstanceInfo,
+        worktree: AgentId,
+        first_seq: Option<u64>,
+        last_seq: Option<u64>,
+        turns: Vec<TurnInfo>,
+    },
+    /// A request named a worktree the daemon does not have.
+    NoSuchWorktree { worktree: AgentId },
 }

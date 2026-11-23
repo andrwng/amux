@@ -1,0 +1,5 @@
+ID                                    WORKTREE   AGENT            UNREAD  LAST TURN
+00000000-0000-4000-8000-000000000001  demo/auth  needs_attention  yes     #42 agent 2026-11-22 10:15
+00000000-0000-4000-8000-000000000002  demo/cli   exited                   #3 user 2026-11-22 10:15
+00000000-0000-4000-8000-000000000003  demo/HEAD  idle                     -
+00000000-0000-4000-8000-000000000004  demo/docs  -                        #7 agent 2026-11-22 10:15

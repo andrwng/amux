@@ -23,7 +23,10 @@ use amux_core::agent::{
 use amux_core::clock::{Clock, SystemClock};
 use amux_core::hook::{classify, HookReport, TurnReport};
 use amux_core::worktree::{WorktreeLocation, WorktreeService};
-use amux_proto::{AgentInfo, DaemonMsg, RepoInfo, Size};
+use amux_proto::{
+    AgentInfo, AgentStatus, ConversationInfo, DaemonMsg, InstanceInfo, RepoInfo, Size, TurnHead,
+    WorktreeInfo,
+};
 
 use crate::conversation::{ConversationLog, Entry, Summary};
 use crate::pty::Session;
@@ -101,6 +104,10 @@ struct Agent {
     /// Inbox unread bit — a notable moment the user hasn't seen yet (see `is_notable_transition`).
     unread: bool,
     primary: TerminalId,
+    /// Whether this agent's CLI has been launched by *this* daemon run. A worktree reloaded from
+    /// `state.json` is suspended, its state a placeholder, so a reader is told there is no agent
+    /// rather than a made-up `Exited`; one that ran and exited in this run reports the exit.
+    launched_this_run: bool,
 }
 
 impl Agent {
@@ -238,6 +245,9 @@ pub struct RegistryOptions {
     pub conversation_dir: Option<PathBuf>,
     /// The clock conversation entries are stamped with.
     pub clock: Arc<dyn Clock>,
+    /// This amux home's instance id (made once, kept under the home by the daemon); `None` makes
+    /// one up for this registry alone.
+    pub instance_id: Option<String>,
 }
 
 impl Default for RegistryOptions {
@@ -248,6 +258,7 @@ impl Default for RegistryOptions {
             state_path: None,
             conversation_dir: None,
             clock: Arc::new(SystemClock),
+            instance_id: None,
         }
     }
 }
@@ -265,6 +276,8 @@ pub struct Registry {
     /// slow disk on a turn never stalls the state machine. `None` when recording is off.
     conversation: Option<Mutex<ConversationLog>>,
     clock: Arc<dyn Clock>,
+    /// Which amux this is, for readers that must tell one from another.
+    instance: InstanceInfo,
     adapter: Box<dyn AgentAdapter>,
     events: broadcast::Sender<DaemonMsg>,
     hooks: Option<HookIntegration>,
@@ -317,9 +330,16 @@ impl Registry {
                         None
                     }
                 });
+        let instance = InstanceInfo {
+            id: options
+                .instance_id
+                .unwrap_or_else(|| AgentId::new().to_full_string()),
+            daemon_started_at: options.clock.now(),
+        };
         Arc::new(Self {
             state: Mutex::new(State::default()),
             conversation,
+            instance,
             clock: options.clock,
             adapter,
             events,
@@ -606,6 +626,7 @@ impl Registry {
                     state: AgentState::Exited { code: None },
                     unread: a.unread,
                     primary: a.primary,
+                    launched_this_run: false,
                 },
             );
         }
@@ -689,6 +710,61 @@ impl Registry {
             .values()
             .map(Agent::info)
             .collect()
+    }
+
+    /// Which amux this is (sent with every read-only reply).
+    pub fn instance(&self) -> InstanceInfo {
+        self.instance.clone()
+    }
+
+    /// Every worktree, as a command reads it, in a stable order (repository path, then name, then
+    /// id). Read-only: nothing here touches unread, last opened or focus.
+    pub fn worktrees(&self) -> Vec<WorktreeInfo> {
+        let mut out: Vec<WorktreeInfo> = {
+            let state = self.state.lock().unwrap();
+            state
+                .agents
+                .values()
+                .filter_map(|a| {
+                    let repo = state.repos.get(&a.repo)?.info.clone();
+                    Some(WorktreeInfo {
+                        id: a.id,
+                        repo,
+                        name: a.workspace.name(),
+                        branch: a.workspace.branch().map(str::to_string),
+                        path: a.worktree.clone(),
+                        task: a.prompt.clone(),
+                        last_opened: a.last_opened,
+                        unread: a.unread,
+                        session: a.ai_session_id.clone(),
+                        agent: a.launched_this_run.then(|| AgentStatus {
+                            state: a.state.clone(),
+                            last_activity: a.last_activity,
+                        }),
+                        conversation: None,
+                    })
+                })
+                .collect()
+        };
+        if let Some(log) = &self.conversation {
+            let log = log.lock().unwrap();
+            for w in &mut out {
+                w.conversation = log.summary(w.id).map(|s| ConversationInfo {
+                    first_seq: s.first_seq,
+                    last_seq: s.last.seq,
+                    last: TurnHead {
+                        seq: s.last.seq,
+                        by: s.last.by,
+                        at: s.last.at,
+                        session: s.last.session.clone(),
+                    },
+                });
+            }
+        }
+        out.sort_by(|a, b| {
+            (&a.repo.path, &a.name, a.id.as_uuid()).cmp(&(&b.repo.path, &b.name, b.id.as_uuid()))
+        });
+        out
     }
 
     /// The live session for a terminal, if it has one.
@@ -791,6 +867,7 @@ impl Registry {
                 state: AgentState::Idle,
                 unread: false,
                 primary: terminal_id,
+                launched_this_run: true,
             };
             let info = agent.info();
             state.agents.insert(agent_id, agent);
@@ -877,6 +954,7 @@ impl Registry {
                 state: AgentState::Idle,
                 unread: false,
                 primary: terminal_id,
+                launched_this_run: true,
             };
             let info = agent.info();
             state.agents.insert(agent_id, agent);
@@ -1173,6 +1251,7 @@ impl Registry {
                     // Resuming lands back at the prompt — idle/waiting, not working (same reasoning
                     // as create): let hooks drive Working so we don't flash a false "⋯"/unread.
                     agent.state = AgentState::Idle;
+                    agent.launched_this_run = true;
                     let at = Utc::now();
                     agent.last_activity = at;
                     agent.last_opened = at;

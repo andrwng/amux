@@ -444,8 +444,53 @@ fn handle_command(
         ClientMsg::Scroll { terminal, lines } => {
             scroll_view(scroll, registry, out_tx, terminal, lines)
         }
+        ClientMsg::ListWorktrees => {
+            let _ = out_tx.send(DaemonMsg::Worktrees {
+                instance: registry.instance(),
+                worktrees: registry.worktrees(),
+            });
+        }
+        ClientMsg::Turns {
+            worktree,
+            after,
+            limit,
+        } => {
+            let limit = (limit as usize).min(MAX_TURNS_PER_REPLY);
+            let reply = match registry.turns(worktree, after, limit, MAX_TURNS_REPLY_BYTES) {
+                None => DaemonMsg::NoSuchWorktree { worktree },
+                Some(Ok(page)) => DaemonMsg::Turns {
+                    instance: registry.instance(),
+                    worktree,
+                    first_seq: page.summary.as_ref().map(|s| s.first_seq),
+                    last_seq: page.summary.as_ref().map(|s| s.last.seq),
+                    turns: page
+                        .turns
+                        .into_iter()
+                        .map(|e| amux_proto::TurnInfo {
+                            seq: e.seq,
+                            by: e.by,
+                            at: e.at,
+                            text: e.text,
+                            clipped: e.clipped,
+                            session: e.session,
+                        })
+                        .collect(),
+                },
+                // The error names the file, never its contents.
+                Some(Err(e)) => DaemonMsg::Error {
+                    message: format!("could not read the conversation log: {e:#}"),
+                },
+            };
+            let _ = out_tx.send(reply);
+        }
     }
 }
+
+/// The most entries one `Turns` reply carries, whatever the client asked for.
+const MAX_TURNS_PER_REPLY: usize = 200;
+/// About how much turn text one `Turns` reply carries: well inside the 4 MiB frame cap, so a page
+/// of 200 maximal (24 KiB) entries is cut short rather than failing to encode. The client pages on.
+const MAX_TURNS_REPLY_BYTES: usize = 1024 * 1024;
 
 /// Register a repo by path (idempotent). `register_path` broadcasts `RepoAdded` if it is new.
 fn register_repo(registry: &Arc<Registry>, path: &Path) -> Result<()> {

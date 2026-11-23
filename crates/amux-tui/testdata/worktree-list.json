@@ -1,0 +1,109 @@
+{
+  "schema": 1,
+  "instance": {
+    "id": "6f1d2c3b-4a59-4e68-9d7c-8b9a0f1e2d3c",
+    "daemon_started_at": "2026-11-22T09:00:00Z"
+  },
+  "worktrees": [
+    {
+      "id": "00000000-0000-4000-8000-000000000001",
+      "repository": {
+        "id": "c91f62dbdc9b8442",
+        "name": "demo",
+        "path": "/src/demo"
+      },
+      "name": "auth",
+      "branch": "feat/auth",
+      "path": "/home/u/.amux/worktrees/demo-1/auth",
+      "task": "synthetic task",
+      "last_opened": "2026-11-22T10:00:00Z",
+      "unread": true,
+      "session": "session-auth",
+      "agent": {
+        "state": "needs_attention",
+        "kind": "permission",
+        "message": "synthetic permission request",
+        "last_activity": "2026-11-22T10:16:00Z"
+      },
+      "conversation": {
+        "first_seq": 1,
+        "last_seq": 42,
+        "last": {
+          "seq": 42,
+          "by": "agent",
+          "at": "2026-11-22T10:15:00Z",
+          "session": "session-auth"
+        }
+      }
+    },
+    {
+      "id": "00000000-0000-4000-8000-000000000002",
+      "repository": {
+        "id": "c91f62dbdc9b8442",
+        "name": "demo",
+        "path": "/src/demo"
+      },
+      "name": "cli",
+      "branch": "feat/cli",
+      "path": "/home/u/.amux/worktrees/demo-1/cli",
+      "last_opened": "2026-11-22T10:00:00Z",
+      "unread": false,
+      "session": "session-cli",
+      "agent": {
+        "state": "exited",
+        "code": 1,
+        "last_activity": "2026-11-22T10:05:00Z"
+      },
+      "conversation": {
+        "first_seq": 1,
+        "last_seq": 3,
+        "last": {
+          "seq": 3,
+          "by": "user",
+          "at": "2026-11-22T10:15:00Z",
+          "session": "session-cli"
+        }
+      }
+    },
+    {
+      "id": "00000000-0000-4000-8000-000000000003",
+      "repository": {
+        "id": "c91f62dbdc9b8442",
+        "name": "demo",
+        "path": "/src/demo"
+      },
+      "name": "HEAD",
+      "path": "/src/demo",
+      "last_opened": "2026-11-22T10:00:00Z",
+      "unread": false,
+      "agent": {
+        "state": "idle",
+        "last_activity": "2026-11-22T09:30:00Z"
+      }
+    },
+    {
+      "id": "00000000-0000-4000-8000-000000000004",
+      "repository": {
+        "id": "c91f62dbdc9b8442",
+        "name": "demo",
+        "path": "/src/demo"
+      },
+      "name": "docs",
+      "branch": "feat/docs",
+      "path": "/home/u/.amux/worktrees/demo-1/docs",
+      "last_opened": "2026-11-22T10:00:00Z",
+      "unread": false,
+      "session": "session-docs",
+      "conversation": {
+        "first_seq": 1,
+        "last_seq": 7,
+        "last": {
+          "seq": 7,
+          "by": "agent",
+          "at": "2026-11-22T10:15:00Z",
+          "session": "session-before-clear"
+        }
+      }
+    }
+  ]
+}

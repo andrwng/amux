@@ -175,7 +175,15 @@ amux doctor                             # prune orphaned worktrees in this repo,
 amux daemon --stop                      # stop the daemon and every agent it owns
 amux --profile <blue|green|yellow|red>  # start the TUI with a border/accent color profile (default: blue),
                                          # to tell concurrent sessions apart
+amux worktree list [--json]             # every worktree: its agent's state, unread, and last prompt/reply
+amux worktree turns <id> [--after <n>] [--limit <n>] [--json]
+                                         # a worktree's recorded prompts and replies, oldest first
 ```
+
+The `worktree` commands are read-only, for scripts and status bars: they never start a daemon
+(exit 3 when none is running, 4 when it is another version of amux) and change nothing you see.
+amux records each worktree's prompts and the replies its agent stopped on, under
+`~/.amux/conversations/`, readable only by you, and deletes them with the worktree.
 
 ## Configuration
 

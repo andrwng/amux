@@ -962,7 +962,11 @@ impl App {
                 self.info = doctor_summary(&pruned, &skipped);
             }
             DaemonMsg::Error { message } => self.status = message,
-            DaemonMsg::Hello { .. } => {}
+            // Replies to the read-only command requests; the terminal client never sends them.
+            DaemonMsg::Hello { .. }
+            | DaemonMsg::Worktrees { .. }
+            | DaemonMsg::Turns { .. }
+            | DaemonMsg::NoSuchWorktree { .. } => {}
         }
         Ok(())
     }

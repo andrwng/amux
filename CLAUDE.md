@@ -24,7 +24,7 @@ cargo test --workspace                                 #
 
 The `amux` binary (`src/main.rs`) is thin dispatch: no args → TUI client · `amux daemon` → the
 daemon (normally auto-spawned) · `amux hook` → the Claude hook→mailbox bridge · `amux doctor` →
-prune orphaned worktrees.
+prune orphaned worktrees · `amux worktree …` → read-only commands that never start a daemon.
 
 ## The loop (every non-trivial task)
 
@@ -60,7 +60,7 @@ These come from `DESIGN.md` §2. Each is tagged with the crate that owns it.
    New runtime state lives in the daemon and reaches clients only as a `DaemonMsg`.
 3. **The daemon↔client boundary is `amux-proto` — and only that.** Never leak internal types across
    the wire. Any change to a wire message bumps `PROTO_VERSION` (`amux-proto/src/lib.rs`, currently
-   21) and updates the codec round-trip tests. *(Review-enforced: a missing bump compiles and
+   22) and updates the codec round-trip tests. *(Review-enforced: a missing bump compiles and
    passes CI but breaks a real client↔daemon pair — watch for it.)*
 4. **CLI-specifics live behind one seam.** Everything is agent-CLI-agnostic except `AgentAdapter`
    and `StatusSource` (`amux-core/src/adapter.rs`). Special-casing `"claude"` anywhere outside an
