@@ -183,8 +183,10 @@ amux worktree open <id>                 # show a worktree in the amux you used l
 
 The `worktree` commands are for scripts, status bars and notifications: they never start a
 daemon (exit 3 when none is running, 4 when it is another version of amux), and `list` and
-`turns` change nothing you see. `open` starts nothing either (exit 5 when no amux is open); a
-worktree whose agent is not running only gets the sidebar cursor, so `Enter` resumes it.
+`turns` change nothing you see. `open` starts nothing either (exit 5 when no amux is open). It
+exits 0 only when amux showed the worktree, and 6 when amux was asked but did not: a prompt is
+open there, or the worktree's agent is not running, which only moves the sidebar cursor to it so
+`Enter` resumes it.
 amux records each worktree's prompts and the replies its agent stopped on, under
 `~/.amux/conversations/`, readable only by you, and deletes them with the worktree.
 

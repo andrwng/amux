@@ -42,18 +42,25 @@ pub enum CommandError {
     BadId,
     #[error("no amux terminal client is attached")]
     NoClient,
+    #[error(
+        "the amux terminal client was asked but did not show the worktree \
+         (a prompt is open there, or the worktree's agent is not running)"
+    )]
+    NotShown,
     #[error("could not read from the amux daemon: {0:#}")]
     Other(anyhow::Error),
 }
 
 impl CommandError {
     /// The process exit code for this outcome: 3 no daemon, 4 another version, 5 no terminal
-    /// client attached (`open`), 1 anything else.
+    /// client attached (`open`), 6 the client was asked but did not show it (`open`), 1 anything
+    /// else.
     pub fn exit_code(&self) -> i32 {
         match self {
             CommandError::NoDaemon => 3,
             CommandError::VersionDiffers => 4,
             CommandError::NoClient => 5,
+            CommandError::NotShown => 6,
             CommandError::NoSuchWorktree | CommandError::BadId | CommandError::Other(_) => 1,
         }
     }
@@ -99,6 +106,9 @@ pub(crate) async fn open_over(
         DaemonMsg::WorktreeOpened { worktree: w } if w == worktree => Some(Ok(String::new())),
         DaemonMsg::NoClientAttached { worktree: w } if w == worktree => {
             Some(Err(CommandError::NoClient))
+        }
+        DaemonMsg::WorktreeNotShown { worktree: w } if w == worktree => {
+            Some(Err(CommandError::NotShown))
         }
         DaemonMsg::NoSuchWorktree { worktree: w } if w == worktree => {
             Some(Err(CommandError::NoSuchWorktree))
@@ -766,6 +776,7 @@ mod tests {
         assert_eq!(CommandError::NoDaemon.exit_code(), 3);
         assert_eq!(CommandError::VersionDiffers.exit_code(), 4);
         assert_eq!(CommandError::NoClient.exit_code(), 5);
+        assert_eq!(CommandError::NotShown.exit_code(), 6);
         assert_eq!(CommandError::NoSuchWorktree.exit_code(), 1);
         assert_eq!(CommandError::BadId.exit_code(), 1);
         assert_eq!(CommandError::Other(anyhow::anyhow!("x")).exit_code(), 1);
@@ -1092,11 +1103,12 @@ mod tests {
         round_trip(&mut older).await;
         let agents_before = d.registry.infos().len();
 
-        assert_eq!(open_over(connect(&d).await, b).await.unwrap(), "");
+        let open = open_in_background(&d, b);
         assert!(
-            asked_to_show(&mut older, b).await,
+            answer_show(&mut older, b, true).await,
             "the client used last is asked"
         );
+        assert_eq!(open.await.unwrap().unwrap(), "", "it showed it: exit 0");
         assert!(!asked_to_show(&mut newer, b).await, "the other is not");
         assert_eq!(
             d.registry.infos().len(),
@@ -1133,12 +1145,63 @@ mod tests {
             .unwrap();
         round_trip(&mut reconnected).await;
 
-        assert_eq!(open_over(connect(&d).await, b).await.unwrap(), "");
+        let open = open_in_background(&d, b);
         assert!(
-            asked_to_show(&mut used, b).await,
+            answer_show(&mut used, b, true).await,
             "the client typed in is asked"
         );
+        assert_eq!(open.await.unwrap().unwrap(), "");
         assert!(!asked_to_show(&mut reconnected, b).await);
+    }
+
+    /// `open` exits 0 only when the client showed the worktree. A client that was asked and did
+    /// not (a prompt open, no running agent), or went away before answering, is exit 6.
+    #[tokio::test]
+    async fn open_is_exit_6_when_the_client_does_not_show_it() {
+        let d = daemon().await;
+        let repo = d.registry.repos()[0].id;
+        let a = d.registry.create(repo, "feat/a", None).unwrap().id;
+        let mut client = terminal_client(&d, Some(a)).await;
+        let open = open_in_background(&d, a);
+        assert!(answer_show(&mut client, a, false).await);
+        let err = open.await.unwrap().unwrap_err();
+        assert!(matches!(err, CommandError::NotShown), "{err}");
+        assert_eq!(err.exit_code(), 6);
+
+        // Asked, and gone before answering.
+        let open = open_in_background(&d, a);
+        assert!(asked_to_show(&mut client, a).await);
+        drop(client);
+        let err = open.await.unwrap().unwrap_err();
+        assert!(matches!(err, CommandError::NotShown), "{err}");
+    }
+
+    /// `amux worktree open` on a task of its own, so the test can play the terminal client.
+    fn open_in_background(
+        d: &Daemon,
+        id: AgentId,
+    ) -> tokio::task::JoinHandle<Result<String, CommandError>> {
+        let socket = d.socket.clone();
+        tokio::spawn(async move {
+            let c = connect_to_running_daemon_at(&socket, Duration::from_secs(2))
+                .await
+                .unwrap();
+            open_over(c, id).await
+        })
+    }
+
+    /// Wait (briefly) to be asked to show `id`, and answer as a terminal client would.
+    async fn answer_show(c: &mut Connection, id: AgentId, shown: bool) -> bool {
+        if !asked_to_show(c, id).await {
+            return false;
+        }
+        c.send(ClientMsg::WorktreeShown {
+            worktree: id,
+            shown,
+        })
+        .await
+        .unwrap();
+        true
     }
 
     /// A keystroke in a pane: the user acting in this client.

@@ -457,11 +457,21 @@ async fn handle_command(
         }
         ClientMsg::OpenWorktree { worktree } => {
             let reply = match registry.open_worktree(worktree) {
-                OpenOutcome::Asked => DaemonMsg::WorktreeOpened { worktree },
+                // Exit 0 for the command only once the client says it showed it. This
+                // connection waits for that (it asked); no other does.
+                OpenOutcome::Asked(answer) => {
+                    match tokio::time::timeout(SHOW_ANSWER_TIMEOUT, answer).await {
+                        Ok(Ok(true)) => DaemonMsg::WorktreeOpened { worktree },
+                        _ => DaemonMsg::WorktreeNotShown { worktree },
+                    }
+                }
                 OpenOutcome::NoClient => DaemonMsg::NoClientAttached { worktree },
                 OpenOutcome::NoSuchWorktree => DaemonMsg::NoSuchWorktree { worktree },
             };
             let _ = out_tx.send(reply);
+        }
+        ClientMsg::WorktreeShown { worktree, shown } => {
+            registry.worktree_shown(connection, worktree, shown)
         }
         ClientMsg::ListWorktrees => {
             let _ = out_tx.send(DaemonMsg::Worktrees {
@@ -512,6 +522,10 @@ async fn handle_command(
         }
     }
 }
+
+/// How long `OpenWorktree` waits for the terminal client to say whether it showed the worktree
+/// before answering "not shown" — well inside the command's own wait for the reply.
+const SHOW_ANSWER_TIMEOUT: Duration = Duration::from_secs(2);
 
 /// The most entries one `Turns` reply carries, whatever the client asked for.
 const MAX_TURNS_PER_REPLY: usize = 200;

@@ -32,7 +32,7 @@ pub use message::{
 /// survives a TUI restart, restored on reconnect like the active agent); v21 the grid size rides
 /// `OutputSnapshot` (the daemon grid is grow-only, the client sizes its parser to it);
 /// v22 worktree conversations (ListWorktrees + Worktrees, Turns + Turns, NoSuchWorktree — read-only
-/// requests for `amux worktree list`/`turns`; OpenWorktree + ShowWorktree, WorktreeOpened,
-/// NoClientAttached for `amux worktree open`; also covers the mailbox's new `PaneMessage::Turn`, so
+/// requests for `amux worktree list`/`turns`; OpenWorktree + ShowWorktree, WorktreeShown,
+/// WorktreeOpened, WorktreeNotShown, NoClientAttached for `amux worktree open`; also covers the mailbox's new `PaneMessage::Turn`, so
 /// a daemon from before recording is replaced at the upgrade rather than silently dropping turns).
 pub const PROTO_VERSION: u32 = 22;

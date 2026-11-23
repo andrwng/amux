@@ -150,13 +150,20 @@ struct ClientEntry {
     viewer: bool,
     /// When the user last acted in it ([`Registry::note_input`]); 0 for never.
     last_input: u64,
+    /// The `ShowWorktree` requests sent to it and not yet answered, oldest first, each with
+    /// where its answer goes. Bounded by [`MAX_PENDING_SHOWS`]; dropping one answers "not shown".
+    pending_shows: std::collections::VecDeque<(AgentId, tokio::sync::oneshot::Sender<bool>)>,
 }
 
+/// The most unanswered `ShowWorktree` requests kept per client; past it the oldest is dropped.
+const MAX_PENDING_SHOWS: usize = 8;
+
 /// What became of an `amux worktree open` request.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug)]
 pub enum OpenOutcome {
-    /// The most recently used terminal client was asked to show the worktree.
-    Asked,
+    /// The most recently used terminal client was asked to show the worktree; its answer
+    /// (whether it showed it) arrives here. A client that goes away first drops the sender.
+    Asked(tokio::sync::oneshot::Receiver<bool>),
     /// No terminal client is attached.
     NoClient,
     /// The daemon has no such worktree.
@@ -1170,6 +1177,7 @@ impl Registry {
                 tx,
                 viewer: false,
                 last_input: 0,
+                pending_shows: std::collections::VecDeque::new(),
             },
         );
         id
@@ -1198,20 +1206,48 @@ impl Registry {
     /// user had chosen it there. Starts nothing: no client, no agent, no window. Ties (clients the
     /// user has not acted in yet) go to the one that connected last.
     pub fn open_worktree(&self, worktree: AgentId) -> OpenOutcome {
-        let state = self.state.lock().unwrap();
+        let mut state = self.state.lock().unwrap();
         if !state.agents.contains_key(&worktree) {
             return OpenOutcome::NoSuchWorktree;
         }
         let chosen = state
             .clients
-            .iter()
+            .iter_mut()
             .filter(|(_, c)| c.viewer && !c.tx.is_closed())
             .max_by_key(|(id, c)| (c.last_input, id.0));
-        match chosen {
-            Some((_, c)) if c.tx.send(DaemonMsg::ShowWorktree { worktree }).is_ok() => {
-                OpenOutcome::Asked
+        let Some((_, client)) = chosen else {
+            return OpenOutcome::NoClient;
+        };
+        if client
+            .tx
+            .send(DaemonMsg::ShowWorktree { worktree })
+            .is_err()
+        {
+            return OpenOutcome::NoClient;
+        }
+        let (answer_tx, answer_rx) = tokio::sync::oneshot::channel();
+        if client.pending_shows.len() >= MAX_PENDING_SHOWS {
+            client.pending_shows.pop_front();
+        }
+        client.pending_shows.push_back((worktree, answer_tx));
+        OpenOutcome::Asked(answer_rx)
+    }
+
+    /// `connection` answered a `ShowWorktree` for `worktree`: pass on whether it showed it, to the
+    /// oldest request of that worktree it has not answered yet.
+    pub fn worktree_shown(&self, connection: ConnectionId, worktree: AgentId, shown: bool) {
+        let mut state = self.state.lock().unwrap();
+        let Some(client) = state.clients.get_mut(&connection) else {
+            return;
+        };
+        if let Some(i) = client
+            .pending_shows
+            .iter()
+            .position(|(w, _)| *w == worktree)
+        {
+            if let Some((_, answer)) = client.pending_shows.remove(i) {
+                let _ = answer.send(shown);
             }
-            _ => OpenOutcome::NoClient,
         }
     }
 

@@ -962,13 +962,19 @@ impl App {
                 self.info = doctor_summary(&pruned, &skipped);
             }
             DaemonMsg::Error { message } => self.status = message,
-            DaemonMsg::ShowWorktree { worktree } => self.show_worktree(worktree, sink).await?,
+            DaemonMsg::ShowWorktree { worktree } => {
+                let shown = self.show_worktree(worktree, sink).await?;
+                // The daemon waits for this to tell `amux worktree open` what happened.
+                sink.send(ClientMsg::WorktreeShown { worktree, shown })
+                    .await?;
+            }
             // Replies to the command requests; the terminal client never sends them.
             DaemonMsg::Hello { .. }
             | DaemonMsg::Worktrees { .. }
             | DaemonMsg::Turns { .. }
             | DaemonMsg::NoSuchWorktree { .. }
             | DaemonMsg::WorktreeOpened { .. }
+            | DaemonMsg::WorktreeNotShown { .. }
             | DaemonMsg::NoClientAttached { .. } => {}
         }
         Ok(())
@@ -2696,19 +2702,23 @@ impl App {
     /// the sidebar is then one key away. And
     /// while a prompt is open (a new branch, a delete confirm, a search) nothing moves; a notice
     /// says why.
-    async fn show_worktree(&mut self, id: AgentId, sink: &mut Sink) -> Result<()> {
+    ///
+    /// Returns whether the worktree was shown (opened in the main area): `false` in both
+    /// exceptions and for an id this client does not know.
+    async fn show_worktree(&mut self, id: AgentId, sink: &mut Sink) -> Result<bool> {
         let Some(agent) = self.agents.iter().find(|a| a.id == id) else {
-            return Ok(());
+            return Ok(false);
         };
         if self.input != InputMode::Normal {
             self.info = "amux worktree open: finish this prompt first".to_string();
-            return Ok(());
+            return Ok(false);
         }
         if matches!(agent.state, AgentState::Exited { .. }) {
             self.place_sidebar_sel(Row::Agent(id));
-            return Ok(());
+            return Ok(false);
         }
-        self.open_agent(id, sink).await
+        self.open_agent(id, sink).await?;
+        Ok(true)
     }
 
     /// The agent the user is currently viewing: the one owning the focused terminal (when focus
@@ -8846,6 +8856,50 @@ mod tests {
     }
 
     /// An id this client does not know is ignored.
+    /// The client answers whether it showed the worktree, so `amux worktree open` can say so:
+    /// yes for a running agent; no while a prompt is open, for an agent that is not running, or
+    /// for an id it does not know.
+    #[tokio::test]
+    async fn show_worktree_answers_whether_it_showed_it() {
+        async fn answer(
+            server: &mut Framed<UnixStream, amux_proto::ServerCodec>,
+        ) -> Option<(AgentId, bool)> {
+            while let Some(msg) = next_msg(server).await {
+                if let ClientMsg::WorktreeShown { worktree, shown } = msg {
+                    return Some((worktree, shown));
+                }
+            }
+            None
+        }
+        let (mut app, ids) = app_with_agents(3);
+        let (mut sink, mut server) = test_server();
+        let _ = app.swap_to_agent(ids[0]);
+        app.on_daemon(DaemonMsg::ShowWorktree { worktree: ids[1] }, &mut sink)
+            .await
+            .unwrap();
+        assert_eq!(answer(&mut server).await, Some((ids[1], true)));
+
+        app.agents[2].state = AgentState::Exited { code: None };
+        let stopped = app.agents[2].id;
+        app.on_daemon(DaemonMsg::ShowWorktree { worktree: stopped }, &mut sink)
+            .await
+            .unwrap();
+        assert_eq!(answer(&mut server).await, Some((stopped, false)));
+
+        app.input = InputMode::Searching;
+        app.on_daemon(DaemonMsg::ShowWorktree { worktree: ids[0] }, &mut sink)
+            .await
+            .unwrap();
+        assert_eq!(answer(&mut server).await, Some((ids[0], false)));
+        app.input = InputMode::Normal;
+
+        let unknown = AgentId::new();
+        app.on_daemon(DaemonMsg::ShowWorktree { worktree: unknown }, &mut sink)
+            .await
+            .unwrap();
+        assert_eq!(answer(&mut server).await, Some((unknown, false)));
+    }
+
     #[tokio::test]
     async fn show_worktree_ignores_an_unknown_id() {
         let (mut app, ids) = app_with_agents(1);

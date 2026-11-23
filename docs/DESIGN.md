@@ -679,12 +679,17 @@ both sides refuse mismatches.
 > `Input` and `Scroll` stamp a connection: a terminal client also sends `Focus` and `SetActive`
 > by itself, restoring its view on connect, so an idle client that reconnects would otherwise
 > take over; one that has attached a terminal, reported focus or set the active agent counts as
-> a terminal client, a command never does) — and replies `WorktreeOpened`,
-> `NoClientAttached` or `NoSuchWorktree`. The client then does what choosing the worktree there
-> does (open it in the main area; focus, unread and last opened follow), with two cautious
+> a terminal client, a command never does). The client then does what choosing the worktree
+> there does (open it in the main area; focus, unread and last opened follow), with two cautious
 > exceptions: a worktree with no running agent only gets the sidebar cursor, because attaching
 > its pane would resume the CLI and the command must never start work; and while a prompt is
-> open nothing moves under it. The daemon starts nothing: no client, no agent, no window.
+> open nothing moves under it. It answers `WorktreeShown { worktree, shown }`, `shown` false in
+> both exceptions (and for an id it does not know), and the daemon, which keeps up to 8
+> unanswered requests per client, waits up to 2 s for that answer before replying
+> `WorktreeOpened` (shown), `WorktreeNotShown` (asked, but not shown, or no answer: the client
+> went away or was slow), `NoClientAttached` or `NoSuchWorktree`. So `amux worktree open` exits 0
+> only when the worktree was shown, 6 when the client did not move, 5 with no client. The daemon
+> starts nothing: no client, no agent, no window.
 
 ```rust
 enum ClientMsg {

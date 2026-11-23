@@ -114,7 +114,7 @@ enum WorktreeCommand {
         json: bool,
     },
     /// Have the terminal client you used last show a worktree in its main pane. Starts nothing:
-    /// exits 5 when no terminal client is attached.
+    /// exits 5 when no terminal client is attached, 6 when it was asked but did not show it.
     Open {
         /// The worktree's id, as `amux worktree list` prints it.
         id: String,
