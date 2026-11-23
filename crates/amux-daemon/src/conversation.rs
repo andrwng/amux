@@ -58,6 +58,8 @@ pub struct Summary {
     pub first_seq: u64,
     pub last: EntryHead,
     entries: usize,
+    /// Trim once `entries` passes this: `MAX_ENTRIES + TRIM_SLACK`, or later after a failed trim.
+    trim_past: usize,
 }
 
 /// The per-worktree logs under one directory, plus the summaries of those loaded.
@@ -143,6 +145,7 @@ impl ConversationLog {
                     first_seq,
                     last,
                     entries,
+                    trim_past: MAX_ENTRIES + TRIM_SLACK,
                 },
             );
         }
@@ -179,18 +182,36 @@ impl ConversationLog {
             first_seq: seq,
             last: head(&entry),
             entries: 0,
+            trim_past: MAX_ENTRIES + TRIM_SLACK,
         });
         summary.last = head(&entry);
         summary.entries += 1;
-        if summary.entries > MAX_ENTRIES + TRIM_SLACK {
-            self.trim(agent)?;
+        if summary.entries > summary.trim_past {
+            // The entry is written whatever becomes of the trim, so a failed trim is reported as
+            // that, and not retried on every turn after it: only once another slack's worth of
+            // entries has arrived.
+            if let Err(e) = self.trim(agent) {
+                tracing::warn!("could not trim the conversation log of {agent}: {e:#}");
+                if let Some(summary) = self.summaries.get_mut(&agent) {
+                    summary.trim_past = summary.entries + TRIM_SLACK;
+                }
+            }
         }
         Ok(seq)
     }
 
     /// Rewrite `agent`'s log keeping only its newest [`MAX_ENTRIES`], beside the file and renamed
-    /// over it.
+    /// over it. On failure the temporary file is removed: the log it was to replace is whole.
     fn trim(&mut self, agent: AgentId) -> Result<()> {
+        let tmp = self.tmp_path(agent);
+        let result = self.rewrite_newest(agent);
+        if result.is_err() {
+            std::fs::remove_file(&tmp).ok();
+        }
+        result
+    }
+
+    fn rewrite_newest(&mut self, agent: AgentId) -> Result<()> {
         let path = self.path(agent);
         let tmp = self.tmp_path(agent);
         let all = read_entries(&path)?;
@@ -212,6 +233,7 @@ impl ConversationLog {
         if let (Some(first), Some(summary)) = (keep.first(), self.summaries.get_mut(&agent)) {
             summary.first_seq = first.seq;
             summary.entries = keep.len();
+            summary.trim_past = MAX_ENTRIES + TRIM_SLACK;
         }
         Ok(())
     }
@@ -486,6 +508,74 @@ mod tests {
         std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o755)).unwrap();
         ConversationLog::open(&dir).unwrap();
         assert_eq!(mode(&dir), 0o700);
+    }
+
+    /// A `Write` that appends into a shared buffer, for reading what was logged.
+    #[derive(Clone, Default)]
+    struct Captured(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
+
+    impl Write for Captured {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(buf);
+            Ok(buf.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    fn lines(path: &Path) -> usize {
+        std::fs::read(path)
+            .unwrap()
+            .iter()
+            .filter(|&&b| b == b'\n')
+            .count()
+    }
+
+    /// A trim that fails does not fail the append (the entry was written), says it was the trim
+    /// that failed, leaves no temporary file, and is not retried on the very next turn — only
+    /// after another slack's worth of turns, when it can succeed.
+    #[test]
+    fn a_failed_trim_keeps_the_entry_cleans_up_and_backs_off() {
+        let captured = Captured::default();
+        let writer = captured.clone();
+        let subscriber = tracing_subscriber::fmt()
+            .with_writer(move || writer.clone())
+            .finish();
+        let _guard = tracing::subscriber::set_default(subscriber);
+
+        let tmp = tempfile::tempdir().unwrap();
+        let mut log = ConversationLog::open(tmp.path()).unwrap();
+        let agent = AgentId::new();
+        let full = MAX_ENTRIES + TRIM_SLACK;
+        for i in 0..full {
+            log.append(agent, turn(Speaker::User, "q"), at(i as i64))
+                .unwrap();
+        }
+        // A leftover the trim cannot write over, so this trim fails.
+        let leftover = log.tmp_path(agent);
+        std::fs::write(&leftover, b"").unwrap();
+        std::fs::set_permissions(&leftover, std::fs::Permissions::from_mode(0o400)).unwrap();
+        let seq = log
+            .append(agent, turn(Speaker::User, "q"), at(0))
+            .expect("the entry was written; only the trim failed");
+        assert_eq!(seq, full as u64 + 1);
+        assert!(!leftover.exists(), "the temporary file is removed");
+        let logged = String::from_utf8(captured.0.lock().unwrap().clone()).unwrap();
+        assert!(
+            logged.contains("trim"),
+            "reported as a failed trim: {logged}"
+        );
+        let path = log.path(agent);
+        assert_eq!(lines(&path), full + 1);
+        // The next turn does not retry it...
+        log.append(agent, turn(Speaker::User, "q"), at(0)).unwrap();
+        assert_eq!(lines(&path), full + 2, "backed off");
+        // ...a slack's worth later it does, and succeeds.
+        for _ in 0..TRIM_SLACK {
+            log.append(agent, turn(Speaker::User, "q"), at(0)).unwrap();
+        }
+        assert_eq!(lines(&path), MAX_ENTRIES, "trimmed once it could be");
     }
 
     #[test]
