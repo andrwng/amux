@@ -502,7 +502,8 @@ gap, shared with tmux: vt100 has no DECOM, so CPR is absolute even under origin 
 The elegant part, and the payoff of the whole status thread:
 
 1. On `prepare_worktree`, `ClaudeAdapter` writes `.claude/settings.local.json` (gitignored)
-   with `Notification` + `Stop` hooks whose command is simply **`amux hook`**.
+   with `Notification`, `Stop`, `UserPromptSubmit`, `PreToolUse` and `PostToolUse` hooks whose
+   command is simply **`amux hook`**.
 2. At spawn, the daemon injects two env vars into the agent process:
    `AMUX_HOOK_SOCK` (the mailbox path) and `AMUX_AGENT_ID`.
 3. When Claude fires a hook, `amux hook` reads the hook JSON from stdin, tags it with the
@@ -517,6 +518,67 @@ Why this is good:
   concern (the daemon controls the full spawn env; agents are launched through a login shell
   so `PATH`, keys, direnv all match a normal terminal).
 - Reference plumbing exists: `disler/claude-code-hooks-multi-agent-observability`.
+
+**The conversation rides the same hooks.** amux hears every turn, so it keeps the two that
+explain an idle agent: the prompt (`prompt` on `UserPromptSubmit`) and the reply the agent
+stopped on (`last_assistant_message` on **every** `Stop` that carries one — when another `Stop`
+hook blocks, Claude continues and stops again, and that later `Stop`, with `stop_hook_active`
+true, carries the real closing reply; observed on Claude Code 2.1.330). Claude's field names are
+read in `amux-core/src/hook.rs` (`turn_from_hook`), and what leaves that seam is a CLI-agnostic
+`Turn` (who spoke, the text, the session). The transcript file is internal to Claude and is never
+read, so turns from before this feature, from a hook that did not arrive, or from a `claude` run
+by hand outside amux are simply not recorded.
+
+- **Its own message, on its own connection.** `amux hook` sends the status report first — the
+  same `PaneMessage::Hook`, byte for byte — and then a `PaneMessage::Turn` on a second
+  connection. The mailbox decodes one message per connection, so the two cannot affect each
+  other: a daemon from before turns existed applies the status and drops the turn (a variant
+  index it does not know), and a daemon with an old `amux hook` simply records nothing for that
+  agent.
+- **The turn may not hold the agent.** The hook runs inside the agent's turn, and a clipped turn
+  (~24 KiB) is three times what a macOS unix stream socket buffers by default (8 KiB), so against
+  a daemon that is not reading it would wait out the status report's 3 s bound. The turn's
+  connection therefore asks for a 64 KiB send buffer, so a turn normally lands in the kernel at
+  once, and has its own deadline of 250 ms for connect and write together; a turn not delivered
+  by then is dropped (the status report has already gone).
+- **Clipped before encoding.** The mailbox reads at most `MAX_REPORT_BYTES` (64 KiB); a larger
+  message would be cut short, fail to decode and be dropped whole. So `amux hook` clips the text
+  to `MAX_TURN_TEXT_BYTES` (24 KiB), keeping head and tail with a marker between, and sets
+  `clipped`. (In a week of real use the largest prompt was ~36 KB, the largest reply ~9 KB.)
+- **A bounded file per worktree, owned by the daemon** (`daemon/src/conversation.rs`):
+  `<amux_home>/conversations/<agent-id>.jsonl`, JSON lines of `{seq, by, at, text, clipped,
+  session}`. Never in `state.json`, which is rewritten whole on every save. `seq` starts at 1, rises
+  by one and is never reused; `at` is the daemon's `Clock` when the hook arrived. Past 2,000
+  entries (plus a slack of 200, so a full log is not copied on every turn) the file is rewritten
+  without the oldest — beside and renamed over, so a crash leaves one whole file — and its first
+  entry says where the log now starts. The daemon clips the text again by what it takes once
+  JSON-encoded (a control character is six bytes there), and the session to 256 bytes, so a stored
+  line is at most 25 KiB and a file at most about 55 MB, whatever the text is made of. At start the
+  daemon reads, per worktree, only the file's two ends: where the log starts and its newest
+  entry; a torn last line (a crash mid-append, possibly inside a multi-byte character) is cut off,
+  and a line that does not decode is skipped wherever it is. Deleting a worktree deletes its log,
+  and a turn racing the delete cannot leave one behind: a turn looks its worktree up while
+  holding that worktree's log lock, and delete removes the worktree from the state before it
+  removes the log under the same lock (a turn takes the log's lock, then the state's; delete never
+  holds the state's while taking the log's). At start, once `state.json` has been read, a log for
+  a worktree it does not name (a delete that never reached the log) is removed; if the state
+  cannot be read, none is.
+- **Off the async workers, a lock per worktree.** Appends and reads are blocking file I/O, run
+  with `spawn_blocking`: a turn from the mailbox (at most 32 waiting; past that a turn is dropped
+  with a warning naming only the worktree) and a `Turns` read for the connection that asked. Each
+  worktree's log has its own lock, and its summary another, so a slow read of one log holds up
+  neither another worktree's append nor a listing. The first read of a log builds an index of
+  each entry's byte offset (from the `{"seq":N` each line starts with, without decoding the rest);
+  appends extend it and a trim rebases it, so a page seeks to its first entry and decodes only its
+  own. A trim copies the kept lines as they are. A trim that fails costs only the trim: the entry
+  is kept, the temporary file removed, and the next attempt waits another 200 entries.
+- **Private.** The text is what the user typed, which can include a pasted secret: files are mode
+  `0600` in a `0700` directory, and turn text is never logged at any level, by `amux hook` or the
+  daemon (`turn_text_reaches_the_log_and_nowhere_else`).
+- **What a hook cannot tell us.** `/clear` fires no `UserPromptSubmit`; Claude ends the session
+  and starts a new one (`SessionEnd` then `SessionStart`, a new `session_id`), neither of which
+  amux registers, so amux first sees the new session id on the next prompt. A prompt Claude Code
+  starts itself is indistinguishable from one typed, and an interrupted turn fires no `Stop`.
 
 > Spike required (Phase 2): confirm exact hook event names, matchers
 > (`permission_prompt` vs `idle_prompt`), and payload keys against the live CLI before
@@ -556,6 +618,15 @@ Why this is good:
   orphaned the previous daemon, which then kept its PTYs and agent processes alive and unreachable
   forever. Eviction sanity-checks that the pid is an amux process first, because ungraceful
   teardown (an SSH drop, a reboot) leaves stale pidfiles and pids get reused.
+- **Commands connect without arbitrating.** The terminal client's connect path spawns a daemon
+  when none answers or the versions differ, and that new daemon evicts the old one with its
+  agents — right for the client you opened to work in, wrong for a command asking a question. So
+  commands (`amux worktree …`) use `connect_to_running_daemon`, which only attempts the
+  handshake: it never spawns, never unlinks the socket, and returns a typed reason decided from
+  what answered — `NoDaemon` when nothing accepts, `VersionDiffers` for a `Hello` of another
+  version, an unexpected frame (an older daemon rejects our `Hello` with an `Error`) or one that
+  does not decode (the same classification as the daemon's `Probe`). A daemon that is there and
+  silent is neither. It needs no git repository.
 - **Deliberate shutdown is graceful**: `shutdown_all` sends every agent `SIGTERM`, waits out a
   shared 2s grace concurrently, then `SIGKILL`s the holdouts — so an agent can checkpoint on an
   upgrade instead of being shot mid-write. Ungraceful teardown skips this by definition, which is
@@ -584,6 +655,41 @@ both sides refuse mismatches.
 > the daemon holds the position and re-bases it past output that has arrived since (§5.2), so a
 > keypress means what the user saw; and because deltas compose, so a spun wheel needs no in-flight
 > bookkeeping on either side.
+>
+> **Read-only requests for commands (v22).** `ListWorktrees` → `Worktrees { instance, worktrees }`
+> and `Turns { worktree, after, limit }` → `Turns { instance, worktree, first_seq, last_seq, turns }`
+> (or `NoSuchWorktree`) serve `amux worktree list` and `amux worktree turns`. They change nothing:
+> not unread, not last opened, not focus (which is per connection, §7.3). A `WorktreeInfo` carries
+> `agent` only for a process this daemon run launched — after a restart a worktree is suspended
+> and its stored state is a placeholder, so it reads as "no agent" rather than a made-up exit.
+> A `Turns` reply holds at most 200 entries and about 1 MiB of text, well inside the 4 MiB frame
+> cap even for 200 entries of 24 KiB; the caller pages on with `after`. `instance` is an id made
+> once and kept in `<amux_home>/instance-id`, plus when this daemon started, so a reader can tell
+> one amux, or one daemon run, from another. The commands print JSON from types they own
+> (`amux-tui/src/worktree.rs`, `schema: 1`), never a serialised protocol type, so the wire can
+> change without changing what a script reads. Their text output (without `--json`) goes to a
+> terminal, and an agent's reply can carry escape sequences — a clipboard write (OSC 52), a title
+> change, a clear screen — so every field it prints (turn text, session ids, names, branches,
+> paths, messages) has its C0 controls, DEL, C1 controls and text-reordering characters replaced
+> by visible stand-ins (`safe_text` keeps newlines and tabs; `safe_line` replaces them too). JSON
+> needs nothing: it escapes control characters itself.
+>
+> **Showing a worktree from outside (v22).** `OpenWorktree { worktree }` asks the daemon to send
+> `ShowWorktree` to **one** terminal client — the one the user acted in most recently (only
+> `Input` and `Scroll` stamp a connection: a terminal client also sends `Focus` and `SetActive`
+> by itself, restoring its view on connect, so an idle client that reconnects would otherwise
+> take over; one that has attached a terminal, reported focus or set the active agent counts as
+> a terminal client, a command never does). The client then does what choosing the worktree
+> there does (open it in the main area; focus, unread and last opened follow), with two cautious
+> exceptions: a worktree with no running agent only gets the sidebar cursor, because attaching
+> its pane would resume the CLI and the command must never start work; and while a prompt is
+> open nothing moves under it. It answers `WorktreeShown { worktree, shown }`, `shown` false in
+> both exceptions (and for an id it does not know), and the daemon, which keeps up to 8
+> unanswered requests per client, waits up to 2 s for that answer before replying
+> `WorktreeOpened` (shown), `WorktreeNotShown` (asked, but not shown, or no answer: the client
+> went away or was slow), `NoClientAttached` or `NoSuchWorktree`. So `amux worktree open` exits 0
+> only when the worktree was shown, 6 when the client did not move, 5 with no client. The daemon
+> starts nothing: no client, no agent, no window.
 
 ```rust
 enum ClientMsg {
@@ -645,6 +751,13 @@ others dimmed but live. The focused terminal receives all keystrokes verbatim (f
 `Input`). A **leader key** always escapes back to navigation; leader+number / tab cycles
 focus. Keymap is config-driven and mirrors tmux/grove reflexes where sensible (muscle-memory
 reuse is a stated goal).
+
+The client tells the daemon which agent it is viewing (`Focus`), and that drives the inbox's
+unread bit: a notable event marks an agent unread **unless some connection has it focused** at
+that moment, and viewing it from any client clears the bit. Focus is kept **per connection** — a
+client disconnecting clears only what it focused — so two terminal clients cannot clear each
+other's, and a command that connects and leaves is invisible
+(`a_disconnect_clears_only_its_own_focus`).
 
 ### 7.4 Resize-to-slot
 

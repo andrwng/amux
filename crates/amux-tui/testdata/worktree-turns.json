@@ -1,0 +1,36 @@
+{
+  "schema": 1,
+  "instance": {
+    "id": "6f1d2c3b-4a59-4e68-9d7c-8b9a0f1e2d3c",
+    "daemon_started_at": "2026-11-22T09:00:00Z"
+  },
+  "worktree": "00000000-0000-4000-8000-000000000001",
+  "first_seq": 1,
+  "last_seq": 42,
+  "turns": [
+    {
+      "seq": 40,
+      "by": "agent",
+      "at": "2026-11-22T10:40:00Z",
+      "text": "synthetic earlier reply",
+      "clipped": false,
+      "session": "session-a"
+    },
+    {
+      "seq": 41,
+      "by": "user",
+      "at": "2026-11-22T10:41:00Z",
+      "text": "synthetic prompt",
+      "clipped": false,
+      "session": "session-b"
+    },
+    {
+      "seq": 42,
+      "by": "agent",
+      "at": "2026-11-22T10:42:00Z",
+      "text": "synthetic head\n[… clipped by amux …]\nsynthetic tail",
+      "clipped": true,
+      "session": "session-b"
+    }
+  ]
+}

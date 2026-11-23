@@ -74,6 +74,13 @@ enum Command {
     Doctor,
     /// Bridge a Claude Code hook event to the daemon mailbox (invoked by Claude's hooks).
     Hook,
+    /// Read amux's worktrees and their recorded conversations, or show one, for scripts and other
+    /// tools. Never starts a daemon: exits 3 when none is running, 4 when it is another version
+    /// of amux, 1 on anything else.
+    Worktree {
+        #[command(subcommand)]
+        command: WorktreeCommand,
+    },
     /// (internal) Hand pane navigation back to amux from an in-pane program at its edge —
     /// invoked by the amux-navigator vim plugin. DIRECTION is h/j/k/l.
     Nav { direction: String },
@@ -81,6 +88,54 @@ enum Command {
     /// program in this pane, so amux knows whether to pass `Ctrl+hjkl` through — invoked by the
     /// vim plugin on enter/leave.
     Passthrough { state: String },
+}
+
+#[derive(Subcommand)]
+enum WorktreeCommand {
+    /// List every worktree amux has: its agent's state, unread, and its last recorded turn.
+    List {
+        /// Print one JSON document (schema 1) instead of a table.
+        #[arg(long)]
+        json: bool,
+    },
+    /// Print a worktree's recorded prompts and replies after a sequence number, oldest first.
+    Turns {
+        /// The worktree's id, as `amux worktree list` prints it.
+        id: String,
+        /// Only turns with a sequence number greater than this.
+        #[arg(long, default_value_t = 0)]
+        after: u64,
+        /// At most this many turns (1 to 200).
+        #[arg(long, default_value_t = amux_tui::MAX_TURNS_LIMIT,
+              value_parser = clap::value_parser!(u32).range(1..=amux_tui::MAX_TURNS_LIMIT as i64))]
+        limit: u32,
+        /// Print one JSON document (schema 1) instead of text.
+        #[arg(long)]
+        json: bool,
+    },
+    /// Have the terminal client you used last show a worktree in its main pane. Starts nothing:
+    /// exits 5 when no terminal client is attached, 6 when it was asked but did not show it.
+    Open {
+        /// The worktree's id, as `amux worktree list` prints it.
+        id: String,
+    },
+}
+
+/// Print a command's output, or its one fixed line on standard error and exit with its code.
+fn finish_command(result: Result<String, amux_tui::CommandError>) -> ! {
+    use std::io::Write;
+    match result {
+        Ok(out) => {
+            // A closed pipe (`| head`) is not an error worth reporting.
+            let _ = std::io::stdout().write_all(out.as_bytes());
+            std::process::exit(0)
+        }
+        Err(e) => {
+            // The line can quote the daemon's own error text; show it, never obey it.
+            eprintln!("amux: {}", amux_tui::safe_line(&e.to_string()));
+            std::process::exit(e.exit_code())
+        }
+    }
 }
 
 fn parse_profile(s: &str) -> Result<amux_core::config::Profile, String> {
@@ -112,6 +167,16 @@ fn main() -> anyhow::Result<()> {
         }
         Some(Command::Doctor) => amux_tui::doctor()?,
         Some(Command::Hook) => amux_daemon::run_hook()?,
+        Some(Command::Worktree { command }) => finish_command(match command {
+            WorktreeCommand::List { json } => amux_tui::worktree_list(json),
+            WorktreeCommand::Turns {
+                id,
+                after,
+                limit,
+                json,
+            } => amux_tui::worktree_turns(&id, after, limit, json),
+            WorktreeCommand::Open { id } => amux_tui::worktree_open(&id),
+        }),
         Some(Command::Nav { direction }) => amux_daemon::run_nav(&direction)?,
         Some(Command::Passthrough { state }) => {
             amux_daemon::run_passthrough(state.eq_ignore_ascii_case("on"))?

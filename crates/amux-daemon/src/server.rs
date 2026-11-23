@@ -26,7 +26,7 @@ use amux_proto::{
 };
 
 use crate::pty::ScrollPos;
-use crate::registry::{DeleteOutcome, Registry};
+use crate::registry::{ConnectionId, DeleteOutcome, OpenOutcome, Registry};
 
 /// How long to wait for a daemon to answer the probe handshake. It only has to serialize a
 /// `Hello` it has already built, so anything slower is wedged, not busy.
@@ -300,11 +300,12 @@ async fn handle_client(stream: UnixStream, registry: Arc<Registry>) -> Result<()
     let mut events = registry.subscribe_events();
     let mut attached: Attachments = HashMap::new();
     let mut scroll: ScrollPositions = HashMap::new();
+    let connection = registry.connect(out_tx.clone());
 
     loop {
         tokio::select! {
             command = stream.next() => match command {
-                Some(Ok(msg)) => handle_command(msg, &registry, &out_tx, &mut attached, &mut scroll),
+                Some(Ok(msg)) => handle_command(msg, connection, &registry, &out_tx, &mut attached, &mut scroll).await,
                 _ => break,
             },
             outbound = out_rx.recv() => match outbound {
@@ -330,18 +331,31 @@ async fn handle_client(stream: UnixStream, registry: Arc<Registry>) -> Result<()
         }
         forwarder.abort();
     }
-    // The viewer is gone, so nothing is being watched — a later notable event should mark unread.
-    registry.focus(None);
+    // This viewer is gone, so what *it* was watching no longer is — a later notable event there
+    // marks unread unless another connection is watching too. Other connections' focus stands.
+    registry.disconnect(connection);
     Ok(())
 }
 
-fn handle_command(
+async fn handle_command(
     msg: ClientMsg,
+    connection: ConnectionId,
     registry: &Arc<Registry>,
     out_tx: &mpsc::UnboundedSender<DaemonMsg>,
     attached: &mut Attachments,
     scroll: &mut ScrollPositions,
 ) {
+    // What the user does in a client makes it the one `amux worktree open` asks: typing into a
+    // pane, or scrolling one. Focus and the active agent do not count — a terminal client also
+    // sends them by itself (restoring its view on connect, following a pane that went away), so
+    // they mark it only as a terminal client.
+    match &msg {
+        ClientMsg::Input { .. } | ClientMsg::Scroll { .. } => registry.note_input(connection),
+        ClientMsg::Attach { .. } | ClientMsg::Focus { .. } | ClientMsg::SetActive(_) => {
+            registry.note_viewer(connection)
+        }
+        _ => {}
+    }
     let report_err = |result: Result<()>| {
         if let Err(e) = result {
             let _ = out_tx.send(DaemonMsg::Error {
@@ -394,7 +408,7 @@ fn handle_command(
             scroll.remove(&terminal);
             registry.close_terminal(terminal);
         }
-        ClientMsg::Focus { agent } => registry.focus(agent),
+        ClientMsg::Focus { agent } => registry.focus(connection, agent),
         ClientMsg::SetLayout { agent, layout } => registry.set_layout(agent, layout),
         ClientMsg::SetMinis(minis) => registry.set_minis(minis),
         ClientMsg::SetActive(agent) => registry.set_active(agent),
@@ -441,8 +455,83 @@ fn handle_command(
         ClientMsg::Scroll { terminal, lines } => {
             scroll_view(scroll, registry, out_tx, terminal, lines)
         }
+        ClientMsg::OpenWorktree { worktree } => {
+            let reply = match registry.open_worktree(worktree) {
+                // Exit 0 for the command only once the client says it showed it. This
+                // connection waits for that (it asked); no other does.
+                OpenOutcome::Asked(answer) => {
+                    match tokio::time::timeout(SHOW_ANSWER_TIMEOUT, answer).await {
+                        Ok(Ok(true)) => DaemonMsg::WorktreeOpened { worktree },
+                        _ => DaemonMsg::WorktreeNotShown { worktree },
+                    }
+                }
+                OpenOutcome::NoClient => DaemonMsg::NoClientAttached { worktree },
+                OpenOutcome::NoSuchWorktree => DaemonMsg::NoSuchWorktree { worktree },
+            };
+            let _ = out_tx.send(reply);
+        }
+        ClientMsg::WorktreeShown { worktree, shown } => {
+            registry.worktree_shown(connection, worktree, shown)
+        }
+        ClientMsg::ListWorktrees => {
+            let _ = out_tx.send(DaemonMsg::Worktrees {
+                instance: registry.instance(),
+                worktrees: registry.worktrees(),
+            });
+        }
+        ClientMsg::Turns {
+            worktree,
+            after,
+            limit,
+        } => {
+            let limit = (limit as usize).min(MAX_TURNS_PER_REPLY);
+            // Reading the log is file I/O: off the async workers. This connection waits for it
+            // (it asked); no other does.
+            let reader = Arc::clone(registry);
+            let page = tokio::task::spawn_blocking(move || {
+                reader.turns(worktree, after, limit, MAX_TURNS_REPLY_BYTES)
+            })
+            .await
+            .unwrap_or_else(|e| Some(Err(anyhow::anyhow!("the read stopped: {e}"))));
+            let reply = match page {
+                None => DaemonMsg::NoSuchWorktree { worktree },
+                Some(Ok(page)) => DaemonMsg::Turns {
+                    instance: registry.instance(),
+                    worktree,
+                    first_seq: page.summary.as_ref().map(|s| s.first_seq),
+                    last_seq: page.summary.as_ref().map(|s| s.last.seq),
+                    turns: page
+                        .turns
+                        .into_iter()
+                        .map(|e| amux_proto::TurnInfo {
+                            seq: e.seq,
+                            by: e.by,
+                            at: e.at,
+                            text: e.text,
+                            clipped: e.clipped,
+                            session: e.session,
+                        })
+                        .collect(),
+                },
+                // The error names the file, never its contents.
+                Some(Err(e)) => DaemonMsg::Error {
+                    message: format!("could not read the conversation log: {e:#}"),
+                },
+            };
+            let _ = out_tx.send(reply);
+        }
     }
 }
+
+/// How long `OpenWorktree` waits for the terminal client to say whether it showed the worktree
+/// before answering "not shown" — well inside the command's own wait for the reply.
+const SHOW_ANSWER_TIMEOUT: Duration = Duration::from_secs(2);
+
+/// The most entries one `Turns` reply carries, whatever the client asked for.
+const MAX_TURNS_PER_REPLY: usize = 200;
+/// About how much turn text one `Turns` reply carries: well inside the 4 MiB frame cap, so a page
+/// of 200 maximal (24 KiB) entries is cut short rather than failing to encode. The client pages on.
+const MAX_TURNS_REPLY_BYTES: usize = 1024 * 1024;
 
 /// Register a repo by path (idempotent). `register_path` broadcasts `RepoAdded` if it is new.
 fn register_repo(registry: &Arc<Registry>, path: &Path) -> Result<()> {

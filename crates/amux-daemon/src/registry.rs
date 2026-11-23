@@ -20,10 +20,15 @@ use amux_core::adapter::{AgentAdapter, HookSetup, LaunchContext};
 use amux_core::agent::{
     is_notable_transition, next_state, AgentEvent, AgentId, AgentState, RepoId, TerminalId,
 };
-use amux_core::hook::{classify, HookReport};
+use amux_core::clock::{Clock, SystemClock};
+use amux_core::hook::{classify, HookReport, TurnReport};
 use amux_core::worktree::{WorktreeLocation, WorktreeService};
-use amux_proto::{AgentInfo, DaemonMsg, RepoInfo, Size};
+use amux_proto::{
+    AgentInfo, AgentStatus, ConversationInfo, DaemonMsg, InstanceInfo, RepoInfo, Size, TurnHead,
+    WorktreeInfo,
+};
 
+use crate::conversation::{ConversationLog, Entry, Summary};
 use crate::pty::Session;
 
 const EVENT_BACKLOG: usize = 256;
@@ -99,6 +104,10 @@ struct Agent {
     /// Inbox unread bit — a notable moment the user hasn't seen yet (see `is_notable_transition`).
     unread: bool,
     primary: TerminalId,
+    /// Whether this agent's CLI has been launched by *this* daemon run. A worktree reloaded from
+    /// `state.json` is suspended, its state a placeholder, so a reader is told there is no agent
+    /// rather than a made-up `Exited`; one that ran and exited in this run reports the exit.
+    launched_this_run: bool,
 }
 
 impl Agent {
@@ -127,6 +136,40 @@ struct Terminal {
     passthrough: bool,
 }
 
+/// One control connection, as the registry tells connections apart: what each one focused is its
+/// own. Handed out by [`Registry::connect`], given back by [`Registry::disconnect`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct ConnectionId(u64);
+
+/// What the registry keeps for one connected client.
+struct ClientEntry {
+    /// Its outbound queue, for a message meant for it alone.
+    tx: tokio::sync::mpsc::UnboundedSender<DaemonMsg>,
+    /// Whether it is a terminal client showing agents (it has attached a terminal or reported a
+    /// focus) — a command that connects to ask something never is.
+    viewer: bool,
+    /// When the user last acted in it ([`Registry::note_input`]); 0 for never.
+    last_input: u64,
+    /// The `ShowWorktree` requests sent to it and not yet answered, oldest first, each with
+    /// where its answer goes. Bounded by [`MAX_PENDING_SHOWS`]; dropping one answers "not shown".
+    pending_shows: std::collections::VecDeque<(AgentId, tokio::sync::oneshot::Sender<bool>)>,
+}
+
+/// The most unanswered `ShowWorktree` requests kept per client; past it the oldest is dropped.
+const MAX_PENDING_SHOWS: usize = 8;
+
+/// What became of an `amux worktree open` request.
+#[derive(Debug)]
+pub enum OpenOutcome {
+    /// The most recently used terminal client was asked to show the worktree; its answer
+    /// (whether it showed it) arrives here. A client that goes away first drops the sender.
+    Asked(tokio::sync::oneshot::Receiver<bool>),
+    /// No terminal client is attached.
+    NoClient,
+    /// The daemon has no such worktree.
+    NoSuchWorktree,
+}
+
 /// A registered repository and its (cheaply cloneable) worktree service.
 struct RepoEntry {
     info: RepoInfo,
@@ -138,9 +181,18 @@ struct State {
     repos: HashMap<RepoId, RepoEntry>,
     agents: HashMap<AgentId, Agent>,
     terminals: HashMap<TerminalId, Terminal>,
-    /// The agent the user is currently viewing, if any. A notable event on this agent does not
-    /// mark it unread (you're watching it); everyone else's does.
-    focused: Option<AgentId>,
+    /// The agent each connection is viewing, if any. A notable event on an agent some connection
+    /// is viewing does not mark it unread (someone is watching it); everyone else's does. Per
+    /// connection, so a client leaving takes only its own focus with it.
+    focused: HashMap<ConnectionId, AgentId>,
+    /// The next [`ConnectionId`] to hand out.
+    next_connection: u64,
+    /// Every connected client, for the requests that address one client rather than all of them
+    /// (`amux worktree open`).
+    clients: HashMap<ConnectionId, ClientEntry>,
+    /// A counter stamped on a client each time the user acts in it, so the most recent is known
+    /// without reading a clock.
+    next_input: u64,
     /// Saved pane layouts per agent, replayed to a re-attaching client so splits survive the TUI
     /// closing — and, since they are part of [`PersistedState`], a daemon restart or an upgrade too.
     layouts: HashMap<AgentId, amux_proto::Layout>,
@@ -215,13 +267,61 @@ struct HookIntegration {
     amux_exe: PathBuf,
 }
 
+/// How a [`Registry`] is built. `Default` is what tests want: no hooks, no persistence, no
+/// conversation log, the real clock.
+pub struct RegistryOptions {
+    /// The hook mailbox socket and the `amux` executable its hooks invoke; `None` disables hooks.
+    pub hooks: Option<(PathBuf, PathBuf)>,
+    /// PTY-silence window after which the heartbeat settles a `Working` agent to `Idle`.
+    pub idle_timeout: Duration,
+    /// Where durable state is written; `None` disables persistence.
+    pub state_path: Option<PathBuf>,
+    /// The directory of per-worktree conversation logs; `None` records no conversation.
+    pub conversation_dir: Option<PathBuf>,
+    /// The clock conversation entries are stamped with.
+    pub clock: Arc<dyn Clock>,
+    /// This amux home's instance id (made once, kept under the home by the daemon); `None` makes
+    /// one up for this registry alone.
+    pub instance_id: Option<String>,
+}
+
+impl Default for RegistryOptions {
+    fn default() -> Self {
+        Self {
+            hooks: None,
+            idle_timeout: DEFAULT_IDLE_TIMEOUT,
+            state_path: None,
+            conversation_dir: None,
+            clock: Arc::new(SystemClock),
+            instance_id: None,
+        }
+    }
+}
+
+/// A page of a worktree's conversation, answering [`Registry::turns`].
+pub struct TurnsPage {
+    /// Where the log starts and its newest entry; `None` when nothing has been recorded.
+    pub summary: Option<Summary>,
+    pub turns: Vec<Entry>,
+}
+
 pub struct Registry {
     state: Mutex<State>,
+    /// Each worktree's conversation log, locked per worktree and never while `state` is held, so
+    /// a slow disk on a turn never stalls the state machine. Its calls block on file I/O: the
+    /// mailbox and the server make them off the async workers. `None` when recording is off.
+    conversation: Option<ConversationLog>,
+    clock: Arc<dyn Clock>,
+    /// Which amux this is, for readers that must tell one from another.
+    instance: InstanceInfo,
     adapter: Box<dyn AgentAdapter>,
     events: broadcast::Sender<DaemonMsg>,
     hooks: Option<HookIntegration>,
     /// PTY-silence window after which the heartbeat settles a `Working` agent to `Idle`.
     idle_timeout: Duration,
+    /// Test seam: called by `on_turn` once it has found the agent, before it writes.
+    #[cfg(test)]
+    after_turn_check: Mutex<Option<Box<dyn Fn() + Send + Sync>>>,
     /// Where durable state (repos/agents/minis) is written so it survives a daemon restart.
     /// `None` disables persistence (tests, unless they opt in via [`Registry::with_state`]).
     state_path: Option<PathBuf>,
@@ -229,50 +329,66 @@ pub struct Registry {
 
 impl Registry {
     pub fn new(adapter: Box<dyn AgentAdapter>) -> Arc<Self> {
-        Self::build(adapter, None, DEFAULT_IDLE_TIMEOUT, None)
-    }
-
-    /// Build a registry that wires launched agents' hooks to `socket`, invoking `amux_exe hook`,
-    /// and persists durable state to `state_path`.
-    pub fn with_hooks(
-        adapter: Box<dyn AgentAdapter>,
-        socket: PathBuf,
-        amux_exe: PathBuf,
-        state_path: PathBuf,
-    ) -> Arc<Self> {
-        Self::build(
-            adapter,
-            Some(HookIntegration { socket, amux_exe }),
-            DEFAULT_IDLE_TIMEOUT,
-            Some(state_path),
-        )
+        Self::with_options(adapter, RegistryOptions::default())
     }
 
     /// Build a registry with a custom heartbeat idle timeout — used by tests to exercise the
     /// backstop on a human timescale.
     pub fn with_idle_timeout(adapter: Box<dyn AgentAdapter>, idle_timeout: Duration) -> Arc<Self> {
-        Self::build(adapter, None, idle_timeout, None)
+        Self::with_options(
+            adapter,
+            RegistryOptions {
+                idle_timeout,
+                ..RegistryOptions::default()
+            },
+        )
     }
 
     /// Build a registry that persists durable state to `state_path` (for persistence tests).
     pub fn with_state(adapter: Box<dyn AgentAdapter>, state_path: PathBuf) -> Arc<Self> {
-        Self::build(adapter, None, DEFAULT_IDLE_TIMEOUT, Some(state_path))
+        Self::with_options(
+            adapter,
+            RegistryOptions {
+                state_path: Some(state_path),
+                ..RegistryOptions::default()
+            },
+        )
     }
 
-    fn build(
-        adapter: Box<dyn AgentAdapter>,
-        hooks: Option<HookIntegration>,
-        idle_timeout: Duration,
-        state_path: Option<PathBuf>,
-    ) -> Arc<Self> {
+    /// Build a registry from `options`. A conversation directory that cannot be created leaves
+    /// recording off (logged), rather than keeping the daemon from starting.
+    pub fn with_options(adapter: Box<dyn AgentAdapter>, options: RegistryOptions) -> Arc<Self> {
         let (events, _) = broadcast::channel(EVENT_BACKLOG);
+        let conversation =
+            options
+                .conversation_dir
+                .and_then(|dir| match ConversationLog::open(&dir) {
+                    Ok(log) => Some(log),
+                    Err(e) => {
+                        tracing::warn!("not recording conversations: {e:#}");
+                        None
+                    }
+                });
+        let instance = InstanceInfo {
+            id: options
+                .instance_id
+                .unwrap_or_else(|| AgentId::new().to_full_string()),
+            daemon_started_at: options.clock.now(),
+        };
         Arc::new(Self {
             state: Mutex::new(State::default()),
+            conversation,
+            instance,
+            clock: options.clock,
             adapter,
             events,
-            hooks,
-            idle_timeout,
-            state_path,
+            hooks: options
+                .hooks
+                .map(|(socket, amux_exe)| HookIntegration { socket, amux_exe }),
+            idle_timeout: options.idle_timeout,
+            #[cfg(test)]
+            after_turn_check: Mutex::new(None),
+            state_path: options.state_path,
         })
     }
 
@@ -493,6 +609,10 @@ impl Registry {
                 return;
             }
         };
+        // Every worktree the state names, reinstated below or not (an agent whose repository
+        // cannot be opened right now still owns its log).
+        let named: std::collections::HashSet<AgentId> =
+            persisted.agents.iter().map(|a| a.id).collect();
         let mut state = self.state.lock().unwrap();
         for r in persisted.repos {
             match WorktreeService::with_base(&r.repo, &r.base) {
@@ -551,6 +671,7 @@ impl Registry {
                     state: AgentState::Exited { code: None },
                     unread: a.unread,
                     primary: a.primary,
+                    launched_this_run: false,
                 },
             );
         }
@@ -580,6 +701,19 @@ impl Registry {
             })
             .collect();
         state.layouts = layouts;
+        let agents: Vec<AgentId> = state.agents.keys().copied().collect();
+        drop(state);
+        if let Some(log) = &self.conversation {
+            for agent in agents {
+                if let Err(e) = log.load(agent) {
+                    tracing::warn!("could not load the conversation log of {agent}: {e:#}");
+                }
+            }
+            // Only now that the state has been read: a log for a worktree it does not name was
+            // left by a delete that never reached the log (an older daemon, a crash), and nothing
+            // would ever remove it. A state that could not be read returned above, removing none.
+            log.remove_orphans(&named);
+        }
     }
 
     /// Ensure `terminal`'s agent is live, resuming a suspended primary if needed. Called when a
@@ -624,6 +758,60 @@ impl Registry {
             .values()
             .map(Agent::info)
             .collect()
+    }
+
+    /// Which amux this is (sent with every read-only reply).
+    pub fn instance(&self) -> InstanceInfo {
+        self.instance.clone()
+    }
+
+    /// Every worktree, as a command reads it, in a stable order (repository path, then name, then
+    /// id). Read-only: nothing here touches unread, last opened or focus.
+    pub fn worktrees(&self) -> Vec<WorktreeInfo> {
+        let mut out: Vec<WorktreeInfo> = {
+            let state = self.state.lock().unwrap();
+            state
+                .agents
+                .values()
+                .filter_map(|a| {
+                    let repo = state.repos.get(&a.repo)?.info.clone();
+                    Some(WorktreeInfo {
+                        id: a.id,
+                        repo,
+                        name: a.workspace.name(),
+                        branch: a.workspace.branch().map(str::to_string),
+                        path: a.worktree.clone(),
+                        task: a.prompt.clone(),
+                        last_opened: a.last_opened,
+                        unread: a.unread,
+                        session: a.ai_session_id.clone(),
+                        agent: a.launched_this_run.then(|| AgentStatus {
+                            state: a.state.clone(),
+                            last_activity: a.last_activity,
+                        }),
+                        conversation: None,
+                    })
+                })
+                .collect()
+        };
+        if let Some(log) = &self.conversation {
+            for w in &mut out {
+                w.conversation = log.summary(w.id).map(|s| ConversationInfo {
+                    first_seq: s.first_seq,
+                    last_seq: s.last.seq,
+                    last: TurnHead {
+                        seq: s.last.seq,
+                        by: s.last.by,
+                        at: s.last.at,
+                        session: s.last.session.clone(),
+                    },
+                });
+            }
+        }
+        out.sort_by(|a, b| {
+            (&a.repo.path, &a.name, a.id.as_uuid()).cmp(&(&b.repo.path, &b.name, b.id.as_uuid()))
+        });
+        out
     }
 
     /// The live session for a terminal, if it has one.
@@ -726,6 +914,7 @@ impl Registry {
                 state: AgentState::Idle,
                 unread: false,
                 primary: terminal_id,
+                launched_this_run: true,
             };
             let info = agent.info();
             state.agents.insert(agent_id, agent);
@@ -812,6 +1001,7 @@ impl Registry {
                 state: AgentState::Idle,
                 unread: false,
                 primary: terminal_id,
+                launched_this_run: true,
             };
             let info = agent.info();
             state.agents.insert(agent_id, agent);
@@ -878,6 +1068,88 @@ impl Registry {
         }
     }
 
+    /// Record a conversation turn `amux hook` forwarded: the next entry in the worktree's log,
+    /// stamped with the daemon's clock. A turn for an agent the daemon does not know is dropped.
+    /// The text is never logged, at any level. Blocks on file I/O.
+    ///
+    /// The agent is looked up while its log is locked ([`ConversationLog::append_if`]), so a turn
+    /// racing [`delete`](Self::delete) cannot leave a log behind: delete takes the agent out of
+    /// `state` first and then removes the log under the same lock, so either the lookup sees the
+    /// agent gone, or the write finishes first and delete removes it. Lock order: this takes the
+    /// log's lock and then `state` briefly; delete never holds `state` while taking the log's.
+    pub fn on_turn(&self, report: TurnReport) {
+        let Some(log) = &self.conversation else {
+            return;
+        };
+        let agent = report.agent;
+        let known = || self.state.lock().unwrap().agents.contains_key(&agent);
+        // A cheap first look, so a turn for an id the daemon never had makes no log at all.
+        if !known() {
+            return;
+        }
+        let at = self.clock.now();
+        let still_known = || {
+            let found = known();
+            #[cfg(test)]
+            if found {
+                if let Some(pause) = self.after_turn_check.lock().unwrap().as_ref() {
+                    pause();
+                }
+            }
+            found
+        };
+        if let Err(e) = log.append_if(agent, report.turn, at, still_known) {
+            tracing::warn!("could not record a turn for {agent}: {e:#}");
+        }
+    }
+
+    /// A page of `agent`'s conversation: entries after `after`, oldest first, at most `limit`
+    /// and at most about `max_bytes` of text. `None` for an agent the daemon does not know.
+    pub fn turns(
+        &self,
+        agent: AgentId,
+        after: u64,
+        limit: usize,
+        max_bytes: usize,
+    ) -> Option<Result<TurnsPage>> {
+        if !self.state.lock().unwrap().agents.contains_key(&agent) {
+            return None;
+        }
+        let Some(log) = &self.conversation else {
+            return Some(Ok(TurnsPage {
+                summary: None,
+                turns: Vec::new(),
+            }));
+        };
+        Some(
+            log.read_after(agent, after, limit, max_bytes)
+                .map(|turns| TurnsPage {
+                    summary: log.summary(agent),
+                    turns,
+                }),
+        )
+    }
+
+    /// Test seam: hold, on a thread of its own, the lock a read of `agent`'s conversation holds —
+    /// as a slow disk would — until the returned sender is dropped or sent to.
+    #[cfg(test)]
+    pub(crate) fn hold_conversation_lock(
+        self: &Arc<Self>,
+        agent: AgentId,
+    ) -> std::sync::mpsc::Sender<()> {
+        let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+        let (held_tx, held_rx) = std::sync::mpsc::channel();
+        let me = Arc::clone(self);
+        std::thread::spawn(move || {
+            me.conversation
+                .as_ref()
+                .unwrap()
+                .hold(agent, held_tx, release_rx);
+        });
+        held_rx.recv().unwrap();
+        release_tx
+    }
+
     /// Fold an [`AgentEvent`] into an agent's state via the pure state machine, flag unread on a
     /// notable transition, and broadcast what changed. Shared by hooks and the idle heartbeat.
     fn apply_event(&self, agent: AgentId, event: AgentEvent) {
@@ -892,13 +1164,111 @@ impl Registry {
         self.broadcast_changes(agent, state_change, unread_change);
     }
 
-    /// Set (or clear) which agent the user is currently viewing. Focusing an agent clears its
-    /// unread bit and stamps its `last_opened` (the sidebar's MRU key — persisted and broadcast);
-    /// while focused, notable events on it won't re-mark it unread.
-    pub fn focus(&self, agent: Option<AgentId>) {
+    /// A control connection has completed its handshake: give it an identity for what the daemon
+    /// keeps per connection.
+    /// `tx` is its outbound queue, for messages meant for it alone.
+    pub fn connect(&self, tx: tokio::sync::mpsc::UnboundedSender<DaemonMsg>) -> ConnectionId {
+        let mut state = self.state.lock().unwrap();
+        state.next_connection += 1;
+        let id = ConnectionId(state.next_connection);
+        state.clients.insert(
+            id,
+            ClientEntry {
+                tx,
+                viewer: false,
+                last_input: 0,
+                pending_shows: std::collections::VecDeque::new(),
+            },
+        );
+        id
+    }
+
+    /// `connection` is a terminal client showing agents (it attached a terminal or reported focus).
+    pub fn note_viewer(&self, connection: ConnectionId) {
+        if let Some(c) = self.state.lock().unwrap().clients.get_mut(&connection) {
+            c.viewer = true;
+        }
+    }
+
+    /// The user acted in `connection` (typed into a pane, or scrolled one): it becomes the most
+    /// recently used client.
+    pub fn note_input(&self, connection: ConnectionId) {
+        let mut state = self.state.lock().unwrap();
+        state.next_input += 1;
+        let stamp = state.next_input;
+        if let Some(c) = state.clients.get_mut(&connection) {
+            c.viewer = true;
+            c.last_input = stamp;
+        }
+    }
+
+    /// Ask the most recently used terminal client to show `worktree` in its main pane, as if the
+    /// user had chosen it there. Starts nothing: no client, no agent, no window. Ties (clients the
+    /// user has not acted in yet) go to the one that connected last.
+    pub fn open_worktree(&self, worktree: AgentId) -> OpenOutcome {
+        let mut state = self.state.lock().unwrap();
+        if !state.agents.contains_key(&worktree) {
+            return OpenOutcome::NoSuchWorktree;
+        }
+        let chosen = state
+            .clients
+            .iter_mut()
+            .filter(|(_, c)| c.viewer && !c.tx.is_closed())
+            .max_by_key(|(id, c)| (c.last_input, id.0));
+        let Some((_, client)) = chosen else {
+            return OpenOutcome::NoClient;
+        };
+        if client
+            .tx
+            .send(DaemonMsg::ShowWorktree { worktree })
+            .is_err()
+        {
+            return OpenOutcome::NoClient;
+        }
+        let (answer_tx, answer_rx) = tokio::sync::oneshot::channel();
+        if client.pending_shows.len() >= MAX_PENDING_SHOWS {
+            client.pending_shows.pop_front();
+        }
+        client.pending_shows.push_back((worktree, answer_tx));
+        OpenOutcome::Asked(answer_rx)
+    }
+
+    /// `connection` answered a `ShowWorktree` for `worktree`: pass on whether it showed it, to the
+    /// oldest request of that worktree it has not answered yet.
+    pub fn worktree_shown(&self, connection: ConnectionId, worktree: AgentId, shown: bool) {
+        let mut state = self.state.lock().unwrap();
+        let Some(client) = state.clients.get_mut(&connection) else {
+            return;
+        };
+        if let Some(i) = client
+            .pending_shows
+            .iter()
+            .position(|(w, _)| *w == worktree)
+        {
+            if let Some((_, answer)) = client.pending_shows.remove(i) {
+                let _ = answer.send(shown);
+            }
+        }
+    }
+
+    /// A control connection has gone: forget what it focused, and only that. Nothing is
+    /// broadcast — focus is not part of any client's view.
+    pub fn disconnect(&self, connection: ConnectionId) {
+        let mut state = self.state.lock().unwrap();
+        state.focused.remove(&connection);
+        state.clients.remove(&connection);
+    }
+
+    /// Set (or clear) which agent `connection` is viewing. Focusing an agent clears its unread bit
+    /// and stamps its `last_opened` (the sidebar's MRU key — persisted and broadcast); while any
+    /// connection has it focused, notable events on it won't re-mark it unread.
+    pub fn focus(&self, connection: ConnectionId, agent: Option<AgentId>) {
         let (opened, cleared) = {
             let mut state = self.state.lock().unwrap();
-            state.focused = agent;
+            match agent {
+                Some(id) => state.focused.insert(connection, id),
+                None => state.focused.remove(&connection),
+            };
             match agent.and_then(|id| state.agents.get_mut(&id).map(|a| (id, a))) {
                 Some((id, a)) => {
                     let at = Utc::now();
@@ -1041,6 +1411,7 @@ impl Registry {
                     // Resuming lands back at the prompt — idle/waiting, not working (same reasoning
                     // as create): let hooks drive Working so we don't flash a false "⋯"/unread.
                     agent.state = AgentState::Idle;
+                    agent.launched_this_run = true;
                     let at = Utc::now();
                     agent.last_activity = at;
                     agent.last_opened = at;
@@ -1105,6 +1476,10 @@ impl Registry {
         };
         for session in sessions {
             session.kill();
+        }
+        // The conversation goes with the worktree.
+        if let Some(log) = &self.conversation {
+            log.remove(id);
         }
         // Remove the managed worktree/branch only for a worktree session; a HEAD session has none
         // and must never prune anything in the user's live tree. Clean up its out-of-tree hook
@@ -1297,7 +1672,7 @@ fn write_atomic(path: &Path, state: &PersistedState) -> Result<()> {
 }
 
 /// Apply `next` to `id` inside the locked state: update the state + activity, and flag the agent
-/// unread on a notable transition — unless it's the agent the user is currently viewing. Returns
+/// unread on a notable transition — unless some connection is viewing it. Returns
 /// `(state change, unread change)` for the caller to broadcast. A no-op transition returns
 /// `(None, None)`.
 fn set_state(
@@ -1305,7 +1680,7 @@ fn set_state(
     id: AgentId,
     next: AgentState,
 ) -> (Option<AgentState>, Option<bool>) {
-    let focused = state.focused;
+    let watched = state.focused.values().any(|a| *a == id);
     let Some(agent) = state.agents.get_mut(&id) else {
         return (None, None);
     };
@@ -1316,7 +1691,7 @@ fn set_state(
     }
     let notable = is_notable_transition(&prev, &next);
     agent.state = next.clone();
-    let unread_change = if notable && focused != Some(id) && !agent.unread {
+    let unread_change = if notable && !watched && !agent.unread {
         agent.unread = true;
         Some(true)
     } else {
@@ -1372,6 +1747,286 @@ mod tests {
         let primary = TerminalId::new();
         let saved = leaf(Some(primary));
         assert_eq!(blank_dead_terminals(&saved, primary), saved);
+    }
+
+    // --- Conversation log concurrency: a real registry over a temp git repo, `cat` agents. ---
+
+    use amux_core::adapter::ClaudeAdapter;
+    use amux_core::conversation::{Speaker, Turn};
+    use std::time::Duration as StdDuration;
+
+    fn init_repo(dir: &Path) {
+        let repo = git2::Repository::init(dir).unwrap();
+        {
+            let mut config = repo.config().unwrap();
+            config.set_str("user.name", "amux test").unwrap();
+            config.set_str("user.email", "test@amux.local").unwrap();
+        }
+        std::fs::write(dir.join("README.md"), "hello").unwrap();
+        let mut index = repo.index().unwrap();
+        index.add_path(Path::new("README.md")).unwrap();
+        index.write().unwrap();
+        let tree = repo.find_tree(index.write_tree().unwrap()).unwrap();
+        let sig = repo.signature().unwrap();
+        repo.commit(Some("HEAD"), &sig, &sig, "init", &tree, &[])
+            .unwrap();
+    }
+
+    /// A registry recording conversations under `tmp`, with two `cat` agents whose tasks run on
+    /// the returned runtime (keep it alive for the test).
+    fn two_agents(tmp: &Path) -> (tokio::runtime::Runtime, Arc<Registry>, AgentId, AgentId) {
+        let agents_rt = tokio::runtime::Runtime::new().unwrap();
+        let _in_runtime = agents_rt.enter();
+        let repo = tmp.join("repo");
+        std::fs::create_dir(&repo).unwrap();
+        init_repo(&repo);
+        let registry = Registry::with_options(
+            Box::new(ClaudeAdapter::with_command(vec!["cat".into()])),
+            RegistryOptions {
+                state_path: Some(tmp.join("state.json")),
+                conversation_dir: Some(tmp.join("conversations")),
+                ..RegistryOptions::default()
+            },
+        );
+        let worktrees = WorktreeService::with_base(&repo, tmp.join("wt")).unwrap();
+        let repo_id = registry.register(worktrees).id;
+        let a = registry.create(repo_id, "feat/a", None).unwrap().id;
+        let b = registry.create(repo_id, "feat/b", None).unwrap().id;
+        drop(_in_runtime);
+        (agents_rt, registry, a, b)
+    }
+
+    fn turn_for(agent: AgentId, text: &str) -> TurnReport {
+        TurnReport {
+            agent,
+            turn: Turn::new(Speaker::User, text, None),
+        }
+    }
+
+    /// Run `f` on a thread and wait at most `wait` for it; `None` if it is still blocked.
+    fn within<T: Send + 'static>(
+        wait: StdDuration,
+        f: impl FnOnce() -> T + Send + 'static,
+    ) -> Option<T> {
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let _ = tx.send(f());
+        });
+        rx.recv_timeout(wait).ok()
+    }
+
+    /// While one worktree's log is busy (a slow page read holds it), another's append goes ahead.
+    #[test]
+    fn an_append_for_one_worktree_does_not_wait_for_another() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (_agents_rt, registry, a, b) = two_agents(tmp.path());
+        registry.on_turn(turn_for(a, "synthetic"));
+        registry.on_turn(turn_for(b, "synthetic"));
+        let release = registry.hold_conversation_lock(a);
+        let r = Arc::clone(&registry);
+        let done = within(StdDuration::from_secs(2), move || {
+            r.on_turn(turn_for(b, "synthetic"));
+        });
+        drop(release);
+        assert!(done.is_some(), "B's append waited for A's log");
+        let page = registry.turns(b, 0, 10, usize::MAX).unwrap().unwrap();
+        assert_eq!(page.turns.len(), 2);
+    }
+
+    /// A turn racing a delete leaves no log behind: `on_turn` is paused just after it found the
+    /// agent, the worktree is deleted meanwhile, and then the turn goes on.
+    #[test]
+    fn a_turn_racing_a_delete_leaves_no_log() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (_agents_rt, registry, a, _b) = two_agents(tmp.path());
+        let (paused_tx, paused_rx) = std::sync::mpsc::channel::<()>();
+        let (go_tx, go_rx) = std::sync::mpsc::channel::<()>();
+        let go_rx = Mutex::new(go_rx);
+        *registry.after_turn_check.lock().unwrap() = Some(Box::new(move || {
+            let _ = paused_tx.send(());
+            let _ = go_rx.lock().unwrap().recv();
+        }));
+        let r = Arc::clone(&registry);
+        let turn = std::thread::spawn(move || r.on_turn(turn_for(a, "synthetic")));
+        paused_rx.recv().unwrap();
+        let r = Arc::clone(&registry);
+        let delete = std::thread::spawn(move || r.delete(a, true).map(|_| ()));
+        // Give the delete every chance to finish while the turn is paused.
+        std::thread::sleep(StdDuration::from_millis(300));
+        go_tx.send(()).unwrap();
+        turn.join().unwrap();
+        delete.join().unwrap().unwrap();
+        let file = tmp
+            .path()
+            .join("conversations")
+            .join(format!("{}.jsonl", a.to_full_string()));
+        assert!(
+            !file.exists(),
+            "the deleted worktree's conversation was left on disk"
+        );
+    }
+
+    /// Turns waiting to be written are bounded: past the bound a turn is dropped, with a warning
+    /// that names the worktree and quotes nothing, and the ones already waiting are all written.
+    #[test]
+    fn turns_past_the_pending_bound_are_dropped_without_their_text() {
+        #[derive(Clone, Default)]
+        struct Captured(Arc<Mutex<Vec<u8>>>);
+        impl std::io::Write for Captured {
+            fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+                self.0.lock().unwrap().extend_from_slice(buf);
+                Ok(buf.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+        let captured = Captured::default();
+
+        let tmp = tempfile::tempdir().unwrap();
+        let (_agents_rt, registry, a, _b) = two_agents(tmp.path());
+        registry.on_turn(turn_for(a, "synthetic"));
+        let mailbox = tmp.path().join("hooks.sock");
+        {
+            // The mailbox on a runtime thread of its own, logging into `captured`.
+            let registry = Arc::clone(&registry);
+            let mailbox = mailbox.clone();
+            let writer = captured.clone();
+            std::thread::spawn(move || {
+                let subscriber = tracing_subscriber::fmt()
+                    .with_writer(move || writer.clone())
+                    .finish();
+                let _guard = tracing::subscriber::set_default(subscriber);
+                let rt = tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                    .unwrap();
+                rt.block_on(async move {
+                    let hooks = crate::mailbox::bind_mailbox(&mailbox).unwrap();
+                    let _ = crate::mailbox::serve_mailbox(hooks, registry).await;
+                });
+            });
+        }
+        while !mailbox.exists() {
+            std::thread::sleep(StdDuration::from_millis(10));
+        }
+        let release = registry.hold_conversation_lock(a);
+        const SENTINEL: &str = "SENTINEL-QUEUED-4d2b";
+        let dropped = 3;
+        for _ in 0..crate::mailbox::MAX_PENDING_TURNS + dropped {
+            let payload = serde_json::json!({"hook_event_name": "UserPromptSubmit",
+                                             "session_id": "s1", "prompt": SENTINEL})
+            .to_string();
+            crate::mailbox::deliver_hook_input(&mailbox, a, &payload).unwrap();
+        }
+        let logged = || String::from_utf8(captured.0.lock().unwrap().clone()).unwrap();
+        for _ in 0..250 {
+            if logged().matches("dropped a turn").count() >= dropped {
+                break;
+            }
+            std::thread::sleep(StdDuration::from_millis(20));
+        }
+        drop(release);
+        let r = Arc::clone(&registry);
+        let want = 1 + crate::mailbox::MAX_PENDING_TURNS;
+        let written = within(StdDuration::from_secs(5), move || loop {
+            let n = r.turns(a, 0, 200, usize::MAX).unwrap().unwrap().turns.len();
+            if n >= want {
+                return n;
+            }
+            std::thread::sleep(StdDuration::from_millis(20));
+        });
+        assert_eq!(
+            written,
+            Some(want),
+            "the waiting turns are written, the rest dropped"
+        );
+        let logged = logged();
+        assert_eq!(
+            logged.matches("dropped a turn").count(),
+            dropped,
+            "{logged}"
+        );
+        assert!(logged.contains(&a.to_string()));
+        assert!(!logged.contains(SENTINEL), "the warning quotes the turn");
+    }
+
+    /// Log I/O runs off the async workers: on a single-threaded runtime, a `Turns` read stuck on
+    /// one worktree's log (a slow disk) neither stalls the runtime nor keeps a turn for another
+    /// worktree, arriving through the mailbox, from being recorded.
+    #[test]
+    fn a_stuck_page_read_does_not_stall_the_daemon() {
+        use futures::SinkExt;
+        let tmp = tempfile::tempdir().unwrap();
+        let (_agents_rt, registry, a, b) = two_agents(tmp.path());
+        let control = tmp.path().join("amuxd.sock");
+        let mailbox = tmp.path().join("hooks.sock");
+        let (stop_tx, stop_rx) = tokio::sync::oneshot::channel::<()>();
+        {
+            let registry = Arc::clone(&registry);
+            let control = control.clone();
+            let mailbox = mailbox.clone();
+            std::thread::spawn(move || {
+                let rt = tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                    .unwrap();
+                rt.block_on(async move {
+                    let listener = tokio::net::UnixListener::bind(&control).unwrap();
+                    let hooks = crate::mailbox::bind_mailbox(&mailbox).unwrap();
+                    tokio::select! {
+                        _ = crate::server::serve(listener, Arc::clone(&registry)) => {}
+                        _ = crate::mailbox::serve_mailbox(hooks, registry) => {}
+                        _ = stop_rx => {}
+                    }
+                });
+            });
+        }
+        while !mailbox.exists() {
+            std::thread::sleep(StdDuration::from_millis(10));
+        }
+        // A has a conversation to read, so the read below needs its log.
+        registry.on_turn(turn_for(a, "synthetic"));
+        let release = registry.hold_conversation_lock(a);
+        // A client asks for A's turns; the read blocks on A's log.
+        let client_rt = tokio::runtime::Runtime::new().unwrap();
+        let _client = client_rt.block_on(async {
+            let stream = tokio::net::UnixStream::connect(&control).await.unwrap();
+            let mut c = tokio_util::codec::Framed::new(stream, amux_proto::ClientCodec::new());
+            c.send(amux_proto::ClientMsg::Hello {
+                proto_version: amux_proto::PROTO_VERSION,
+            })
+            .await
+            .unwrap();
+            c.send(amux_proto::ClientMsg::Turns {
+                worktree: a,
+                after: 0,
+                limit: 10,
+            })
+            .await
+            .unwrap();
+            c
+        });
+        std::thread::sleep(StdDuration::from_millis(100));
+        // A turn for B arrives through the mailbox, as `amux hook` sends it.
+        let payload = serde_json::json!({"hook_event_name": "UserPromptSubmit",
+                                         "session_id": "s1", "prompt": "synthetic"})
+        .to_string();
+        crate::mailbox::deliver_hook_input(&mailbox, b, &payload).unwrap();
+        let r = Arc::clone(&registry);
+        let recorded = within(StdDuration::from_secs(3), move || loop {
+            let page = r.turns(b, 0, 10, usize::MAX).unwrap().unwrap();
+            if !page.turns.is_empty() {
+                return;
+            }
+            std::thread::sleep(StdDuration::from_millis(20));
+        });
+        drop(release);
+        let _ = stop_tx.send(());
+        assert!(
+            recorded.is_some(),
+            "B's turn was not recorded while A's read was stuck"
+        );
     }
 
     /// An already-blank leaf (a split whose shell had not arrived yet) stays blank rather than

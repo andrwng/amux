@@ -6,7 +6,10 @@ mod codec;
 mod message;
 
 pub use codec::{check_version, ClientCodec, ProtoError, ServerCodec, WireCodec, MAX_FRAME_BYTES};
-pub use message::{AgentInfo, ClientMsg, DaemonMsg, Layout, RepoInfo, Size};
+pub use message::{
+    AgentInfo, AgentStatus, ClientMsg, ConversationInfo, DaemonMsg, InstanceInfo, Layout, RepoInfo,
+    Size, TurnHead, TurnInfo, WorktreeInfo,
+};
 
 /// Protocol version. The client and daemon refuse to talk across a mismatch (the client
 /// auto-recovers). v1 multi-agent; v2 dirty-delete; v3 multi-attach; v4 agents-own-terminals;
@@ -26,5 +29,10 @@ pub use message::{AgentInfo, ClientMsg, DaemonMsg, Layout, RepoInfo, Size};
 /// v19 daemon-owned scrollback (Scroll + ScrollView — clients page through history the daemon holds
 /// instead of keeping a private ring, so depth no longer depends on when they attached);
 /// v20 previous-session persistence (SetPrevious, Previous — `Ctrl+B -` jump-to-previous target
-/// survives a TUI restart, restored on reconnect like the active agent).
-pub const PROTO_VERSION: u32 = 21;
+/// survives a TUI restart, restored on reconnect like the active agent); v21 the grid size rides
+/// `OutputSnapshot` (the daemon grid is grow-only, the client sizes its parser to it);
+/// v22 worktree conversations (ListWorktrees + Worktrees, Turns + Turns, NoSuchWorktree — read-only
+/// requests for `amux worktree list`/`turns`; OpenWorktree + ShowWorktree, WorktreeShown,
+/// WorktreeOpened, WorktreeNotShown, NoClientAttached for `amux worktree open`; also covers the mailbox's new `PaneMessage::Turn`, so
+/// a daemon from before recording is replaced at the upgrade rather than silently dropping turns).
+pub const PROTO_VERSION: u32 = 22;

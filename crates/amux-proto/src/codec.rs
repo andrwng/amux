@@ -244,6 +244,58 @@ mod tests {
             terminal: t,
             size: Size { cols: 80, rows: 24 },
         });
+        roundtrip(ClientMsg::ListWorktrees);
+        roundtrip(ClientMsg::Turns {
+            worktree: id,
+            after: 41,
+            limit: 200,
+        });
+        roundtrip(ClientMsg::Turns {
+            worktree: id,
+            after: u64::MAX,
+            limit: 0,
+        });
+        roundtrip(ClientMsg::OpenWorktree { worktree: id });
+        roundtrip(ClientMsg::WorktreeShown {
+            worktree: id,
+            shown: false,
+        });
+    }
+
+    fn sample_instance() -> crate::InstanceInfo {
+        crate::InstanceInfo {
+            id: "3f2c9a1e-0000-4000-8000-000000000001".into(),
+            daemon_started_at: Utc::now(),
+        }
+    }
+
+    fn sample_worktree(agent: Option<AgentState>, conversation: bool) -> crate::WorktreeInfo {
+        use amux_core::conversation::Speaker;
+        crate::WorktreeInfo {
+            id: AgentId::new(),
+            repo: sample_repo(),
+            name: "auth".into(),
+            branch: Some("feat/auth".into()),
+            path: PathBuf::from("/wt/amux/auth"),
+            task: Some("synthetic task".into()),
+            last_opened: Utc::now(),
+            unread: true,
+            session: Some("sess-2".into()),
+            agent: agent.map(|state| crate::AgentStatus {
+                state,
+                last_activity: Utc::now(),
+            }),
+            conversation: conversation.then(|| crate::ConversationInfo {
+                first_seq: 1,
+                last_seq: 42,
+                last: crate::TurnHead {
+                    seq: 42,
+                    by: Speaker::Agent,
+                    at: Utc::now(),
+                    session: Some("sess-1".into()),
+                },
+            }),
+        }
     }
 
     #[test]
@@ -309,6 +361,87 @@ mod tests {
         roundtrip(DaemonMsg::Error {
             message: "boom".into(),
         });
+        roundtrip(DaemonMsg::Worktrees {
+            instance: sample_instance(),
+            worktrees: vec![
+                sample_worktree(Some(AgentState::Idle), true),
+                sample_worktree(
+                    Some(AgentState::NeedsAttention {
+                        kind: amux_core::agent::AttentionKind::Permission,
+                        message: Some("synthetic question".into()),
+                    }),
+                    false,
+                ),
+                sample_worktree(None, false),
+            ],
+        });
+        roundtrip(DaemonMsg::Turns {
+            instance: sample_instance(),
+            worktree: id,
+            first_seq: Some(1),
+            last_seq: Some(2),
+            turns: vec![
+                crate::TurnInfo {
+                    seq: 1,
+                    by: amux_core::conversation::Speaker::User,
+                    at: Utc::now(),
+                    text: "synthetic prompt".into(),
+                    clipped: false,
+                    session: Some("sess-1".into()),
+                },
+                crate::TurnInfo {
+                    seq: 2,
+                    by: amux_core::conversation::Speaker::Agent,
+                    at: Utc::now(),
+                    text: "synthetic reply".into(),
+                    clipped: true,
+                    session: None,
+                },
+            ],
+        });
+        roundtrip(DaemonMsg::Turns {
+            instance: sample_instance(),
+            worktree: id,
+            first_seq: None,
+            last_seq: None,
+            turns: vec![],
+        });
+        roundtrip(DaemonMsg::NoSuchWorktree { worktree: id });
+        roundtrip(DaemonMsg::ShowWorktree { worktree: id });
+        roundtrip(DaemonMsg::WorktreeOpened { worktree: id });
+        roundtrip(DaemonMsg::NoClientAttached { worktree: id });
+        roundtrip(DaemonMsg::WorktreeNotShown { worktree: id });
+    }
+
+    /// A HEAD session (no branch), with no task, session, agent or conversation, round-trips.
+    #[test]
+    fn a_bare_worktree_roundtrips() {
+        let mut w = sample_worktree(None, false);
+        w.branch = None;
+        w.task = None;
+        w.session = None;
+        roundtrip(DaemonMsg::Worktrees {
+            instance: sample_instance(),
+            worktrees: vec![w],
+        });
+    }
+
+    /// The variants a v21 peer knows keep their positions: new ones are appended, so an older
+    /// daemon's rejection (`Error`) still decodes as `Error` here and reads as "another version".
+    #[test]
+    fn new_variants_are_appended() {
+        let mut codec = WireCodec::<DaemonMsg, DaemonMsg>::new();
+        let mut buf = BytesMut::new();
+        codec
+            .encode(
+                DaemonMsg::Error {
+                    message: String::new(),
+                },
+                &mut buf,
+            )
+            .unwrap();
+        // Error was variant 21 (0-based) in v21 and still is.
+        assert_eq!(buf[4], 21);
     }
 
     #[test]
