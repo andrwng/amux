@@ -9,6 +9,7 @@ use std::sync::Arc;
 use anyhow::{Context, Result};
 use tokio::io::AsyncReadExt;
 use tokio::net::{UnixListener, UnixStream};
+use tokio::sync::Semaphore;
 
 use amux_core::hook::{HookReport, PaneMessage, TurnReport};
 
@@ -25,20 +26,30 @@ pub fn bind_mailbox(path: &Path) -> Result<UnixListener> {
     UnixListener::bind(path).context("bind mailbox socket")
 }
 
+/// How many conversation turns may be waiting to be written at once. A turn arriving past this is
+/// dropped (with a warning that carries no text) rather than queued without bound.
+pub(crate) const MAX_PENDING_TURNS: usize = 32;
+
 /// Accept hook connections forever, each handled on its own task.
 pub async fn serve_mailbox(listener: UnixListener, registry: Arc<Registry>) -> Result<()> {
+    let turn_slots = Arc::new(Semaphore::new(MAX_PENDING_TURNS));
     loop {
         let (stream, _addr) = listener.accept().await.context("accept hook connection")?;
         let registry = Arc::clone(&registry);
+        let turn_slots = Arc::clone(&turn_slots);
         tokio::spawn(async move {
-            if let Err(e) = handle(stream, &registry).await {
+            if let Err(e) = handle(stream, registry, turn_slots).await {
                 tracing::debug!("hook report ignored: {e:#}");
             }
         });
     }
 }
 
-async fn handle(stream: UnixStream, registry: &Registry) -> Result<()> {
+async fn handle(
+    stream: UnixStream,
+    registry: Arc<Registry>,
+    turn_slots: Arc<Semaphore>,
+) -> Result<()> {
     let mut buf = Vec::with_capacity(1024);
     stream
         .take(MAX_REPORT_BYTES as u64)
@@ -50,7 +61,22 @@ async fn handle(stream: UnixStream, registry: &Registry) -> Result<()> {
         PaneMessage::Hook(report) => registry.on_hook(report),
         PaneMessage::Passthrough { terminal, on } => registry.set_passthrough(terminal, on),
         PaneMessage::Nav { terminal, dir } => registry.request_nav(terminal, dir),
-        PaneMessage::Turn(report) => registry.on_turn(report),
+        PaneMessage::Turn(report) => {
+            // Writing the log is file I/O: off the async workers, and bounded.
+            let Ok(slot) = turn_slots.try_acquire_owned() else {
+                tracing::warn!(
+                    "dropped a turn for {}: {MAX_PENDING_TURNS} are already waiting to be written",
+                    report.agent
+                );
+                return Ok(());
+            };
+            tokio::task::spawn_blocking(move || {
+                registry.on_turn(report);
+                drop(slot);
+            })
+            .await
+            .context("record a turn")?;
+        }
     }
     Ok(())
 }

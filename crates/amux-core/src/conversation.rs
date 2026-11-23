@@ -53,39 +53,66 @@ impl Turn {
 /// between them. Returns the text and whether it was cut. Cuts land on character boundaries, so
 /// the result is always valid UTF-8 and never longer than `limit`.
 pub fn clip_text(text: &str, limit: usize) -> (String, bool) {
-    if text.len() <= limit {
+    clip_by_cost(text, limit, char::len_utf8)
+}
+
+/// [`clip_text`], measuring by what the text takes inside a JSON string rather than by its own
+/// bytes: a control character costs six bytes there (`\u0001`), a quote or backslash two. Clipped
+/// with this, the text's JSON encoding (without the quotes) is never longer than `limit`, so a
+/// stored line is bounded whatever characters the text is made of.
+pub fn clip_text_for_json(text: &str, limit: usize) -> (String, bool) {
+    clip_by_cost(text, limit, json_escaped_len)
+}
+
+/// How many bytes `c` takes inside a JSON string as `serde_json` writes it.
+pub fn json_escaped_len(c: char) -> usize {
+    match c {
+        '"' | '\\' | '\u{8}' | '\u{c}' | '\n' | '\r' | '\t' => 2,
+        '\0'..='\u{1f}' => 6,
+        _ => c.len_utf8(),
+    }
+}
+
+/// Clip `text` so its total `cost` is at most `limit`, keeping head and tail with
+/// [`CLIP_MARKER`] between them (the marker's cost counted), cutting only between characters.
+fn clip_by_cost(text: &str, limit: usize, cost: fn(char) -> usize) -> (String, bool) {
+    let total: usize = text.chars().map(cost).sum();
+    if total <= limit {
         return (text.to_string(), false);
     }
-    let Some(room) = limit.checked_sub(CLIP_MARKER.len()) else {
-        // A limit smaller than the marker leaves room for nothing but a head.
-        return (text[..floor_char_boundary(text, limit)].to_string(), true);
+    // The longest prefix costing at most `budget`, as a byte index.
+    let prefix_end = |budget: usize| {
+        let mut spent = 0;
+        for (i, c) in text.char_indices() {
+            spent += cost(c);
+            if spent > budget {
+                return i;
+            }
+        }
+        text.len()
     };
-    let head_end = floor_char_boundary(text, room / 2);
-    let tail_len = room - head_end;
-    let tail_start = ceil_char_boundary(text, text.len() - tail_len);
+    let marker: usize = CLIP_MARKER.chars().map(cost).sum();
+    let Some(room) = limit.checked_sub(marker) else {
+        // A limit smaller than the marker leaves room for nothing but a head.
+        return (text[..prefix_end(limit)].to_string(), true);
+    };
+    let head_end = prefix_end(room / 2);
+    let head_cost: usize = text[..head_end].chars().map(cost).sum();
+    // The longest suffix costing at most what is left.
+    let mut tail_start = text.len();
+    let mut spent = 0;
+    for (i, c) in text.char_indices().rev() {
+        spent += cost(c);
+        if spent > room - head_cost || i < head_end {
+            break;
+        }
+        tail_start = i;
+    }
     let mut out = String::with_capacity(limit);
     out.push_str(&text[..head_end]);
     out.push_str(CLIP_MARKER);
     out.push_str(&text[tail_start..]);
     (out, true)
-}
-
-/// The largest char boundary at or below `i`.
-fn floor_char_boundary(s: &str, i: usize) -> usize {
-    let mut i = i.min(s.len());
-    while !s.is_char_boundary(i) {
-        i -= 1;
-    }
-    i
-}
-
-/// The smallest char boundary at or above `i`.
-fn ceil_char_boundary(s: &str, i: usize) -> usize {
-    let mut i = i.min(s.len());
-    while !s.is_char_boundary(i) {
-        i += 1;
-    }
-    i
 }
 
 #[cfg(test)]
@@ -143,6 +170,39 @@ mod tests {
         let (out, clipped) = clip_text("abcdefghij", 4);
         assert!(clipped);
         assert_eq!(out, "abcd");
+    }
+
+    /// What JSON escaping makes of a text is bounded by the limit, for text of any characters.
+    #[test]
+    fn clipping_for_json_bounds_the_encoded_size() {
+        let encoded = |s: &str| serde_json::to_string(s).unwrap().len() - 2;
+        for text in [
+            "\u{1}".repeat(64 * 1024),
+            "\"\\".repeat(20 * 1024),
+            format!("HEAD{}TAIL", "\u{7}🦀\n".repeat(10_000)),
+        ] {
+            let (out, clipped) = clip_text_for_json(&text, MAX_TURN_TEXT_BYTES);
+            assert!(clipped);
+            assert!(
+                encoded(&out) <= MAX_TURN_TEXT_BYTES,
+                "{} bytes",
+                encoded(&out)
+            );
+            assert!(
+                encoded(&out) > MAX_TURN_TEXT_BYTES - 16,
+                "uses the room it has"
+            );
+            assert!(out.contains(CLIP_MARKER));
+        }
+        let (out, clipped) = clip_text_for_json("HEAD-z-TAIL", 1000);
+        assert_eq!((out.as_str(), clipped), ("HEAD-z-TAIL", false));
+        let text = format!("HEAD{}TAIL", "\u{1}".repeat(MAX_TURN_TEXT_BYTES));
+        let (out, _) = clip_text_for_json(&text, MAX_TURN_TEXT_BYTES);
+        assert!(out.starts_with("HEAD") && out.ends_with("TAIL"));
+        // Every character's cost matches what serde_json writes.
+        for c in ['\0', '\u{1f}', '\n', '"', '\\', 'a', '\u{7f}', 'é', '🦀'] {
+            assert_eq!(json_escaped_len(c), encoded(&c.to_string()), "{c:?}");
+        }
     }
 
     #[test]

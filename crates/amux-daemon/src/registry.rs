@@ -300,9 +300,10 @@ pub struct TurnsPage {
 
 pub struct Registry {
     state: Mutex<State>,
-    /// Each worktree's conversation log. Its own lock, never taken while `state` is held, so a
-    /// slow disk on a turn never stalls the state machine. `None` when recording is off.
-    conversation: Option<Mutex<ConversationLog>>,
+    /// Each worktree's conversation log, locked per worktree and never while `state` is held, so
+    /// a slow disk on a turn never stalls the state machine. Its calls block on file I/O: the
+    /// mailbox and the server make them off the async workers. `None` when recording is off.
+    conversation: Option<ConversationLog>,
     clock: Arc<dyn Clock>,
     /// Which amux this is, for readers that must tell one from another.
     instance: InstanceInfo,
@@ -352,7 +353,7 @@ impl Registry {
             options
                 .conversation_dir
                 .and_then(|dir| match ConversationLog::open(&dir) {
-                    Ok(log) => Some(Mutex::new(log)),
+                    Ok(log) => Some(log),
                     Err(e) => {
                         tracing::warn!("not recording conversations: {e:#}");
                         None
@@ -687,7 +688,6 @@ impl Registry {
         let agents: Vec<AgentId> = state.agents.keys().copied().collect();
         drop(state);
         if let Some(log) = &self.conversation {
-            let mut log = log.lock().unwrap();
             for agent in agents {
                 if let Err(e) = log.load(agent) {
                     tracing::warn!("could not load the conversation log of {agent}: {e:#}");
@@ -775,7 +775,6 @@ impl Registry {
                 .collect()
         };
         if let Some(log) = &self.conversation {
-            let log = log.lock().unwrap();
             for w in &mut out {
                 w.conversation = log.summary(w.id).map(|s| ConversationInfo {
                     first_seq: s.first_seq,
@@ -1066,7 +1065,7 @@ impl Registry {
             return;
         }
         let at = self.clock.now();
-        if let Err(e) = log.lock().unwrap().append(report.agent, report.turn, at) {
+        if let Err(e) = log.append(report.agent, report.turn, at) {
             tracing::warn!("could not record a turn for {}: {e:#}", report.agent);
         }
     }
@@ -1089,14 +1088,33 @@ impl Registry {
                 turns: Vec::new(),
             }));
         };
-        let log = log.lock().unwrap();
         Some(
             log.read_after(agent, after, limit, max_bytes)
                 .map(|turns| TurnsPage {
-                    summary: log.summary(agent).cloned(),
+                    summary: log.summary(agent),
                     turns,
                 }),
         )
+    }
+
+    /// Test seam: hold, on a thread of its own, the lock a read of `agent`'s conversation holds —
+    /// as a slow disk would — until the returned sender is dropped or sent to.
+    #[cfg(test)]
+    pub(crate) fn hold_conversation_lock(
+        self: &Arc<Self>,
+        agent: AgentId,
+    ) -> std::sync::mpsc::Sender<()> {
+        let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+        let (held_tx, held_rx) = std::sync::mpsc::channel();
+        let me = Arc::clone(self);
+        std::thread::spawn(move || {
+            me.conversation
+                .as_ref()
+                .unwrap()
+                .hold(agent, held_tx, release_rx);
+        });
+        held_rx.recv().unwrap();
+        release_tx
     }
 
     /// Fold an [`AgentEvent`] into an agent's state via the pure state machine, flag unread on a
@@ -1399,7 +1417,7 @@ impl Registry {
         }
         // The conversation goes with the worktree.
         if let Some(log) = &self.conversation {
-            log.lock().unwrap().remove(id);
+            log.remove(id);
         }
         // Remove the managed worktree/branch only for a worktree session; a HEAD session has none
         // and must never prune anything in the user's live tree. Clean up its out-of-tree hook
@@ -1667,6 +1685,253 @@ mod tests {
         let primary = TerminalId::new();
         let saved = leaf(Some(primary));
         assert_eq!(blank_dead_terminals(&saved, primary), saved);
+    }
+
+    // --- Conversation log concurrency: a real registry over a temp git repo, `cat` agents. ---
+
+    use amux_core::adapter::ClaudeAdapter;
+    use amux_core::conversation::{Speaker, Turn};
+    use std::time::Duration as StdDuration;
+
+    fn init_repo(dir: &Path) {
+        let repo = git2::Repository::init(dir).unwrap();
+        {
+            let mut config = repo.config().unwrap();
+            config.set_str("user.name", "amux test").unwrap();
+            config.set_str("user.email", "test@amux.local").unwrap();
+        }
+        std::fs::write(dir.join("README.md"), "hello").unwrap();
+        let mut index = repo.index().unwrap();
+        index.add_path(Path::new("README.md")).unwrap();
+        index.write().unwrap();
+        let tree = repo.find_tree(index.write_tree().unwrap()).unwrap();
+        let sig = repo.signature().unwrap();
+        repo.commit(Some("HEAD"), &sig, &sig, "init", &tree, &[])
+            .unwrap();
+    }
+
+    /// A registry recording conversations under `tmp`, with two `cat` agents whose tasks run on
+    /// the returned runtime (keep it alive for the test).
+    fn two_agents(tmp: &Path) -> (tokio::runtime::Runtime, Arc<Registry>, AgentId, AgentId) {
+        let agents_rt = tokio::runtime::Runtime::new().unwrap();
+        let _in_runtime = agents_rt.enter();
+        let repo = tmp.join("repo");
+        std::fs::create_dir(&repo).unwrap();
+        init_repo(&repo);
+        let registry = Registry::with_options(
+            Box::new(ClaudeAdapter::with_command(vec!["cat".into()])),
+            RegistryOptions {
+                state_path: Some(tmp.join("state.json")),
+                conversation_dir: Some(tmp.join("conversations")),
+                ..RegistryOptions::default()
+            },
+        );
+        let worktrees = WorktreeService::with_base(&repo, tmp.join("wt")).unwrap();
+        let repo_id = registry.register(worktrees).id;
+        let a = registry.create(repo_id, "feat/a", None).unwrap().id;
+        let b = registry.create(repo_id, "feat/b", None).unwrap().id;
+        drop(_in_runtime);
+        (agents_rt, registry, a, b)
+    }
+
+    fn turn_for(agent: AgentId, text: &str) -> TurnReport {
+        TurnReport {
+            agent,
+            turn: Turn::new(Speaker::User, text, None),
+        }
+    }
+
+    /// Run `f` on a thread and wait at most `wait` for it; `None` if it is still blocked.
+    fn within<T: Send + 'static>(
+        wait: StdDuration,
+        f: impl FnOnce() -> T + Send + 'static,
+    ) -> Option<T> {
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let _ = tx.send(f());
+        });
+        rx.recv_timeout(wait).ok()
+    }
+
+    /// While one worktree's log is busy (a slow page read holds it), another's append goes ahead.
+    #[test]
+    fn an_append_for_one_worktree_does_not_wait_for_another() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (_agents_rt, registry, a, b) = two_agents(tmp.path());
+        registry.on_turn(turn_for(a, "synthetic"));
+        registry.on_turn(turn_for(b, "synthetic"));
+        let release = registry.hold_conversation_lock(a);
+        let r = Arc::clone(&registry);
+        let done = within(StdDuration::from_secs(2), move || {
+            r.on_turn(turn_for(b, "synthetic"));
+        });
+        drop(release);
+        assert!(done.is_some(), "B's append waited for A's log");
+        let page = registry.turns(b, 0, 10, usize::MAX).unwrap().unwrap();
+        assert_eq!(page.turns.len(), 2);
+    }
+
+    /// Turns waiting to be written are bounded: past the bound a turn is dropped, with a warning
+    /// that names the worktree and quotes nothing, and the ones already waiting are all written.
+    #[test]
+    fn turns_past_the_pending_bound_are_dropped_without_their_text() {
+        #[derive(Clone, Default)]
+        struct Captured(Arc<Mutex<Vec<u8>>>);
+        impl std::io::Write for Captured {
+            fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+                self.0.lock().unwrap().extend_from_slice(buf);
+                Ok(buf.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+        let captured = Captured::default();
+
+        let tmp = tempfile::tempdir().unwrap();
+        let (_agents_rt, registry, a, _b) = two_agents(tmp.path());
+        registry.on_turn(turn_for(a, "synthetic"));
+        let mailbox = tmp.path().join("hooks.sock");
+        {
+            // The mailbox on a runtime thread of its own, logging into `captured`.
+            let registry = Arc::clone(&registry);
+            let mailbox = mailbox.clone();
+            let writer = captured.clone();
+            std::thread::spawn(move || {
+                let subscriber = tracing_subscriber::fmt()
+                    .with_writer(move || writer.clone())
+                    .finish();
+                let _guard = tracing::subscriber::set_default(subscriber);
+                let rt = tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                    .unwrap();
+                rt.block_on(async move {
+                    let hooks = crate::mailbox::bind_mailbox(&mailbox).unwrap();
+                    let _ = crate::mailbox::serve_mailbox(hooks, registry).await;
+                });
+            });
+        }
+        while !mailbox.exists() {
+            std::thread::sleep(StdDuration::from_millis(10));
+        }
+        let release = registry.hold_conversation_lock(a);
+        const SENTINEL: &str = "SENTINEL-QUEUED-4d2b";
+        let dropped = 3;
+        for _ in 0..crate::mailbox::MAX_PENDING_TURNS + dropped {
+            let payload = serde_json::json!({"hook_event_name": "UserPromptSubmit",
+                                             "session_id": "s1", "prompt": SENTINEL})
+            .to_string();
+            crate::mailbox::deliver_hook_input(&mailbox, a, &payload).unwrap();
+        }
+        let logged = || String::from_utf8(captured.0.lock().unwrap().clone()).unwrap();
+        for _ in 0..250 {
+            if logged().matches("dropped a turn").count() >= dropped {
+                break;
+            }
+            std::thread::sleep(StdDuration::from_millis(20));
+        }
+        drop(release);
+        let r = Arc::clone(&registry);
+        let want = 1 + crate::mailbox::MAX_PENDING_TURNS;
+        let written = within(StdDuration::from_secs(5), move || loop {
+            let n = r.turns(a, 0, 200, usize::MAX).unwrap().unwrap().turns.len();
+            if n >= want {
+                return n;
+            }
+            std::thread::sleep(StdDuration::from_millis(20));
+        });
+        assert_eq!(
+            written,
+            Some(want),
+            "the waiting turns are written, the rest dropped"
+        );
+        let logged = logged();
+        assert_eq!(
+            logged.matches("dropped a turn").count(),
+            dropped,
+            "{logged}"
+        );
+        assert!(logged.contains(&a.to_string()));
+        assert!(!logged.contains(SENTINEL), "the warning quotes the turn");
+    }
+
+    /// Log I/O runs off the async workers: on a single-threaded runtime, a `Turns` read stuck on
+    /// one worktree's log (a slow disk) neither stalls the runtime nor keeps a turn for another
+    /// worktree, arriving through the mailbox, from being recorded.
+    #[test]
+    fn a_stuck_page_read_does_not_stall_the_daemon() {
+        use futures::SinkExt;
+        let tmp = tempfile::tempdir().unwrap();
+        let (_agents_rt, registry, a, b) = two_agents(tmp.path());
+        let control = tmp.path().join("amuxd.sock");
+        let mailbox = tmp.path().join("hooks.sock");
+        let (stop_tx, stop_rx) = tokio::sync::oneshot::channel::<()>();
+        {
+            let registry = Arc::clone(&registry);
+            let control = control.clone();
+            let mailbox = mailbox.clone();
+            std::thread::spawn(move || {
+                let rt = tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                    .unwrap();
+                rt.block_on(async move {
+                    let listener = tokio::net::UnixListener::bind(&control).unwrap();
+                    let hooks = crate::mailbox::bind_mailbox(&mailbox).unwrap();
+                    tokio::select! {
+                        _ = crate::server::serve(listener, Arc::clone(&registry)) => {}
+                        _ = crate::mailbox::serve_mailbox(hooks, registry) => {}
+                        _ = stop_rx => {}
+                    }
+                });
+            });
+        }
+        while !mailbox.exists() {
+            std::thread::sleep(StdDuration::from_millis(10));
+        }
+        // A has a conversation to read, so the read below needs its log.
+        registry.on_turn(turn_for(a, "synthetic"));
+        let release = registry.hold_conversation_lock(a);
+        // A client asks for A's turns; the read blocks on A's log.
+        let client_rt = tokio::runtime::Runtime::new().unwrap();
+        let _client = client_rt.block_on(async {
+            let stream = tokio::net::UnixStream::connect(&control).await.unwrap();
+            let mut c = tokio_util::codec::Framed::new(stream, amux_proto::ClientCodec::new());
+            c.send(amux_proto::ClientMsg::Hello {
+                proto_version: amux_proto::PROTO_VERSION,
+            })
+            .await
+            .unwrap();
+            c.send(amux_proto::ClientMsg::Turns {
+                worktree: a,
+                after: 0,
+                limit: 10,
+            })
+            .await
+            .unwrap();
+            c
+        });
+        std::thread::sleep(StdDuration::from_millis(100));
+        // A turn for B arrives through the mailbox, as `amux hook` sends it.
+        let payload = serde_json::json!({"hook_event_name": "UserPromptSubmit",
+                                         "session_id": "s1", "prompt": "synthetic"})
+        .to_string();
+        crate::mailbox::deliver_hook_input(&mailbox, b, &payload).unwrap();
+        let r = Arc::clone(&registry);
+        let recorded = within(StdDuration::from_secs(3), move || loop {
+            let page = r.turns(b, 0, 10, usize::MAX).unwrap().unwrap();
+            if !page.turns.is_empty() {
+                return;
+            }
+            std::thread::sleep(StdDuration::from_millis(20));
+        });
+        drop(release);
+        let _ = stop_tx.send(());
+        assert!(
+            recorded.is_some(),
+            "B's turn was not recorded while A's read was stuck"
+        );
     }
 
     /// An already-blank leaf (a split whose shell had not arrived yet) stays blank rather than

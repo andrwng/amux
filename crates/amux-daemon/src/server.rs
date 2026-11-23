@@ -305,7 +305,7 @@ async fn handle_client(stream: UnixStream, registry: Arc<Registry>) -> Result<()
     loop {
         tokio::select! {
             command = stream.next() => match command {
-                Some(Ok(msg)) => handle_command(msg, connection, &registry, &out_tx, &mut attached, &mut scroll),
+                Some(Ok(msg)) => handle_command(msg, connection, &registry, &out_tx, &mut attached, &mut scroll).await,
                 _ => break,
             },
             outbound = out_rx.recv() => match outbound {
@@ -337,7 +337,7 @@ async fn handle_client(stream: UnixStream, registry: Arc<Registry>) -> Result<()
     Ok(())
 }
 
-fn handle_command(
+async fn handle_command(
     msg: ClientMsg,
     connection: ConnectionId,
     registry: &Arc<Registry>,
@@ -473,7 +473,15 @@ fn handle_command(
             limit,
         } => {
             let limit = (limit as usize).min(MAX_TURNS_PER_REPLY);
-            let reply = match registry.turns(worktree, after, limit, MAX_TURNS_REPLY_BYTES) {
+            // Reading the log is file I/O: off the async workers. This connection waits for it
+            // (it asked); no other does.
+            let reader = Arc::clone(registry);
+            let page = tokio::task::spawn_blocking(move || {
+                reader.turns(worktree, after, limit, MAX_TURNS_REPLY_BYTES)
+            })
+            .await
+            .unwrap_or_else(|e| Some(Err(anyhow::anyhow!("the read stopped: {e}"))));
+            let reply = match page {
                 None => DaemonMsg::NoSuchWorktree { worktree },
                 Some(Ok(page)) => DaemonMsg::Turns {
                     instance: registry.instance(),

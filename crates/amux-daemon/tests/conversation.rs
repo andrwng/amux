@@ -127,6 +127,8 @@ async fn a_prompt_and_its_reply_are_recorded_with_the_daemons_clock() {
     )
     .await;
     wait_for_state(&f, |s| matches!(s, AgentState::Working)).await;
+    // The turn is stamped when it is written (off the async workers), not with the status.
+    wait_for_turns(&f, 1).await;
     f.clock.advance(chrono::Duration::seconds(30));
     hook(
         &f,

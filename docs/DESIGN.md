@@ -551,9 +551,21 @@ by hand outside amux are simply not recorded.
   by one and is never reused; `at` is the daemon's `Clock` when the hook arrived. Past 2,000
   entries (plus a slack of 200, so a full log is not copied on every turn) the file is rewritten
   without the oldest — beside and renamed over, so a crash leaves one whole file — and its first
-  entry says where the log now starts. At start the daemon rebuilds, per worktree, only where the
-  log starts and its newest entry; a torn last line (a crash mid-append) is cut off. Deleting a
-  worktree deletes its log.
+  entry says where the log now starts. The daemon clips the text again by what it takes once
+  JSON-encoded (a control character is six bytes there), and the session to 256 bytes, so a stored
+  line is at most 25 KiB and a file at most about 55 MB, whatever the text is made of. At start the
+  daemon reads, per worktree, only the file's two ends: where the log starts and its newest
+  entry; a torn last line (a crash mid-append, possibly inside a multi-byte character) is cut off,
+  and a line that does not decode is skipped wherever it is. Deleting a worktree deletes its log.
+- **Off the async workers, a lock per worktree.** Appends and reads are blocking file I/O, run
+  with `spawn_blocking`: a turn from the mailbox (at most 32 waiting; past that a turn is dropped
+  with a warning naming only the worktree) and a `Turns` read for the connection that asked. Each
+  worktree's log has its own lock, and its summary another, so a slow read of one log holds up
+  neither another worktree's append nor a listing. The first read of a log builds an index of
+  each entry's byte offset (from the `{"seq":N` each line starts with, without decoding the rest);
+  appends extend it and a trim rebases it, so a page seeks to its first entry and decodes only its
+  own. A trim copies the kept lines as they are. A trim that fails costs only the trim: the entry
+  is kept, the temporary file removed, and the next attempt waits another 200 entries.
 - **Private.** The text is what the user typed, which can include a pasted secret: files are mode
   `0600` in a `0700` directory, and turn text is never logged at any level, by `amux hook` or the
   daemon (`turn_text_reaches_the_log_and_nowhere_else`).
