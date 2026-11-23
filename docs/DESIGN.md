@@ -560,7 +560,9 @@ by hand outside amux are simply not recorded.
   and a turn racing the delete cannot leave one behind: a turn looks its worktree up while
   holding that worktree's log lock, and delete removes the worktree from the state before it
   removes the log under the same lock (a turn takes the log's lock, then the state's; delete never
-  holds the state's while taking the log's).
+  holds the state's while taking the log's). At start, once `state.json` has been read, a log for
+  a worktree it does not name (a delete that never reached the log) is removed; if the state
+  cannot be read, none is.
 - **Off the async workers, a lock per worktree.** Appends and reads are blocking file I/O, run
   with `spawn_blocking`: a turn from the mailbox (at most 32 waiting; past that a turn is dropped
   with a warning naming only the worktree) and a `Turns` read for the connection that asked. Each

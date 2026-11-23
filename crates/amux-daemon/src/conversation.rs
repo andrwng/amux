@@ -411,6 +411,37 @@ impl ConversationLog {
         }
     }
 
+    /// Remove every log (and leftover temporary file) in the directory whose worktree is not in
+    /// `known`. Only files named as logs are touched: `<worktree id>.jsonl` and `.jsonl.tmp`.
+    pub fn remove_orphans(&self, known: &std::collections::HashSet<AgentId>) {
+        let entries = match std::fs::read_dir(&self.dir) {
+            Ok(entries) => entries,
+            Err(e) => {
+                tracing::warn!("could not list {}: {e}", self.dir.display());
+                return;
+            }
+        };
+        for entry in entries.flatten() {
+            let name = entry.file_name();
+            let Some(name) = name.to_str() else {
+                continue;
+            };
+            let Some(id) = name
+                .strip_suffix(".jsonl")
+                .or_else(|| name.strip_suffix(".jsonl.tmp"))
+                .and_then(AgentId::parse)
+            else {
+                continue;
+            };
+            if !known.contains(&id) {
+                self.remove(id);
+                tracing::info!(
+                    "removed the conversation log of {id}, a worktree amux no longer has"
+                );
+            }
+        }
+    }
+
     /// Test seam: hold `agent`'s file lock — as a slow read would — on the calling thread, saying
     /// so on `held`, until `release` is sent to or dropped.
     #[cfg(test)]

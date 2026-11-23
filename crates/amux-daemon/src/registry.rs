@@ -602,6 +602,10 @@ impl Registry {
                 return;
             }
         };
+        // Every worktree the state names, reinstated below or not (an agent whose repository
+        // cannot be opened right now still owns its log).
+        let named: std::collections::HashSet<AgentId> =
+            persisted.agents.iter().map(|a| a.id).collect();
         let mut state = self.state.lock().unwrap();
         for r in persisted.repos {
             match WorktreeService::with_base(&r.repo, &r.base) {
@@ -698,6 +702,10 @@ impl Registry {
                     tracing::warn!("could not load the conversation log of {agent}: {e:#}");
                 }
             }
+            // Only now that the state has been read: a log for a worktree it does not name was
+            // left by a delete that never reached the log (an older daemon, a crash), and nothing
+            // would ever remove it. A state that could not be read returned above, removing none.
+            log.remove_orphans(&named);
         }
     }
 

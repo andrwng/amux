@@ -398,3 +398,50 @@ async fn a_listing_reports_an_agent_only_for_this_run() {
     assert!(w.agent.is_none(), "no process after a restart");
     assert_eq!(w.branch.as_deref(), Some("feat/talk"));
 }
+
+/// A log whose worktree is not in `state.json` (deleted while the daemon was down, or by an older
+/// daemon) is removed at start, once the state has loaded; the logs of known worktrees and any
+/// other file stay. If the state could not be read, nothing is removed.
+#[tokio::test]
+async fn orphaned_logs_are_removed_at_start() {
+    let f = fixture().await;
+    hook(
+        &f,
+        serde_json::json!({"hook_event_name": "UserPromptSubmit", "session_id": "s1",
+                           "prompt": "kept"}),
+    )
+    .await;
+    wait_for_turns(&f, 1).await;
+    f.registry.save();
+    let dir = f.tmp.path().join("conversations");
+    let kept = dir.join(format!("{}.jsonl", f.agent.to_full_string()));
+    let orphan = dir.join(format!("{}.jsonl", AgentId::new().to_full_string()));
+    let orphan_tmp = dir.join(format!("{}.jsonl.tmp", AgentId::new().to_full_string()));
+    let other = dir.join("notes.txt");
+    for p in [&orphan, &orphan_tmp, &other] {
+        std::fs::write(p, b"{\"seq\":1}\n").unwrap();
+    }
+    let restart = |state: &str| {
+        let r = Registry::with_options(
+            Box::new(ClaudeAdapter::with_command(vec!["cat".into()])),
+            RegistryOptions {
+                state_path: Some(f.tmp.path().join(state)),
+                conversation_dir: Some(dir.clone()),
+                ..RegistryOptions::default()
+            },
+        );
+        r.load_state();
+        r
+    };
+
+    // A state that cannot be read removes nothing.
+    std::fs::write(f.tmp.path().join("damaged.json"), b"{not json").unwrap();
+    restart("damaged.json");
+    assert!(orphan.exists() && orphan_tmp.exists() && kept.exists());
+
+    restart("state.json");
+    assert!(!orphan.exists(), "the orphaned log is removed");
+    assert!(!orphan_tmp.exists(), "and an orphaned temporary file");
+    assert!(kept.exists(), "a known worktree's log stays");
+    assert!(other.exists(), "a file that is not a log stays");
+}
