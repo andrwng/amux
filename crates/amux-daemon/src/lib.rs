@@ -84,8 +84,16 @@ pub fn run_blocking(repo: PathBuf) -> Result<()> {
     // The bridge Claude's hooks invoke (absolute path — hooks run with cwd = the worktree).
     let amux_exe = std::env::current_exe().context("locate the amux executable")?;
 
+    // Everything that can fail without a socket bound is resolved first: an error here leaves
+    // nothing behind to clean up.
+    let state_path = amux_core::paths::state_file()?;
+    let conversation_dir = amux_core::paths::conversation_dir()?;
+    let instance_id_path = amux_core::paths::amux_home()?.join("instance-id");
+
     let runtime = tokio::runtime::Runtime::new().context("build tokio runtime")?;
     runtime.block_on(async move {
+        let mut sigterm = signal(SignalKind::terminate()).context("install SIGTERM handler")?;
+        let mut sigint = signal(SignalKind::interrupt()).context("install SIGINT handler")?;
         // Arbitrates against a daemon already on the socket via the advisory lock: stands down
         // behind a compatible or merely-unreachable incumbent, evicts only a confirmed-incompatible
         // one (the reinstall case) so it cannot linger with its PTYs.
@@ -100,63 +108,76 @@ pub fn run_blocking(repo: PathBuf) -> Result<()> {
             );
             return Ok(());
         };
-        std::fs::set_permissions(&socket, std::fs::Permissions::from_mode(0o600)).ok();
-        let hook_listener = mailbox::bind_mailbox(&mailbox)?;
-        std::fs::set_permissions(&mailbox, std::fs::Permissions::from_mode(0o600)).ok();
+        // From here on the socket is ours: every way out goes through the cleanup below. The
+        // pidfile is written first, because the cleanup removes only files a pidfile naming this
+        // process vouches for.
         std::fs::write(&pidfile, std::process::id().to_string()).ok();
-        tracing::info!(
-            "amux daemon for {} listening at {} (mailbox {}, pid {})",
-            repo.display(),
-            socket.display(),
-            mailbox.display(),
-            std::process::id()
-        );
+        let outcome = async {
+            std::fs::set_permissions(&socket, std::fs::Permissions::from_mode(0o600)).ok();
+            let hook_listener = mailbox::bind_mailbox(&mailbox)?;
+            std::fs::set_permissions(&mailbox, std::fs::Permissions::from_mode(0o600)).ok();
+            tracing::info!(
+                "amux daemon for {} listening at {} (mailbox {}, pid {})",
+                repo.display(),
+                socket.display(),
+                mailbox.display(),
+                std::process::id()
+            );
 
-        let state_path = amux_core::paths::state_file()?;
-        let conversation_dir = amux_core::paths::conversation_dir()?;
-        let registry = Registry::with_options(
-            adapter,
-            RegistryOptions {
-                hooks: Some((mailbox.clone(), amux_exe)),
-                state_path: Some(state_path),
-                conversation_dir: Some(conversation_dir),
-                instance_id: Some(instance_id()?),
-                ..RegistryOptions::default()
-            },
-        );
-        // Reinstate agents/repos/minis from a previous run (suspended until a client opens them).
-        registry.load_state();
-        // Pre-register the launching repo so `amux` in a repo dir works out of the box; clients
-        // also register their own cwd on connect, so the daemon serves many repos over time.
-        if let Err(e) = registry.register_path(&repo, WorktreeLocation::Global) {
-            tracing::warn!("could not register launch repo {}: {e:#}", repo.display());
+            let registry = Registry::with_options(
+                adapter,
+                RegistryOptions {
+                    hooks: Some((mailbox.clone(), amux_exe)),
+                    state_path: Some(state_path),
+                    conversation_dir: Some(conversation_dir),
+                    // Made under the lock, so a daemon that stands down never replaces it.
+                    instance_id: Some(instance_id_for_this_run(&instance_id_path)),
+                    ..RegistryOptions::default()
+                },
+            );
+            // Reinstate agents/repos/minis from a previous run (suspended until a client opens
+            // them).
+            registry.load_state();
+            // Pre-register the launching repo so `amux` in a repo dir works out of the box;
+            // clients also register their own cwd on connect, so the daemon serves many repos
+            // over time.
+            if let Err(e) = registry.register_path(&repo, WorktreeLocation::Global) {
+                tracing::warn!("could not register launch repo {}: {e:#}", repo.display());
+            }
+
+            let outcome = tokio::select! {
+                r = server::serve(listener, registry.clone()) => r,
+                r = mailbox::serve_mailbox(hook_listener, registry.clone()) => r,
+                _ = sigterm.recv() => { tracing::info!("SIGTERM, shutting down"); Ok(()) }
+                _ = sigint.recv() => { tracing::info!("SIGINT, shutting down"); Ok(()) }
+            };
+
+            // Capture any last durable changes (e.g. unread/activity) before the processes die.
+            registry.save();
+            // Graceful: agents get SIGTERM and a moment to checkpoint before they are killed.
+            registry.shutdown_all().await;
+            outcome
         }
-        let mut sigterm = signal(SignalKind::terminate()).context("install SIGTERM handler")?;
-        let mut sigint = signal(SignalKind::interrupt()).context("install SIGINT handler")?;
-
-        let outcome = tokio::select! {
-            r = server::serve(listener, registry.clone()) => r,
-            r = mailbox::serve_mailbox(hook_listener, registry.clone()) => r,
-            _ = sigterm.recv() => { tracing::info!("SIGTERM, shutting down"); Ok(()) }
-            _ = sigint.recv() => { tracing::info!("SIGINT, shutting down"); Ok(()) }
-        };
-
-        // Capture any last durable changes (e.g. unread/activity) before the processes die.
-        registry.save();
-        // Graceful: agents get SIGTERM and a moment to checkpoint before they are killed.
-        registry.shutdown_all().await;
+        .await;
         cleanup_if_owner(&pidfile, &[&socket, &mailbox], std::process::id());
         outcome
     })
 }
 
-/// This amux home's instance id: read from `<amux_home>/instance-id`, or made (a uuid) and kept
-/// there the first time. It is what lets a reader tell this amux from another one.
-fn instance_id() -> Result<String> {
-    let path = amux_core::paths::amux_home()?.join("instance-id");
-    read_or_make_instance_id(&path)
+/// The instance id kept at `path`, or — if it cannot be read or kept there — one made for this
+/// run alone, with a warning. Never a reason not to start.
+fn instance_id_for_this_run(path: &Path) -> String {
+    read_or_make_instance_id(path).unwrap_or_else(|e| {
+        tracing::warn!(
+            "could not keep an instance id at {}: {e:#}; using one for this run only",
+            path.display()
+        );
+        uuid::Uuid::new_v4().to_string()
+    })
 }
 
+/// This amux home's instance id: read from `path` (`<amux_home>/instance-id`), or made (a uuid)
+/// and kept there the first time. It is what lets a reader tell this amux from another one.
 fn read_or_make_instance_id(path: &Path) -> Result<String> {
     if let Ok(existing) = std::fs::read_to_string(path) {
         let existing = existing.trim();
@@ -278,6 +299,20 @@ mod tests {
         let replaced = read_or_make_instance_id(&path).unwrap();
         assert_ne!(replaced, "not an id");
         assert_eq!(read_or_make_instance_id(&path).unwrap(), replaced);
+    }
+
+    /// An instance id that cannot be kept (the home is not writable) does not stop the daemon: it
+    /// gets an id for this run only.
+    #[test]
+    fn an_instance_id_that_cannot_be_kept_is_made_for_this_run() {
+        let tmp = tempfile::tempdir().unwrap();
+        let not_a_dir = tmp.path().join("file");
+        std::fs::write(&not_a_dir, b"").unwrap();
+        let path = not_a_dir.join("instance-id");
+        assert!(read_or_make_instance_id(&path).is_err(), "cannot be kept");
+        let id = instance_id_for_this_run(&path);
+        assert!(uuid::Uuid::parse_str(&id).is_ok(), "got {id:?}");
+        assert_ne!(instance_id_for_this_run(&path), id, "one per run");
     }
 
     #[test]
