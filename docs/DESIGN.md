@@ -556,7 +556,11 @@ by hand outside amux are simply not recorded.
   line is at most 25 KiB and a file at most about 55 MB, whatever the text is made of. At start the
   daemon reads, per worktree, only the file's two ends: where the log starts and its newest
   entry; a torn last line (a crash mid-append, possibly inside a multi-byte character) is cut off,
-  and a line that does not decode is skipped wherever it is. Deleting a worktree deletes its log.
+  and a line that does not decode is skipped wherever it is. Deleting a worktree deletes its log,
+  and a turn racing the delete cannot leave one behind: a turn looks its worktree up while
+  holding that worktree's log lock, and delete removes the worktree from the state before it
+  removes the log under the same lock (a turn takes the log's lock, then the state's; delete never
+  holds the state's while taking the log's).
 - **Off the async workers, a lock per worktree.** Appends and reads are blocking file I/O, run
   with `spawn_blocking`: a turn from the mailbox (at most 32 waiting; past that a turn is dropped
   with a warning naming only the worktree) and a `Turns` read for the connection that asked. Each

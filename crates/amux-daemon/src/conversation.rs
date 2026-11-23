@@ -183,9 +183,55 @@ impl ConversationLog {
     /// Append `turn` to `agent`'s log as the next entry, stamped `at`, and trim the file if it has
     /// grown past its bound. Returns the entry's sequence number. The text is clipped again here,
     /// by what it takes once JSON-encoded, so a stored line stays within [`MAX_LINE_BYTES`].
+    /// (The daemon appends with [`append_if`](Self::append_if); this is its unconditional form,
+    /// for tests.)
+    #[cfg(test)]
     pub fn append(&self, agent: AgentId, turn: Turn, at: DateTime<Utc>) -> Result<u64> {
         let worktree = self.worktree(agent);
         let mut file = worktree.file.lock().unwrap();
+        self.append_locked(agent, &worktree, &mut file, turn, at)
+    }
+
+    /// [`append`](Self::append), but only if `wanted()` says so, asked while this worktree's log
+    /// is locked: so a [`remove`](Self::remove) (which takes the same lock) is either wholly
+    /// before the question — and `wanted` sees the worktree gone — or wholly after the write, and
+    /// removes it. `None` when not wanted. `wanted` may take other locks; nothing here holds this
+    /// one while waiting for them in the other order.
+    pub fn append_if(
+        &self,
+        agent: AgentId,
+        turn: Turn,
+        at: DateTime<Utc>,
+        wanted: impl FnOnce() -> bool,
+    ) -> Result<Option<u64>> {
+        let worktree = self.worktree(agent);
+        let mut file = worktree.file.lock().unwrap();
+        if !wanted() {
+            drop(file);
+            // Forget a log this call made for nothing, so unwanted turns leave no entry behind.
+            let mut worktrees = self.worktrees.lock().unwrap();
+            let unused = worktree.summary.lock().unwrap().is_none();
+            if unused
+                && worktrees
+                    .get(&agent)
+                    .is_some_and(|w| Arc::ptr_eq(w, &worktree))
+            {
+                worktrees.remove(&agent);
+            }
+            return Ok(None);
+        }
+        self.append_locked(agent, &worktree, &mut file, turn, at)
+            .map(Some)
+    }
+
+    fn append_locked(
+        &self,
+        agent: AgentId,
+        worktree: &WorktreeLog,
+        file: &mut FileState,
+        turn: Turn,
+        at: DateTime<Utc>,
+    ) -> Result<u64> {
         let (text, clipped_here) = clip_text_for_json(&turn.text, MAX_TURN_TEXT_BYTES);
         let session = turn
             .session
@@ -232,7 +278,7 @@ impl ConversationLog {
             // The entry is written whatever becomes of the trim, so a failed trim is reported as
             // that, and not retried on every turn after it: only once another slack's worth of
             // entries has arrived.
-            if let Err(e) = self.trim(agent, &worktree, &mut file) {
+            if let Err(e) = self.trim(agent, worktree, file) {
                 tracing::warn!("could not trim the conversation log of {agent}: {e:#}");
                 if let Some(summary) = worktree.summary.lock().unwrap().as_mut() {
                     summary.trim_past = summary.span() + TRIM_SLACK as u64;

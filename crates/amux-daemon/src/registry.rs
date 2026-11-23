@@ -312,6 +312,9 @@ pub struct Registry {
     hooks: Option<HookIntegration>,
     /// PTY-silence window after which the heartbeat settles a `Working` agent to `Idle`.
     idle_timeout: Duration,
+    /// Test seam: called by `on_turn` once it has found the agent, before it writes.
+    #[cfg(test)]
+    after_turn_check: Mutex<Option<Box<dyn Fn() + Send + Sync>>>,
     /// Where durable state (repos/agents/minis) is written so it survives a daemon restart.
     /// `None` disables persistence (tests, unless they opt in via [`Registry::with_state`]).
     state_path: Option<PathBuf>,
@@ -376,6 +379,8 @@ impl Registry {
                 .hooks
                 .map(|(socket, amux_exe)| HookIntegration { socket, amux_exe }),
             idle_timeout: options.idle_timeout,
+            #[cfg(test)]
+            after_turn_check: Mutex::new(None),
             state_path: options.state_path,
         })
     }
@@ -1050,23 +1055,36 @@ impl Registry {
 
     /// Record a conversation turn `amux hook` forwarded: the next entry in the worktree's log,
     /// stamped with the daemon's clock. A turn for an agent the daemon does not know is dropped.
-    /// The text is never logged, at any level.
+    /// The text is never logged, at any level. Blocks on file I/O.
+    ///
+    /// The agent is looked up while its log is locked ([`ConversationLog::append_if`]), so a turn
+    /// racing [`delete`](Self::delete) cannot leave a log behind: delete takes the agent out of
+    /// `state` first and then removes the log under the same lock, so either the lookup sees the
+    /// agent gone, or the write finishes first and delete removes it. Lock order: this takes the
+    /// log's lock and then `state` briefly; delete never holds `state` while taking the log's.
     pub fn on_turn(&self, report: TurnReport) {
         let Some(log) = &self.conversation else {
             return;
         };
-        if !self
-            .state
-            .lock()
-            .unwrap()
-            .agents
-            .contains_key(&report.agent)
-        {
+        let agent = report.agent;
+        let known = || self.state.lock().unwrap().agents.contains_key(&agent);
+        // A cheap first look, so a turn for an id the daemon never had makes no log at all.
+        if !known() {
             return;
         }
         let at = self.clock.now();
-        if let Err(e) = log.append(report.agent, report.turn, at) {
-            tracing::warn!("could not record a turn for {}: {e:#}", report.agent);
+        let still_known = || {
+            let found = known();
+            #[cfg(test)]
+            if found {
+                if let Some(pause) = self.after_turn_check.lock().unwrap().as_ref() {
+                    pause();
+                }
+            }
+            found
+        };
+        if let Err(e) = log.append_if(agent, report.turn, at, still_known) {
+            tracing::warn!("could not record a turn for {agent}: {e:#}");
         }
     }
 
@@ -1769,6 +1787,39 @@ mod tests {
         assert!(done.is_some(), "B's append waited for A's log");
         let page = registry.turns(b, 0, 10, usize::MAX).unwrap().unwrap();
         assert_eq!(page.turns.len(), 2);
+    }
+
+    /// A turn racing a delete leaves no log behind: `on_turn` is paused just after it found the
+    /// agent, the worktree is deleted meanwhile, and then the turn goes on.
+    #[test]
+    fn a_turn_racing_a_delete_leaves_no_log() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (_agents_rt, registry, a, _b) = two_agents(tmp.path());
+        let (paused_tx, paused_rx) = std::sync::mpsc::channel::<()>();
+        let (go_tx, go_rx) = std::sync::mpsc::channel::<()>();
+        let go_rx = Mutex::new(go_rx);
+        *registry.after_turn_check.lock().unwrap() = Some(Box::new(move || {
+            let _ = paused_tx.send(());
+            let _ = go_rx.lock().unwrap().recv();
+        }));
+        let r = Arc::clone(&registry);
+        let turn = std::thread::spawn(move || r.on_turn(turn_for(a, "synthetic")));
+        paused_rx.recv().unwrap();
+        let r = Arc::clone(&registry);
+        let delete = std::thread::spawn(move || r.delete(a, true).map(|_| ()));
+        // Give the delete every chance to finish while the turn is paused.
+        std::thread::sleep(StdDuration::from_millis(300));
+        go_tx.send(()).unwrap();
+        turn.join().unwrap();
+        delete.join().unwrap().unwrap();
+        let file = tmp
+            .path()
+            .join("conversations")
+            .join(format!("{}.jsonl", a.to_full_string()));
+        assert!(
+            !file.exists(),
+            "the deleted worktree's conversation was left on disk"
+        );
     }
 
     /// Turns waiting to be written are bounded: past the bound a turn is dropped, with a warning
