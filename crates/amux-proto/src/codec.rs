@@ -255,6 +255,7 @@ mod tests {
             after: u64::MAX,
             limit: 0,
         });
+        roundtrip(ClientMsg::OpenWorktree { worktree: id });
     }
 
     fn sample_instance() -> crate::InstanceInfo {
@@ -402,6 +403,9 @@ mod tests {
             turns: vec![],
         });
         roundtrip(DaemonMsg::NoSuchWorktree { worktree: id });
+        roundtrip(DaemonMsg::ShowWorktree { worktree: id });
+        roundtrip(DaemonMsg::WorktreeOpened { worktree: id });
+        roundtrip(DaemonMsg::NoClientAttached { worktree: id });
     }
 
     /// A HEAD session (no branch), with no task, session, agent or conversation, round-trips.

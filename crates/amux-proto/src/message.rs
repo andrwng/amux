@@ -227,6 +227,10 @@ pub enum ClientMsg {
         after: u64,
         limit: u32,
     },
+    /// Ask the daemon to have the most recently used terminal client show `worktree`, as if the
+    /// user had chosen it there. Replied to with `WorktreeOpened`, `NoClientAttached` or
+    /// `NoSuchWorktree`. Starts nothing: no client, no agent, no window.
+    OpenWorktree { worktree: AgentId },
 }
 
 /// Messages the daemon sends to the client.
@@ -326,4 +330,11 @@ pub enum DaemonMsg {
     },
     /// A request named a worktree the daemon does not have.
     NoSuchWorktree { worktree: AgentId },
+    /// To one terminal client, the one the user most recently used: show `worktree` in the main
+    /// pane, as if the user had chosen it in the sidebar (`amux worktree open`).
+    ShowWorktree { worktree: AgentId },
+    /// Reply to `OpenWorktree`: a terminal client was asked to show it.
+    WorktreeOpened { worktree: AgentId },
+    /// Reply to `OpenWorktree`: no terminal client is attached to ask.
+    NoClientAttached { worktree: AgentId },
 }

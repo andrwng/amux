@@ -1470,7 +1470,10 @@ async fn durable_state_survives_a_daemon_restart() {
         let mini = registry.create(repo_id, "mini", None).unwrap();
         registry.set_minis(vec![mini.id]);
         registry.set_active(Some(info.id));
-        registry.focus(registry.connect(), Some(info.id));
+        registry.focus(
+            registry.connect(tokio::sync::mpsc::unbounded_channel().0),
+            Some(info.id),
+        );
         info
     };
     assert!(state_path.exists(), "state.json is written");
@@ -1866,7 +1869,10 @@ async fn a_dispatched_task_survives_a_daemon_restart() {
     let adapter = Box::new(ClaudeAdapter::with_command(vec!["cat".into()]));
     let registry = Registry::with_state(adapter, state_path.clone());
     registry.load_state();
-    registry.focus(registry.connect(), Some(dispatched.id)); // any mutation that triggers save()
+    registry.focus(
+        registry.connect(tokio::sync::mpsc::unbounded_channel().0),
+        Some(dispatched.id),
+    ); // any mutation that triggers save()
 
     assert_eq!(
         prompt_of(&state_path, dispatched.id).as_deref(),

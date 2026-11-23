@@ -26,7 +26,7 @@ use amux_proto::{
 };
 
 use crate::pty::ScrollPos;
-use crate::registry::{ConnectionId, DeleteOutcome, Registry};
+use crate::registry::{ConnectionId, DeleteOutcome, OpenOutcome, Registry};
 
 /// How long to wait for a daemon to answer the probe handshake. It only has to serialize a
 /// `Hello` it has already built, so anything slower is wedged, not busy.
@@ -300,7 +300,7 @@ async fn handle_client(stream: UnixStream, registry: Arc<Registry>) -> Result<()
     let mut events = registry.subscribe_events();
     let mut attached: Attachments = HashMap::new();
     let mut scroll: ScrollPositions = HashMap::new();
-    let connection = registry.connect();
+    let connection = registry.connect(out_tx.clone());
 
     loop {
         tokio::select! {
@@ -345,6 +345,15 @@ fn handle_command(
     attached: &mut Attachments,
     scroll: &mut ScrollPositions,
 ) {
+    // What the user does in a client makes it the one `amux worktree open` asks.
+    match &msg {
+        ClientMsg::Input { .. }
+        | ClientMsg::Focus { .. }
+        | ClientMsg::Scroll { .. }
+        | ClientMsg::SetActive(_) => registry.note_input(connection),
+        ClientMsg::Attach { .. } => registry.note_viewer(connection),
+        _ => {}
+    }
     let report_err = |result: Result<()>| {
         if let Err(e) = result {
             let _ = out_tx.send(DaemonMsg::Error {
@@ -443,6 +452,14 @@ fn handle_command(
         }
         ClientMsg::Scroll { terminal, lines } => {
             scroll_view(scroll, registry, out_tx, terminal, lines)
+        }
+        ClientMsg::OpenWorktree { worktree } => {
+            let reply = match registry.open_worktree(worktree) {
+                OpenOutcome::Asked => DaemonMsg::WorktreeOpened { worktree },
+                OpenOutcome::NoClient => DaemonMsg::NoClientAttached { worktree },
+                OpenOutcome::NoSuchWorktree => DaemonMsg::NoSuchWorktree { worktree },
+            };
+            let _ = out_tx.send(reply);
         }
         ClientMsg::ListWorktrees => {
             let _ = out_tx.send(DaemonMsg::Worktrees {

@@ -644,6 +644,16 @@ both sides refuse mismatches.
 > one amux, or one daemon run, from another. The commands print JSON from types they own
 > (`amux-tui/src/worktree.rs`, `schema: 1`), never a serialised protocol type, so the wire can
 > change without changing what a script reads.
+>
+> **Showing a worktree from outside (v22).** `OpenWorktree { worktree }` asks the daemon to send
+> `ShowWorktree` to **one** terminal client — the one the user acted in most recently (`Input`,
+> `Focus`, `Scroll`, `SetActive` stamp a connection; one that has attached a terminal or reported
+> focus counts as a terminal client, a command never does) — and replies `WorktreeOpened`,
+> `NoClientAttached` or `NoSuchWorktree`. The client then does what choosing the worktree there
+> does (open it in the main area; focus, unread and last opened follow), with two cautious
+> exceptions: a worktree with no running agent only gets the sidebar cursor, because attaching
+> its pane would resume the CLI and the command must never start work; and while a prompt is
+> open nothing moves under it. The daemon starts nothing: no client, no agent, no window.
 
 ```rust
 enum ClientMsg {

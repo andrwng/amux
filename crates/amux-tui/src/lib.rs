@@ -50,6 +50,11 @@ pub fn worktree_turns(
     command_runtime()?.block_on(worktree::turns(id, after, limit, json))
 }
 
+/// Entry point for `amux worktree open`: prints nothing on success.
+pub fn worktree_open(id: &str) -> std::result::Result<String, CommandError> {
+    command_runtime()?.block_on(worktree::open(id))
+}
+
 /// A small runtime for a one-request command.
 fn command_runtime() -> std::result::Result<tokio::runtime::Runtime, CommandError> {
     tokio::runtime::Builder::new_current_thread()

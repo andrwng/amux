@@ -74,9 +74,9 @@ enum Command {
     Doctor,
     /// Bridge a Claude Code hook event to the daemon mailbox (invoked by Claude's hooks).
     Hook,
-    /// Read amux's worktrees and their recorded conversations, for scripts and other tools.
-    /// Read-only, and never starts a daemon: exits 3 when none is running, 4 when it is another
-    /// version of amux, 1 on anything else.
+    /// Read amux's worktrees and their recorded conversations, or show one, for scripts and other
+    /// tools. Never starts a daemon: exits 3 when none is running, 4 when it is another version
+    /// of amux, 1 on anything else.
     Worktree {
         #[command(subcommand)]
         command: WorktreeCommand,
@@ -112,6 +112,12 @@ enum WorktreeCommand {
         /// Print one JSON document (schema 1) instead of text.
         #[arg(long)]
         json: bool,
+    },
+    /// Have the terminal client you used last show a worktree in its main pane. Starts nothing:
+    /// exits 5 when no terminal client is attached.
+    Open {
+        /// The worktree's id, as `amux worktree list` prints it.
+        id: String,
     },
 }
 
@@ -168,6 +174,7 @@ fn main() -> anyhow::Result<()> {
                 limit,
                 json,
             } => amux_tui::worktree_turns(&id, after, limit, json),
+            WorktreeCommand::Open { id } => amux_tui::worktree_open(&id),
         }),
         Some(Command::Nav { direction }) => amux_daemon::run_nav(&direction)?,
         Some(Command::Passthrough { state }) => {

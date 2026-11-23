@@ -141,6 +141,28 @@ struct Terminal {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct ConnectionId(u64);
 
+/// What the registry keeps for one connected client.
+struct ClientEntry {
+    /// Its outbound queue, for a message meant for it alone.
+    tx: tokio::sync::mpsc::UnboundedSender<DaemonMsg>,
+    /// Whether it is a terminal client showing agents (it has attached a terminal or reported a
+    /// focus) — a command that connects to ask something never is.
+    viewer: bool,
+    /// When the user last acted in it ([`Registry::note_input`]); 0 for never.
+    last_input: u64,
+}
+
+/// What became of an `amux worktree open` request.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OpenOutcome {
+    /// The most recently used terminal client was asked to show the worktree.
+    Asked,
+    /// No terminal client is attached.
+    NoClient,
+    /// The daemon has no such worktree.
+    NoSuchWorktree,
+}
+
 /// A registered repository and its (cheaply cloneable) worktree service.
 struct RepoEntry {
     info: RepoInfo,
@@ -158,6 +180,12 @@ struct State {
     focused: HashMap<ConnectionId, AgentId>,
     /// The next [`ConnectionId`] to hand out.
     next_connection: u64,
+    /// Every connected client, for the requests that address one client rather than all of them
+    /// (`amux worktree open`).
+    clients: HashMap<ConnectionId, ClientEntry>,
+    /// A counter stamped on a client each time the user acts in it, so the most recent is known
+    /// without reading a clock.
+    next_input: u64,
     /// Saved pane layouts per agent, replayed to a re-attaching client so splits survive the TUI
     /// closing — and, since they are part of [`PersistedState`], a daemon restart or an upgrade too.
     layouts: HashMap<AgentId, amux_proto::Layout>,
@@ -1087,16 +1115,68 @@ impl Registry {
 
     /// A control connection has completed its handshake: give it an identity for what the daemon
     /// keeps per connection.
-    pub fn connect(&self) -> ConnectionId {
+    /// `tx` is its outbound queue, for messages meant for it alone.
+    pub fn connect(&self, tx: tokio::sync::mpsc::UnboundedSender<DaemonMsg>) -> ConnectionId {
         let mut state = self.state.lock().unwrap();
         state.next_connection += 1;
-        ConnectionId(state.next_connection)
+        let id = ConnectionId(state.next_connection);
+        state.clients.insert(
+            id,
+            ClientEntry {
+                tx,
+                viewer: false,
+                last_input: 0,
+            },
+        );
+        id
+    }
+
+    /// `connection` is a terminal client showing agents (it attached a terminal or reported focus).
+    pub fn note_viewer(&self, connection: ConnectionId) {
+        if let Some(c) = self.state.lock().unwrap().clients.get_mut(&connection) {
+            c.viewer = true;
+        }
+    }
+
+    /// The user acted in `connection` (typed into a pane, moved focus, scrolled): it becomes the
+    /// most recently used client.
+    pub fn note_input(&self, connection: ConnectionId) {
+        let mut state = self.state.lock().unwrap();
+        state.next_input += 1;
+        let stamp = state.next_input;
+        if let Some(c) = state.clients.get_mut(&connection) {
+            c.viewer = true;
+            c.last_input = stamp;
+        }
+    }
+
+    /// Ask the most recently used terminal client to show `worktree` in its main pane, as if the
+    /// user had chosen it there. Starts nothing: no client, no agent, no window. Ties (clients the
+    /// user has not acted in yet) go to the one that connected last.
+    pub fn open_worktree(&self, worktree: AgentId) -> OpenOutcome {
+        let state = self.state.lock().unwrap();
+        if !state.agents.contains_key(&worktree) {
+            return OpenOutcome::NoSuchWorktree;
+        }
+        let chosen = state
+            .clients
+            .iter()
+            .filter(|(_, c)| c.viewer && !c.tx.is_closed())
+            .max_by_key(|(id, c)| (c.last_input, id.0));
+        match chosen {
+            Some((_, c)) if c.tx.send(DaemonMsg::ShowWorktree { worktree }).is_ok() => {
+                OpenOutcome::Asked
+            }
+            _ => OpenOutcome::NoClient,
+        }
     }
 
     /// A control connection has gone: forget what it focused, and only that. Nothing is
     /// broadcast — focus is not part of any client's view.
     pub fn disconnect(&self, connection: ConnectionId) {
-        self.state.lock().unwrap().focused.remove(&connection);
+        let mut state = self.state.lock().unwrap();
+        state.focused.remove(&connection);
+        state.clients.remove(&connection);
     }
 
     /// Set (or clear) which agent `connection` is viewing. Focusing an agent clears its unread bit

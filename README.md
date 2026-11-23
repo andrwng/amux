@@ -178,10 +178,13 @@ amux --profile <blue|green|yellow|red>  # start the TUI with a border/accent col
 amux worktree list [--json]             # every worktree: its agent's state, unread, and last prompt/reply
 amux worktree turns <id> [--after <n>] [--limit <n>] [--json]
                                          # a worktree's recorded prompts and replies, oldest first
+amux worktree open <id>                 # show a worktree in the amux you used last, as if you picked it
 ```
 
-The `worktree` commands are read-only, for scripts and status bars: they never start a daemon
-(exit 3 when none is running, 4 when it is another version of amux) and change nothing you see.
+The `worktree` commands are for scripts, status bars and notifications: they never start a
+daemon (exit 3 when none is running, 4 when it is another version of amux), and `list` and
+`turns` change nothing you see. `open` starts nothing either (exit 5 when no amux is open); a
+worktree whose agent is not running only gets the sidebar cursor, so `Enter` resumes it.
 amux records each worktree's prompts and the replies its agent stopped on, under
 `~/.amux/conversations/`, readable only by you, and deletes them with the worktree.
 

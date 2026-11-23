@@ -962,11 +962,14 @@ impl App {
                 self.info = doctor_summary(&pruned, &skipped);
             }
             DaemonMsg::Error { message } => self.status = message,
-            // Replies to the read-only command requests; the terminal client never sends them.
+            DaemonMsg::ShowWorktree { worktree } => self.show_worktree(worktree, sink).await?,
+            // Replies to the command requests; the terminal client never sends them.
             DaemonMsg::Hello { .. }
             | DaemonMsg::Worktrees { .. }
             | DaemonMsg::Turns { .. }
-            | DaemonMsg::NoSuchWorktree { .. } => {}
+            | DaemonMsg::NoSuchWorktree { .. }
+            | DaemonMsg::WorktreeOpened { .. }
+            | DaemonMsg::NoClientAttached { .. } => {}
         }
         Ok(())
     }
@@ -2682,6 +2685,30 @@ impl App {
     async fn open_agent(&mut self, id: AgentId, sink: &mut Sink) -> Result<()> {
         self.place_sidebar_sel(Row::Agent(id));
         self.activate(id, sink).await
+    }
+
+    /// `amux worktree open` asked this client to show `id`: do what choosing it here does — open
+    /// it in the main area (focus, unread and last opened follow, as for the numeric shortcuts).
+    ///
+    /// Two cautious exceptions, so a script can never start work or eat a keystroke. A worktree
+    /// with no running agent (suspended, or exited) only gets the sidebar cursor, and focus stays
+    /// where it is: opening it would attach its pane, and attaching resumes its CLI — `Enter` in
+    /// the sidebar is then one key away. And
+    /// while a prompt is open (a new branch, a delete confirm, a search) nothing moves; a notice
+    /// says why.
+    async fn show_worktree(&mut self, id: AgentId, sink: &mut Sink) -> Result<()> {
+        let Some(agent) = self.agents.iter().find(|a| a.id == id) else {
+            return Ok(());
+        };
+        if self.input != InputMode::Normal {
+            self.info = "amux worktree open: finish this prompt first".to_string();
+            return Ok(());
+        }
+        if matches!(agent.state, AgentState::Exited { .. }) {
+            self.place_sidebar_sel(Row::Agent(id));
+            return Ok(());
+        }
+        self.open_agent(id, sink).await
     }
 
     /// The agent the user is currently viewing: the one owning the focused terminal (when focus
@@ -8765,5 +8792,73 @@ mod tests {
         type_keys(&mut app, &mut sink, &typed("/x")).await;
         type_keys(&mut app, &mut sink, &[key(KeyCode::Esc)]).await;
         assert!(!app.sidebar_placed);
+    }
+
+    /// `amux worktree open` on a running agent opens it in the main area, focused — what choosing
+    /// it with a numeric shortcut does.
+    #[tokio::test]
+    async fn show_worktree_opens_a_running_agent() {
+        let (mut app, ids) = app_with_agents(2);
+        let (mut sink, _server) = test_sink();
+        let _ = app.swap_to_agent(ids[0]);
+        app.focus = Focus::Sidebar;
+        app.on_daemon(DaemonMsg::ShowWorktree { worktree: ids[1] }, &mut sink)
+            .await
+            .unwrap();
+        assert_eq!(app.active_agent, Some(ids[1]));
+        assert!(matches!(app.focus, Focus::Panes));
+        assert_eq!(app.selected_agent(), Some(ids[1]));
+    }
+
+    /// A worktree with no running agent only gets the sidebar cursor: opening it would attach its
+    /// pane, and attaching resumes the agent, which the command must never do.
+    #[tokio::test]
+    async fn show_worktree_never_resumes_a_stopped_agent() {
+        let (mut app, ids) = app_with_agents(2);
+        let (mut sink, _server) = test_sink();
+        let _ = app.swap_to_agent(ids[0]);
+        app.agents[1].state = AgentState::Exited { code: None };
+        let stopped = app.agents[1].id;
+        app.on_daemon(DaemonMsg::ShowWorktree { worktree: stopped }, &mut sink)
+            .await
+            .unwrap();
+        assert_eq!(app.active_agent, Some(ids[0]), "the main area is unchanged");
+        assert!(matches!(app.focus, Focus::Panes), "focus is unchanged");
+        assert_eq!(app.selected_agent(), Some(stopped), "the cursor is on it");
+    }
+
+    /// While a prompt is open, nothing moves under it.
+    #[tokio::test]
+    async fn show_worktree_waits_for_an_open_prompt() {
+        let (mut app, ids) = app_with_agents(2);
+        let (mut sink, _server) = test_sink();
+        let _ = app.swap_to_agent(ids[0]);
+        app.input = InputMode::Searching;
+        app.on_daemon(DaemonMsg::ShowWorktree { worktree: ids[1] }, &mut sink)
+            .await
+            .unwrap();
+        assert_eq!(app.active_agent, Some(ids[0]));
+        assert!(
+            app.input == InputMode::Searching,
+            "the search is still open"
+        );
+        assert!(app.info.contains("finish this prompt"));
+    }
+
+    /// An id this client does not know is ignored.
+    #[tokio::test]
+    async fn show_worktree_ignores_an_unknown_id() {
+        let (mut app, ids) = app_with_agents(1);
+        let (mut sink, _server) = test_sink();
+        let _ = app.swap_to_agent(ids[0]);
+        app.on_daemon(
+            DaemonMsg::ShowWorktree {
+                worktree: AgentId::new(),
+            },
+            &mut sink,
+        )
+        .await
+        .unwrap();
+        assert_eq!(app.active_agent, Some(ids[0]));
     }
 }

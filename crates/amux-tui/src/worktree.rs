@@ -1,5 +1,6 @@
 //! `amux worktree list` and `amux worktree turns`: read-only thin clients of the daemon, for a
-//! status bar, a script or another tool. They connect through
+//! status bar, a script or another tool. `amux worktree open` asks the terminal client you last
+//! used to show a worktree, and otherwise changes nothing itself. They connect through
 //! [`connect_to_running_daemon`](crate::client::connect_to_running_daemon), so they can never start
 //! or replace a daemon; they send one read-only request, print the reply, and leave — changing
 //! nothing (not unread, not last opened, not focus, not a terminal's size).
@@ -39,16 +40,20 @@ pub enum CommandError {
     NoSuchWorktree,
     #[error("not a worktree id (use the id `amux worktree list` prints)")]
     BadId,
+    #[error("no amux terminal client is attached")]
+    NoClient,
     #[error("could not read from the amux daemon: {0:#}")]
     Other(anyhow::Error),
 }
 
 impl CommandError {
-    /// The process exit code for this outcome: 3 no daemon, 4 another version, 1 anything else.
+    /// The process exit code for this outcome: 3 no daemon, 4 another version, 5 no terminal
+    /// client attached (`open`), 1 anything else.
     pub fn exit_code(&self) -> i32 {
         match self {
             CommandError::NoDaemon => 3,
             CommandError::VersionDiffers => 4,
+            CommandError::NoClient => 5,
             CommandError::NoSuchWorktree | CommandError::BadId | CommandError::Other(_) => 1,
         }
     }
@@ -75,6 +80,32 @@ pub async fn turns(id: &str, after: u64, limit: u32, json: bool) -> Result<Strin
     let worktree = AgentId::parse(id).ok_or(CommandError::BadId)?;
     let connection = crate::client::connect_to_running_daemon().await?;
     turns_over(connection, worktree, after, limit, json).await
+}
+
+/// `amux worktree open <id>`: ask the terminal client you last used to show the worktree. Prints
+/// nothing. Never starts a client, an agent or a window.
+pub async fn open(id: &str) -> Result<String, CommandError> {
+    let worktree = AgentId::parse(id).ok_or(CommandError::BadId)?;
+    let connection = crate::client::connect_to_running_daemon().await?;
+    open_over(connection, worktree).await
+}
+
+pub(crate) async fn open_over(
+    mut connection: Connection,
+    worktree: AgentId,
+) -> Result<String, CommandError> {
+    send(&mut connection, ClientMsg::OpenWorktree { worktree }).await?;
+    reply(&mut connection, |msg| match msg {
+        DaemonMsg::WorktreeOpened { worktree: w } if w == worktree => Some(Ok(String::new())),
+        DaemonMsg::NoClientAttached { worktree: w } if w == worktree => {
+            Some(Err(CommandError::NoClient))
+        }
+        DaemonMsg::NoSuchWorktree { worktree: w } if w == worktree => {
+            Some(Err(CommandError::NoSuchWorktree))
+        }
+        _ => None,
+    })
+    .await
 }
 
 pub(crate) async fn list_over(
@@ -673,6 +704,7 @@ mod tests {
     fn exit_codes() {
         assert_eq!(CommandError::NoDaemon.exit_code(), 3);
         assert_eq!(CommandError::VersionDiffers.exit_code(), 4);
+        assert_eq!(CommandError::NoClient.exit_code(), 5);
         assert_eq!(CommandError::NoSuchWorktree.exit_code(), 1);
         assert_eq!(CommandError::BadId.exit_code(), 1);
         assert_eq!(CommandError::Other(anyhow::anyhow!("x")).exit_code(), 1);
@@ -947,5 +979,92 @@ mod tests {
             UnixStream::connect(&socket).await.is_ok(),
             "the other daemon is still there"
         );
+    }
+
+    /// A terminal client in the test: handshake, then optionally a focus (which counts as the user
+    /// acting in it).
+    async fn terminal_client(d: &Daemon, focus: Option<AgentId>) -> Connection {
+        let mut c = Framed::new(
+            UnixStream::connect(&d.socket).await.unwrap(),
+            ClientCodec::new(),
+        );
+        c.send(ClientMsg::Hello {
+            proto_version: PROTO_VERSION,
+        })
+        .await
+        .unwrap();
+        c.send(ClientMsg::Focus { agent: focus }).await.unwrap();
+        // Round-trip so the daemon has applied it.
+        c.send(ClientMsg::ListWorktrees).await.unwrap();
+        loop {
+            if let Some(Ok(DaemonMsg::Worktrees { .. })) = c.next().await {
+                return c;
+            }
+        }
+    }
+
+    /// Whether `c` is asked to show `id` within a short wait.
+    async fn asked_to_show(c: &mut Connection, id: AgentId) -> bool {
+        tokio::time::timeout(Duration::from_millis(300), async {
+            loop {
+                match c.next().await {
+                    Some(Ok(DaemonMsg::ShowWorktree { worktree })) => return worktree == id,
+                    Some(Ok(_)) => {}
+                    _ => return false,
+                }
+            }
+        })
+        .await
+        .unwrap_or(false)
+    }
+
+    #[tokio::test]
+    async fn open_asks_the_most_recently_used_client_and_only_it() {
+        let d = daemon().await;
+        let repo = d.registry.repos()[0].id;
+        let a = d.registry.create(repo, "feat/a", None).unwrap().id;
+        let b = d.registry.create(repo, "feat/b", None).unwrap().id;
+        let mut older = terminal_client(&d, Some(a)).await;
+        let mut newer = terminal_client(&d, Some(a)).await;
+        // The user goes back to the first client: it is now the most recently used.
+        older.send(ClientMsg::Focus { agent: None }).await.unwrap();
+        older.send(ClientMsg::ListWorktrees).await.unwrap();
+        loop {
+            if let Some(Ok(DaemonMsg::Worktrees { .. })) = older.next().await {
+                break;
+            }
+        }
+        let agents_before = d.registry.infos().len();
+
+        assert_eq!(open_over(connect(&d).await, b).await.unwrap(), "");
+        assert!(
+            asked_to_show(&mut older, b).await,
+            "the client used last is asked"
+        );
+        assert!(!asked_to_show(&mut newer, b).await, "the other is not");
+        assert_eq!(
+            d.registry.infos().len(),
+            agents_before,
+            "nothing was created"
+        );
+
+        let err = open_over(connect(&d).await, AgentId::new())
+            .await
+            .unwrap_err();
+        assert!(matches!(err, CommandError::NoSuchWorktree));
+        assert_eq!(err.exit_code(), 1);
+    }
+
+    #[tokio::test]
+    async fn open_with_no_client_attached_is_exit_5_and_starts_nothing() {
+        let d = daemon().await;
+        let repo = d.registry.repos()[0].id;
+        let a = d.registry.create(repo, "feat/a", None).unwrap().id;
+        // Another command connected at the same time is not a terminal client.
+        let _bystander = connect(&d).await;
+        let err = open_over(connect(&d).await, a).await.unwrap_err();
+        assert!(matches!(err, CommandError::NoClient));
+        assert_eq!(err.exit_code(), 5);
+        assert_eq!(d.registry.infos().len(), 1);
     }
 }
